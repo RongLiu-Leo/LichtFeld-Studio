@@ -353,6 +353,55 @@ namespace fast_lfs::rasterization::kernels::backward {
         return {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     }
 
+    __device__ __forceinline__ float sky_smoothstep(
+        const float edge0,
+        const float edge1,
+        const float x) {
+        const float t = fminf(fmaxf((x - edge0) / fmaxf(edge1 - edge0, 1.0e-6f), 0.0f), 1.0f);
+        return t * t * (3.0f - 2.0f * t);
+    }
+
+    __device__ __forceinline__ bool is_sky_shell_primitive(
+        const FusedAdamSettings& fused_adam,
+        const uint primitive_idx) {
+        const uint shell_start = static_cast<uint>(fused_adam.sky_shell_start);
+        const uint shell_end = shell_start + static_cast<uint>(fused_adam.sky_shell_count);
+        return primitive_idx >= shell_start && primitive_idx < shell_end;
+    }
+
+    __device__ __forceinline__ float sky_split_color_factor(
+        const FusedAdamSettings& fused_adam,
+        const bool is_sky_shell,
+        const uint pixel_idx) {
+        if (fused_adam.sky_gate == nullptr ||
+            fused_adam.sky_shell_count <= 0 ||
+            fused_adam.sky_gate_strength <= 0.0f) {
+            return 1.0f;
+        }
+
+        const float sky = fminf(fmaxf(fused_adam.sky_gate[pixel_idx], 0.0f), 1.0f);
+        const float target = is_sky_shell
+                                 ? sky_smoothstep(0.62f, 0.92f, sky)
+                                 : (1.0f - sky_smoothstep(0.82f, 0.98f, sky));
+        const float strength = fminf(fmaxf(fused_adam.sky_gate_strength, 0.0f), 1.0f);
+        return 1.0f - strength + strength * target;
+    }
+
+    __device__ __forceinline__ float sky_split_transmittance_factor(
+        const FusedAdamSettings& fused_adam,
+        const bool is_sky_shell) {
+        if (fused_adam.sky_gate == nullptr ||
+            fused_adam.sky_shell_count <= 0 ||
+            fused_adam.sky_gate_strength <= 0.0f) {
+            return 1.0f;
+        }
+
+        // The extra learned-sky alpha term is a foreground cleanup signal. Do
+        // not let it shrink the sky shell itself; shell opacity is still driven
+        // by the color residual through dL_dalpha.
+        return is_sky_shell ? 0.0f : 1.0f;
+    }
+
     template <DensificationType DENSIFICATION_TYPE>
     __global__ void __launch_bounds__(config::block_size_blend_backward) blend_backward_cu(
         const uint2* __restrict__ tile_instance_ranges,
@@ -372,6 +421,7 @@ namespace fast_lfs::rasterization::kernels::backward {
         float3* __restrict__ grad_color,
         float* __restrict__ densification_info,
         const float* __restrict__ densification_error_map,
+        FusedAdamSettings fused_adam,
         const uint n_primitives,
         const uint width,
         const uint height,
@@ -463,6 +513,9 @@ namespace fast_lfs::rasterization::kernels::backward {
                     if (static_cast<uint>(tile_primitive_idx) < last_contributor) {
                         const uint2 pixel_coords = {start_pixel_coords.x + static_cast<uint>(pixel_rank % config::tile_width),
                                                     start_pixel_coords.y + static_cast<uint>(pixel_rank / config::tile_width)};
+                        const uint pixel_idx = width * pixel_coords.y + pixel_coords.x;
+                        const bool is_sky_shell = is_sky_shell_primitive(fused_adam, primitive_idx);
+                        const float split_factor = sky_split_color_factor(fused_adam, is_sky_shell, pixel_idx);
                         const float2 pixel = make_float2(__uint2float_rn(pixel_coords.x), __uint2float_rn(pixel_coords.y)) + 0.5f;
                         const float2 delta = mean2d - pixel;
                         const float sigma_over_2 = 0.5f * (conic.x * delta.x * delta.x + conic.z * delta.y * delta.y) +
@@ -479,14 +532,16 @@ namespace fast_lfs::rasterization::kernels::backward {
                                 const float transmittance_after = s_transmittance_state[pixel_rank];
                                 const float transmittance_before = transmittance_after / one_minus_alpha_safe;
                                 const float blending_weight = transmittance_before * alpha;
-                                const float3 grad_color_pixel = s_grad_color_state[pixel_rank];
-                                const float grad_transmittance_after = s_grad_transmittance_state[pixel_rank];
+                                const float3 grad_color_pixel_raw = s_grad_color_state[pixel_rank];
+                                const float grad_transmittance_after_raw = s_grad_transmittance_state[pixel_rank];
+                                const float3 grad_color_pixel = split_factor * grad_color_pixel_raw;
+                                const float transmittance_factor = sky_split_transmittance_factor(fused_adam, is_sky_shell);
+                                const float grad_transmittance_after = transmittance_factor * grad_transmittance_after_raw;
 
                                 if constexpr (DENSIFICATION_TYPE == DensificationType::MCMC) {
-                                    const uint pixel_idx = width * pixel_coords.y + pixel_coords.x;
                                     const float pixel_error = densification_error_map[pixel_idx];
-                                    accum.densification_weight += blending_weight;
-                                    accum.densification_error_weighted += blending_weight * pixel_error;
+                                    accum.densification_weight += split_factor * blending_weight;
+                                    accum.densification_error_weighted += split_factor * blending_weight * pixel_error;
                                 }
 
                                 const float3 dL_dcolor = blending_weight * grad_color_pixel * color_grad_factor;
@@ -509,17 +564,16 @@ namespace fast_lfs::rasterization::kernels::backward {
                                 accum.mean_y += dL_dmean2d.y;
 
                                 if constexpr (DENSIFICATION_TYPE == DensificationType::MRNF) {
-                                    const uint pixel_idx = width * pixel_coords.y + pixel_coords.x;
                                     const float pixel_error = (densification_error_map != nullptr)
                                                                   ? densification_error_map[pixel_idx]
                                                                   : 1.0f;
-                                    accum.densification_weight += blending_weight;
-                                    accum.densification_error_weighted += blending_weight * pixel_error;
+                                    accum.densification_weight += split_factor * blending_weight;
+                                    accum.densification_error_weighted += split_factor * blending_weight * pixel_error;
                                 }
 
                                 s_transmittance_state[pixel_rank] = transmittance_before;
-                                s_grad_transmittance_state[pixel_rank] = dot(grad_color_pixel, alpha * color) +
-                                                                         grad_transmittance_after * one_minus_alpha;
+                                s_grad_transmittance_state[pixel_rank] = dot(grad_color_pixel_raw, alpha * color) +
+                                                                         grad_transmittance_after_raw * one_minus_alpha;
                             }
                         }
                     }

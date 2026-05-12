@@ -561,6 +561,10 @@ namespace lfs::training {
         fused_adam.sparsity_n = fused_extra_gradients.sparsity_n;
         fused_adam.sparsity_rho = fused_extra_gradients.sparsity_rho;
         fused_adam.sparsity_grad_loss = fused_extra_gradients.sparsity_grad_loss;
+        fused_adam.sky_gate = fused_extra_gradients.sky_gate;
+        fused_adam.sky_shell_start = fused_extra_gradients.sky_shell_start;
+        fused_adam.sky_shell_count = fused_extra_gradients.sky_shell_count;
+        fused_adam.sky_gate_strength = fused_extra_gradients.sky_gate_strength;
         fused_adam.means = convert_param(optimizer_fused.means);
         fused_adam.scaling = convert_param(optimizer_fused.scaling);
         fused_adam.rotation = convert_param(optimizer_fused.rotation);

@@ -139,6 +139,10 @@ namespace lfs::training {
         int sparsity_n = 0;
         float sparsity_rho = 0.0f;
         float sparsity_grad_loss = 0.0f;
+        const float* sky_gate = nullptr;
+        int sky_shell_start = 0;
+        int sky_shell_count = 0;
+        float sky_gate_strength = 0.0f;
     };
 
     // Explicit forward pass - returns render output and context for backward

@@ -250,14 +250,13 @@ namespace lfs::training::kernels {
             const float luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
 
             const float y_norm = py_full / fmaxf(static_cast<float>(full_height), 1.0f);
-            const float top_prior = 1.0f - smoothstep01(0.38f, 0.82f, y_norm);
-            const float up_prior = smoothstep01(-0.10f, 0.35f, y);
-            const float placement = saturate(fmaxf(top_prior, 0.75f * up_prior));
+            const float top_prior = 1.0f - smoothstep01(0.42f, 0.86f, y_norm);
+            const float placement = saturate(top_prior);
 
             const float warm_bias = fmaxf(r - b, g - b);
-            const float cool_or_neutral = 1.0f - smoothstep01(0.02f, 0.12f, warm_bias);
-            const float white_sky = smoothstep01(0.68f, 0.88f, luma) *
-                                    (1.0f - smoothstep01(0.08f, 0.22f, sat)) *
+            const float cool_or_neutral = 1.0f - smoothstep01(0.04f, 0.18f, warm_bias);
+            const float white_sky = smoothstep01(0.52f, 0.78f, luma) *
+                                    (1.0f - smoothstep01(0.10f, 0.32f, sat)) *
                                     cool_or_neutral;
             const float blue_sky = smoothstep01(0.02f, 0.18f, b - r) *
                                    smoothstep01(0.02f, 0.16f, b - g) *
@@ -413,7 +412,8 @@ namespace lfs::training::kernels {
             }
 
             const float sky = sky_gate ? saturate(sky_gate[idx]) : 0.0f;
-            const float attenuation = saturate(strength) * sky;
+            const float clean_sky = smoothstep01(0.82f, 0.98f, sky);
+            const float attenuation = saturate(strength) * clean_sky;
             const float factor = 1.0f - attenuation;
             const int HW = total;
             for (int c = 0; c < 3; ++c) {
@@ -435,7 +435,8 @@ namespace lfs::training::kernels {
             }
 
             const float sky = sky_gate ? saturate(sky_gate[idx]) : 0.0f;
-            const float attenuation = saturate(strength) * sky;
+            const float clean_sky = smoothstep01(0.82f, 0.98f, sky);
+            const float attenuation = saturate(strength) * clean_sky;
             error_map[idx] *= 1.0f - attenuation;
         }
 
@@ -517,10 +518,17 @@ namespace lfs::training::kernels {
 
             opacity[row] = fminf(opacity_max, fmaxf(opacity_min, opacity[row]));
 
+            constexpr float kSHC0 = 0.28209479177387814f;
             const float keep = 1.0f - prior_mix;
             for (int c = 0; c < 3; ++c) {
                 const float mixed = sh0[row * 3 + c] * keep + shell_sh0_prior[i * 3 + c] * prior_mix;
-                sh0[row * 3 + c] = fminf(sh0_max, fmaxf(sh0_min, mixed));
+                const float prior_rgb = saturate(shell_sh0_prior[i * 3 + c] * kSHC0 + 0.5f);
+                const float mixed_rgb = saturate(mixed * kSHC0 + 0.5f);
+                const float min_rgb = fmaxf(0.26f, prior_rgb - 0.20f);
+                const float max_rgb = fminf(1.0f, prior_rgb + 0.22f);
+                const float bounded_rgb = fminf(max_rgb, fmaxf(min_rgb, mixed_rgb));
+                const float bounded_sh = (bounded_rgb - 0.5f) / kSHC0;
+                sh0[row * 3 + c] = fminf(sh0_max, fmaxf(sh0_min, bounded_sh));
             }
 
             if (shN && sh_rest > 0) {

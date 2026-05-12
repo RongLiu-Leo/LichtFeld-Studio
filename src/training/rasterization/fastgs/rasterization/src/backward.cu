@@ -73,6 +73,7 @@ void fast_lfs::rasterization::backward(
                 grad_color_helper,
                 densification_info,
                 densification_error_map,
+                fused_adam,
                 n_primitives,
                 width,
                 height,

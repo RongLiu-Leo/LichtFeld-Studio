@@ -3134,7 +3134,7 @@ namespace lfs::training {
             safe_logit(0.62f),
             rgb_to_sh0(0.0f),
             rgb_to_sh0(1.0f),
-            0.06f,
+            0.18f,
             model.means().stream());
     }
 
@@ -3234,6 +3234,13 @@ namespace lfs::training {
                 !bg_image.is_empty() &&
                 directional_background_ &&
                 directional_background_->is_initialized();
+            const bool learned_sky_shell_active =
+                params_.optimization.bg_mode == lfs::core::param::BackgroundMode::LearnedDirectional &&
+                learned_sky_shell_count_ > 0;
+            const bool sky_gate_active =
+                params_.optimization.bg_mode == lfs::core::param::BackgroundMode::LearnedDirectional &&
+                params_.optimization.bg_auto_sky_gate &&
+                (learned_directional_bg_active || learned_sky_shell_active);
 
             // Configurable tile-based training to reduce peak memory in 3DGUT.
             const int full_width = cam->image_width();
@@ -3427,7 +3434,7 @@ namespace lfs::training {
 
                 lfs::core::Tensor sky_gate_tile;
                 lfs::core::Tensor sky_gate_target;
-                if (learned_directional_bg_active && params_.optimization.bg_auto_sky_gate) {
+                if (sky_gate_active) {
                     sky_gate_target = gt_tile;
                     if (sky_gate_target.dtype() == lfs::core::DataType::UInt8) {
                         sky_gate_target = sky_gate_target.to(lfs::core::DataType::Float32) / 255.0f;
@@ -3903,7 +3910,7 @@ namespace lfs::training {
                             tile_error_map.mul_(mask_for_error);
                         }
 
-                        if (learned_directional_bg_active &&
+                        if ((learned_directional_bg_active || learned_sky_shell_active) &&
                             sky_gate_tile.is_valid() &&
                             tile_error_map.is_valid() &&
                             tile_error_map.dtype() == lfs::core::DataType::Float32 &&
@@ -4095,12 +4102,21 @@ namespace lfs::training {
                     } else {
                         tile_context_guard.release();
                         if (run_fastgs_gaussian_backward && fast_ctx->forward_ctx.n_instances > 0) {
+                            FastGSFusedExtraGradients tile_fused_extra_gradients = fused_extra_gradients;
+                            if (learned_sky_shell_active &&
+                                sky_gate_tile.is_valid() &&
+                                sky_gate_tile.numel() == static_cast<size_t>(tile_height * tile_width)) {
+                                tile_fused_extra_gradients.sky_gate = sky_gate_tile.ptr<float>();
+                                tile_fused_extra_gradients.sky_shell_start = static_cast<int>(learned_sky_shell_start_);
+                                tile_fused_extra_gradients.sky_shell_count = static_cast<int>(learned_sky_shell_count_);
+                                tile_fused_extra_gradients.sky_gate_strength = 1.0f;
+                            }
                             fast_rasterize_backward(*fast_ctx, gaussian_raster_grad, strategy_->get_model(),
                                                     strategy_->get_optimizer(), tile_grad_alpha,
                                                     use_pixel_error_densification ? tile_error_map : lfs::core::Tensor{},
                                                     densification_type,
                                                     iter,
-                                                    fused_extra_gradients);
+                                                    tile_fused_extra_gradients);
                         } else {
                             cleanup_tile_context();
                         }

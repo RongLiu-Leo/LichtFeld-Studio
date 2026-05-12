@@ -391,8 +391,8 @@ TEST_F(BackgroundImageTest, Checkpoint_OldCheckpointLoadsWithDefaults) {
     EXPECT_FLOAT_EQ(params.bg_color[2], 0.0f);
     EXPECT_TRUE(params.bg_image_path.empty());
     EXPECT_TRUE(params.bg_auto_sky_gate);
-    EXPECT_FLOAT_EQ(params.bg_sky_gate_threshold, 0.25f);
-    EXPECT_FLOAT_EQ(params.bg_sky_opacity_decay, 0.05f);
+    EXPECT_FLOAT_EQ(params.bg_sky_gate_threshold, 0.45f);
+    EXPECT_FLOAT_EQ(params.bg_sky_opacity_decay, 0.06f);
 }
 
 TEST_F(BackgroundImageTest, Checkpoint_AllBackgroundModesSerialize) {

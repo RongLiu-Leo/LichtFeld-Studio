@@ -17,6 +17,15 @@ namespace lfs::training::kernels {
             return static_cast<unsigned int>((total + kThreadsPerBlock - 1) / kThreadsPerBlock);
         }
 
+        __device__ inline float saturate_device(const float x) {
+            return fminf(fmaxf(x, 0.0f), 1.0f);
+        }
+
+        __device__ inline float smoothstep_device(const float edge0, const float edge1, const float x) {
+            const float t = saturate_device((x - edge0) / fmaxf(edge1 - edge0, 1.0e-6f));
+            return t * t * (3.0f - 2.0f * t);
+        }
+
         template <bool kUseImage, bool kSubtract>
         __global__ void fused_background_compose_kernel(
             const float* __restrict__ image,
@@ -183,7 +192,8 @@ namespace lfs::training::kernels {
         if (idx >= HW)
             return;
 
-        const float gate = sky_gate ? fminf(fmaxf(sky_gate[idx], 0.0f), 1.0f) : 1.0f;
+        const float gate_raw = sky_gate ? saturate_device(sky_gate[idx]) : 1.0f;
+        const float gate = sky_gate ? smoothstep_device(0.82f, 0.98f, gate_raw) : 1.0f;
         if (gate <= 0.0f)
             return;
 
