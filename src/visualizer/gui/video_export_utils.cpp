@@ -5,7 +5,9 @@
 #include "gui/video_export_utils.hpp"
 #include "rendering/render_constants.hpp"
 #include "scene/scene_manager.hpp"
+#include "training/trainer.hpp"
 #include "training/training_manager.hpp"
+#include <cstring>
 #include <format>
 #include <optional>
 #include <shared_mutex>
@@ -82,6 +84,51 @@ namespace lfs::vis::gui {
             return lock;
         }
 
+        [[nodiscard]] std::uint64_t hashLearnedSkySnapshot(
+            const lfs::training::DirectionalBackgroundSnapshot& snapshot) {
+            std::uint64_t hash = 1469598103934665603ull;
+            const auto mix = [&hash](const std::uint32_t value) {
+                hash ^= static_cast<std::uint64_t>(value);
+                hash *= 1099511628211ull;
+            };
+            mix(static_cast<std::uint32_t>(snapshot.degree));
+            mix(static_cast<std::uint32_t>(snapshot.step));
+            mix(static_cast<std::uint32_t>(snapshot.step >> 32));
+            for (const auto& coeff : snapshot.coeffs) {
+                for (const float channel : coeff) {
+                    std::uint32_t bits = 0;
+                    std::memcpy(&bits, &channel, sizeof(bits));
+                    mix(bits);
+                }
+            }
+            return hash;
+        }
+
+        [[nodiscard]] lfs::rendering::LearnedSkyRenderState captureLearnedSkyRenderState(
+            const lfs::vis::SceneManager& scene_manager) {
+            const auto* const tm = scene_manager.getTrainerManager();
+            const auto* const trainer = tm ? tm->getTrainer() : nullptr;
+            if (!trainer) {
+                return {};
+            }
+            const auto snapshot = trainer->learnedDirectionalBackgroundSnapshot();
+            if (!snapshot) {
+                return {};
+            }
+
+            lfs::rendering::LearnedSkyRenderState state;
+            state.enabled = true;
+            state.degree = snapshot->degree;
+            state.generation = hashLearnedSkySnapshot(*snapshot);
+            for (size_t i = 0; i < state.coeffs.size(); ++i) {
+                state.coeffs[i] = glm::vec3(
+                    snapshot->coeffs[i][0],
+                    snapshot->coeffs[i][1],
+                    snapshot->coeffs[i][2]);
+            }
+            return state;
+        }
+
     } // namespace
 
     std::expected<VideoExportSceneSnapshot, std::string> captureVideoExportSceneSnapshot(
@@ -91,6 +138,7 @@ namespace lfs::vis::gui {
         auto render_lock = acquireLiveModelRenderLock(scene_manager);
         const auto render_state = scene_manager.buildRenderState();
         const auto& scene = scene_manager.getScene();
+        snapshot.learned_sky = captureLearnedSkyRenderState(scene_manager);
 
         if (const auto* const model = scene_manager.getModelForRendering();
             model && model->size() > 0) {

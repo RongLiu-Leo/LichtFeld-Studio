@@ -6,6 +6,7 @@
 
 #include "checkpoint.hpp"
 #include "components/bilateral_grid.hpp"
+#include "components/directional_background.hpp"
 #include "components/ppisp.hpp"
 #include "components/ppisp_controller_pool.hpp"
 #include "components/sparsity_optimizer.hpp"
@@ -163,6 +164,7 @@ namespace lfs::training {
 
         const lfs::core::param::TrainingParameters& getParams() const { return params_; }
         void setParams(const lfs::core::param::TrainingParameters& params);
+        [[nodiscard]] std::optional<DirectionalBackgroundSnapshot> learnedDirectionalBackgroundSnapshot() const;
 
         void setOnIterationStart(std::function<void()> cb) { on_iteration_start_ = std::move(cb); }
 
@@ -232,6 +234,11 @@ namespace lfs::training {
         // Returns the resized background image for the given camera dimensions
         // Returns empty tensor if no background image is set
         lfs::core::Tensor get_background_image_for_camera(int width, int height);
+        lfs::core::Tensor get_background_image_for_camera(
+            const lfs::core::Camera& camera,
+            int width,
+            int height,
+            int iteration);
 
         lfs::core::Tensor get_random_background_for_camera(int width, int height, int iteration);
 
@@ -398,6 +405,7 @@ namespace lfs::training {
         lfs::core::Tensor bg_image_base_{};                              // Original background image [C, H, W]
         std::unordered_map<uint64_t, lfs::core::Tensor> bg_image_cache_; // Cache of resized bg images keyed by (H << 32) | W
         lfs::core::Tensor random_bg_buffer_{};                           // Reusable buffer for random background
+        std::unique_ptr<DirectionalBackground> directional_background_;
         std::unique_ptr<TrainingProgress> progress_;
         size_t train_dataset_size_ = 0;
         size_t total_cameras_count_ = 0;

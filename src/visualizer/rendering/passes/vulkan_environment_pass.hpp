@@ -5,6 +5,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "rendering/rendering.hpp"
 
 #include <filesystem>
 #include <glm/glm.hpp>
@@ -24,6 +25,7 @@ namespace lfs::vis {
         float exposure = 0.0f;
         float rotation_radians = 0.0f;
         bool equirectangular_view = false;
+        lfs::rendering::LearnedSkyRenderState learned_sky;
     };
 
     class LFS_VIS_API VulkanEnvironmentPass {

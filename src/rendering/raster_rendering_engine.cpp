@@ -204,6 +204,38 @@ namespace lfs::rendering {
                 glm::vec3(1.0f));
         }
 
+        [[nodiscard]] float sigmoidClamped(const float value) {
+            const float clamped = std::clamp(value, -16.0f, 16.0f);
+            return 1.0f / (1.0f + std::exp(-clamped));
+        }
+
+        [[nodiscard]] glm::vec3 evaluateLearnedSky(const LearnedSkyRenderState& sky,
+                                                   const glm::vec3& dir) {
+            float basis[9] = {1.0f};
+            if (sky.degree >= 1) {
+                basis[1] = dir.x;
+                basis[2] = dir.y;
+                basis[3] = dir.z;
+            }
+            if (sky.degree >= 2) {
+                basis[4] = dir.x * dir.y;
+                basis[5] = dir.y * dir.z;
+                basis[6] = dir.z * dir.x;
+                basis[7] = dir.x * dir.x - dir.y * dir.y;
+                basis[8] = 3.0f * dir.z * dir.z - 1.0f;
+            }
+
+            const int basis_count = std::clamp((sky.degree + 1) * (sky.degree + 1), 1, 9);
+            glm::vec3 raw(0.0f);
+            for (int b = 0; b < basis_count; ++b) {
+                raw += sky.coeffs[static_cast<size_t>(b)] * basis[b];
+            }
+            return glm::vec3(
+                sigmoidClamped(raw.r),
+                sigmoidClamped(raw.g),
+                sigmoidClamped(raw.b));
+        }
+
         [[nodiscard]] glm::vec3 rotateAroundY(const glm::vec3& value, const float radians) {
             const float c = std::cos(radians);
             const float s = std::sin(radians);
@@ -303,6 +335,25 @@ namespace lfs::rendering {
                     image[i] = request.background_color.r;
                     image[pixel_count + i] = request.background_color.g;
                     image[2 * pixel_count + i] = request.background_color.b;
+                }
+                return image;
+            }
+
+            if (request.environment.learned_sky.enabled) {
+                const auto& sky = request.environment.learned_sky;
+                for (int y = 0; y < height; ++y) {
+                    for (int x = 0; x < width; ++x) {
+                        const glm::vec3 world_dir = environmentDirectionForPixel(
+                            request.frame_view, x, y, request.environment.equirectangular);
+                        const glm::vec3 color = glm::clamp(
+                            evaluateLearnedSky(sky, world_dir),
+                            glm::vec3(0.0f),
+                            glm::vec3(1.0f));
+                        const size_t pixel = static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x);
+                        image[pixel] = color.r;
+                        image[pixel_count + pixel] = color.g;
+                        image[2 * pixel_count + pixel] = color.b;
+                    }
                 }
                 return image;
             }

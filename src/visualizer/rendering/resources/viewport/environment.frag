@@ -8,7 +8,7 @@ layout(push_constant) uniform EnvPush {
     mat4 cam_to_world;       // upper-left mat3 = camera rotation; w col unused
     vec4 intrinsics;         // focal_x, focal_y, cx, cy
     vec4 viewport_exposure;  // viewport.xy, exposure, rotation_radians
-    vec4 flags;              // x = is_equirectangular_view
+    vec4 flags;              // x = is_equirectangular_view, y = sampled texture is display-linear learned sky
 } push;
 
 const float PI = 3.14159265358979323846;
@@ -61,8 +61,12 @@ void main() {
     uv.x = fract(uv.x);
     uv.y = clamp(uv.y, 0.0, 1.0);
     vec3 color = textureLod(u_environment, uv, 0.0).rgb;
-    color *= exp2(push.viewport_exposure.z);
-    color = aces_tonemap(color);
-    color = pow(color, vec3(1.0 / 2.2));
+    if (push.flags.y < 0.5) {
+        color *= exp2(push.viewport_exposure.z);
+        color = aces_tonemap(color);
+        color = pow(color, vec3(1.0 / 2.2));
+    } else {
+        color = clamp(color, 0.0, 1.0);
+    }
     outColor = vec4(color, 1.0);
 }

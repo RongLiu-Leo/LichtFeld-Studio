@@ -159,12 +159,20 @@ namespace lfs::core {
             opt_json["prune_ratio"] = prune_ratio;
             opt_json["bg_modulation"] = bg_modulation;
 
-            static constexpr const char* BG_MODE_NAMES[] = {"solid_color", "modulation", "image", "random"};
+            static constexpr const char* BG_MODE_NAMES[] = {"solid_color", "modulation", "image", "random", "learned_directional"};
             opt_json["bg_mode"] = BG_MODE_NAMES[static_cast<int>(bg_mode)];
             opt_json["bg_color"] = {bg_color[0], bg_color[1], bg_color[2]};
             if (!bg_image_path.empty()) {
                 opt_json["bg_image_path"] = path_to_utf8(bg_image_path);
             }
+            opt_json["bg_learned_degree"] = bg_learned_degree;
+            opt_json["bg_learned_lr"] = bg_learned_lr;
+            opt_json["bg_learned_l2"] = bg_learned_l2;
+            opt_json["bg_learned_start_iter"] = bg_learned_start_iter;
+            opt_json["bg_alpha_release"] = bg_alpha_release;
+            opt_json["bg_auto_sky_gate"] = bg_auto_sky_gate;
+            opt_json["bg_sky_gate_threshold"] = bg_sky_gate_threshold;
+            opt_json["bg_sky_opacity_decay"] = bg_sky_opacity_decay;
 
             // Mask parameters
             static constexpr const char* MASK_MODE_NAMES[] = {"none", "segment", "ignore", "alpha_consistent"};
@@ -194,6 +202,20 @@ namespace lfs::core {
                 return "GUT and igs+ strategy cannot be used together";
             if (ppisp_freeze_from_sidecar && !use_ppisp)
                 return "PPISP sidecar freeze requires PPISP enabled";
+            if (bg_learned_degree < 0 || bg_learned_degree > 2)
+                return "Learned directional background degree must be between 0 and 2";
+            if (bg_learned_lr < 0.0f)
+                return "Learned directional background learning rate must be non-negative";
+            if (bg_learned_l2 < 0.0f)
+                return "Learned directional background L2 must be non-negative";
+            if (bg_learned_start_iter < 0)
+                return "Learned directional background start iteration must be non-negative";
+            if (bg_alpha_release < 0.0f)
+                return "Learned directional background alpha release must be non-negative";
+            if (bg_sky_gate_threshold < 0.0f || bg_sky_gate_threshold > 1.0f)
+                return "Learned directional background sky gate threshold must be between 0 and 1";
+            if (bg_sky_opacity_decay < 0.0f)
+                return "Learned directional background sky opacity decay must be non-negative";
             return {};
         }
 
@@ -459,6 +481,8 @@ namespace lfs::core {
                     params.bg_mode = BackgroundMode::Image;
                 } else if (mode == "random") {
                     params.bg_mode = BackgroundMode::Random;
+                } else if (mode == "learned_directional" || mode == "learned_sky") {
+                    params.bg_mode = BackgroundMode::LearnedDirectional;
                 }
             }
             if (json.contains("bg_color") && json["bg_color"].is_array() && json["bg_color"].size() == 3) {
@@ -466,6 +490,30 @@ namespace lfs::core {
             }
             if (json.contains("bg_image_path")) {
                 params.bg_image_path = utf8_to_path(json["bg_image_path"].get<std::string>());
+            }
+            if (json.contains("bg_learned_degree")) {
+                params.bg_learned_degree = json["bg_learned_degree"];
+            }
+            if (json.contains("bg_learned_lr")) {
+                params.bg_learned_lr = json["bg_learned_lr"];
+            }
+            if (json.contains("bg_learned_l2")) {
+                params.bg_learned_l2 = json["bg_learned_l2"];
+            }
+            if (json.contains("bg_learned_start_iter")) {
+                params.bg_learned_start_iter = json["bg_learned_start_iter"];
+            }
+            if (json.contains("bg_alpha_release")) {
+                params.bg_alpha_release = json["bg_alpha_release"];
+            }
+            if (json.contains("bg_auto_sky_gate")) {
+                params.bg_auto_sky_gate = json["bg_auto_sky_gate"];
+            }
+            if (json.contains("bg_sky_gate_threshold")) {
+                params.bg_sky_gate_threshold = json["bg_sky_gate_threshold"];
+            }
+            if (json.contains("bg_sky_opacity_decay")) {
+                params.bg_sky_opacity_decay = json["bg_sky_opacity_decay"];
             }
 
             // Mask parameters

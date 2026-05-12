@@ -18,6 +18,7 @@
 #include <vector>
 
 namespace lfs::training {
+    class DirectionalBackground;
 
     // Peak Signal-to-Noise Ratio
     class PSNR {
@@ -113,7 +114,8 @@ namespace lfs::training {
         EvalMetrics evaluate(const int iteration,
                              const lfs::core::SplatData& splatData,
                              std::shared_ptr<CameraDataset> val_dataset,
-                             lfs::core::Tensor& background);
+                             lfs::core::Tensor& background,
+                             DirectionalBackground* directional_background = nullptr);
 
         // Save final report
         void save_report() const {

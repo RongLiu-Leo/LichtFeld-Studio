@@ -5,6 +5,7 @@
 #include "metrics.hpp"
 #include "../rasterization/fast_rasterizer.hpp"
 #include "../rasterization/gsplat_rasterizer.hpp"
+#include "components/directional_background.hpp"
 #include "core/cuda/undistort/undistort.hpp"
 #include "core/events.hpp"
 #include "core/image_io.hpp"
@@ -434,7 +435,8 @@ namespace lfs::training {
     EvalMetrics MetricsEvaluator::evaluate(const int iteration,
                                            const lfs::core::SplatData& splatData,
                                            std::shared_ptr<CameraDataset> val_dataset,
-                                           lfs::core::Tensor& background) {
+                                           lfs::core::Tensor& background,
+                                           DirectionalBackground* directional_background) {
         if (!_params.optimization.enable_eval) {
             throw std::runtime_error("Evaluation is not enabled");
         }
@@ -492,11 +494,17 @@ namespace lfs::training {
 
             auto& splatData_mutable = const_cast<lfs::core::SplatData&>(splatData);
             RenderOutput r_output;
+            lfs::core::Tensor bg_image;
+            if (_params.optimization.bg_mode == lfs::core::param::BackgroundMode::LearnedDirectional &&
+                directional_background &&
+                directional_background->is_initialized()) {
+                bg_image = directional_background->render(*cam, cam->image_width(), cam->image_height());
+            }
             if (_params.optimization.gut) {
                 r_output = gsplat_rasterize(*cam, splatData_mutable, background,
-                                            1.0f, false, GsplatRenderMode::RGB, true);
+                                            1.0f, false, GsplatRenderMode::RGB, true, bg_image);
             } else {
-                r_output = fast_rasterize(*cam, splatData_mutable, background, _params.optimization.mip_filter);
+                r_output = fast_rasterize(*cam, splatData_mutable, background, _params.optimization.mip_filter, bg_image);
             }
             r_output.image = r_output.image.clamp(0.0f, 1.0f);
 

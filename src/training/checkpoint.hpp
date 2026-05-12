@@ -35,6 +35,7 @@ namespace lfs::training {
 
     class IStrategy;
     class BilateralGrid;
+    class DirectionalBackground;
     class PPISP;
     class PPISPControllerPool;
 
@@ -45,6 +46,7 @@ namespace lfs::training {
         const IStrategy& strategy,
         const lfs::core::param::TrainingParameters& params,
         const BilateralGrid* bilateral_grid = nullptr,
+        const DirectionalBackground* directional_background = nullptr,
         const PPISP* ppisp = nullptr,
         const PPISPControllerPool* ppisp_controller_pool = nullptr);
 
@@ -54,6 +56,7 @@ namespace lfs::training {
         IStrategy& strategy,
         lfs::core::param::TrainingParameters& params,
         BilateralGrid* bilateral_grid = nullptr,
+        DirectionalBackground* directional_background = nullptr,
         PPISP* ppisp = nullptr,
         PPISPControllerPool* ppisp_controller_pool = nullptr);
 

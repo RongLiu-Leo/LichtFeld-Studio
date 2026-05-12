@@ -314,7 +314,8 @@ namespace lfs::vis::gui {
 
     rendering::MeshRenderOptions makeVideoExportMeshOptions(const RenderSettings& render_settings,
                                                             const bool any_selected,
-                                                            const bool is_selected) {
+                                                            const bool is_selected,
+                                                            const bool transparent_background) {
         return rendering::MeshRenderOptions{
             .wireframe_overlay = render_settings.mesh_wireframe,
             .wireframe_color = render_settings.mesh_wireframe_color,
@@ -329,7 +330,7 @@ namespace lfs::vis::gui {
             .dim_non_emphasized = render_settings.desaturate_unselected && any_selected,
             .flash_intensity = 0.0f,
             .background_color = render_settings.background_color,
-            .transparent_background = environmentBackgroundEnabled(render_settings)};
+            .transparent_background = transparent_background};
     }
 
     std::expected<lfs::core::Tensor, std::string> renderVideoExportFrame(
@@ -342,7 +343,7 @@ namespace lfs::vis::gui {
         const int height) {
         const auto viewport = makeVideoExportViewport(cam_state, render_settings, width, height);
         const auto frame_view = makeVideoExportFrameView(cam_state, render_settings, width, height);
-        const bool render_environment = environmentBackgroundEnabled(render_settings);
+        const bool render_environment = environmentBackgroundEnabled(render_settings) || snapshot.learned_sky.enabled;
         const bool requires_composite_pass = render_environment || !snapshot.meshes.empty();
 
         std::optional<rendering::GpuFrame> primary_frame;
@@ -481,7 +482,7 @@ namespace lfs::vis::gui {
                 .mesh = mesh_snapshot.mesh.get(),
                 .transform = mesh_snapshot.transform,
                 .options = makeVideoExportMeshOptions(
-                    render_settings, any_selected, mesh_snapshot.is_selected),
+                    render_settings, any_selected, mesh_snapshot.is_selected, render_environment),
             });
         }
 
@@ -497,7 +498,8 @@ namespace lfs::vis::gui {
                                  : std::filesystem::path{},
                  .exposure = render_settings.environment_exposure,
                  .rotation_degrees = render_settings.environment_rotation_degrees,
-                 .equirectangular = render_settings.equirectangular},
+                 .equirectangular = render_settings.equirectangular,
+                 .learned_sky = snapshot.learned_sky},
             .meshes = std::move(mesh_items),
         };
         return engine.renderVideoCompositeFrame(primary_frame, composite_request);

@@ -107,6 +107,14 @@ LOCALE_KEYS = {
     "bg_mode": "training_params.bg_mode",
     "bg_color": "training_params.bg_color",
     "bg_image": "training_params.bg_image",
+    "bg_learned_degree": "training_params.bg_learned_degree",
+    "bg_learned_lr": "training_params.bg_learned_lr",
+    "bg_learned_l2": "training_params.bg_learned_l2",
+    "bg_learned_start_iter": "training_params.bg_learned_start_iter",
+    "bg_alpha_release": "training_params.bg_alpha_release",
+    "bg_auto_sky_gate": "training_params.bg_auto_sky_gate",
+    "bg_sky_gate_threshold": "training_params.bg_sky_gate_threshold",
+    "bg_sky_opacity_decay": "training_params.bg_sky_opacity_decay",
     "dataset_path": "training.dataset.path",
     "dataset_images": "training.dataset.images",
     "resize_factor": "training.dataset.resize_factor",
@@ -178,6 +186,7 @@ LOCALE_KEYS = {
     "bg_option_modulation": "training.options.bg.modulation",
     "bg_option_image": "training.options.bg.image",
     "bg_option_random": "training.options.bg.random",
+    "bg_option_learned": "training.options.bg.learned",
     "bg_color_red_prefix": "training_panel.color_red_prefix",
     "bg_color_green_prefix": "training_panel.color_green_prefix",
     "bg_color_blue_prefix": "training_panel.color_blue_prefix",
@@ -205,6 +214,7 @@ PARAM_BOOL_PROPS = [
     "ppisp_use_controller",
     "ppisp_freeze_from_sidecar",
     "ppisp_freeze_gaussians",
+    "bg_auto_sky_gate",
     "random",
     "revised_opacity",
     "enable_eval",
@@ -237,6 +247,13 @@ NUM_PROP_DEFS = [
     ("mask_opacity_penalty_weight", float, "%.3f", 0, None, 0.1),
     ("mask_opacity_penalty_power", float, "%.3f", 0.5, None, 0.1),
     ("mask_threshold", float, "%.3f", 0, 1, 0.05),
+    ("bg_learned_degree", int, "%d", 0, 2, 1),
+    ("bg_learned_lr", float, "%.5f", 0, 0.1, 0.001),
+    ("bg_learned_l2", float, "%.6f", 0, 0.01, 0.0001),
+    ("bg_learned_start_iter", int, "%d", 0, None, 100),
+    ("bg_alpha_release", float, "%.3f", 0, 2.0, 0.01),
+    ("bg_sky_gate_threshold", float, "%.3f", 0, 1.0, 0.01),
+    ("bg_sky_opacity_decay", float, "%.3f", 0, 1.0, 0.01),
     ("opacity_reg", float, "%.4f", 0, None, 0.001),
     ("scale_reg", float, "%.4f", 0, None, 0.001),
     ("tv_loss_weight", float, "%.1f", 0, None, 0.5),
@@ -572,6 +589,10 @@ class TrainingPanel(Panel):
         model.bind_func(
             "dep_bg_image",
             lambda: p() is not None and p().has_params() and p().bg_mode.value == 2,
+        )
+        model.bind_func(
+            "dep_bg_learned",
+            lambda: p() is not None and p().has_params() and p().bg_mode.value == 4,
         )
         model.bind_func(
             "has_bg_clear",
@@ -2450,6 +2471,7 @@ class TrainingPanel(Panel):
                 tr("training.options.bg.modulation"),
                 tr("training.options.bg.image"),
                 tr("training.options.bg.random"),
+                tr("training.options.bg.learned"),
             ]
             changed, new_idx = layout.combo("##py_bg_mode", bg_idx, bg_mode_items)
             if changed:
@@ -2500,6 +2522,86 @@ class TrainingPanel(Panel):
                     tr("training_params.bg_image_clear") + "##py_bg_clear"
                 ):
                     params.bg_image_path = ""
+
+            if bg_mode_val == 4:
+                self._input_int_row(
+                    layout,
+                    tr("training_params.bg_learned_degree"),
+                    "bg_learned_degree",
+                    params,
+                    1,
+                    1,
+                )
+                self._input_float_prop_row(
+                    layout,
+                    tr("training_params.bg_learned_lr"),
+                    "bg_learned_lr",
+                    params,
+                    0.001,
+                    0.01,
+                    "%.5f",
+                    0.0,
+                )
+                self._input_float_prop_row(
+                    layout,
+                    tr("training_params.bg_learned_l2"),
+                    "bg_learned_l2",
+                    params,
+                    0.0001,
+                    0.001,
+                    "%.6f",
+                    0.0,
+                )
+                self._input_int_row(
+                    layout,
+                    tr("training_params.bg_learned_start_iter"),
+                    "bg_learned_start_iter",
+                    params,
+                    100,
+                    1000,
+                )
+                self._input_float_prop_row(
+                    layout,
+                    tr("training_params.bg_alpha_release"),
+                    "bg_alpha_release",
+                    params,
+                    0.01,
+                    0.1,
+                    "%.3f",
+                    0.0,
+                )
+                layout.table_next_row()
+                layout.table_next_column()
+                layout.label(tr("training_params.bg_auto_sky_gate"))
+                layout.table_next_column()
+                changed, new_val = layout.checkbox(
+                    "##py_bg_auto_sky_gate", params.bg_auto_sky_gate
+                )
+                if changed:
+                    params.bg_auto_sky_gate = new_val
+                if layout.is_item_hovered():
+                    layout.set_tooltip(tr("training.tooltip.bg_auto_sky_gate"))
+                if params.bg_auto_sky_gate:
+                    self._input_float_prop_row(
+                        layout,
+                        tr("training_params.bg_sky_gate_threshold"),
+                        "bg_sky_gate_threshold",
+                        params,
+                        0.01,
+                        0.1,
+                        "%.3f",
+                        0.0,
+                    )
+                    self._input_float_prop_row(
+                        layout,
+                        tr("training_params.bg_sky_opacity_decay"),
+                        "bg_sky_opacity_decay",
+                        params,
+                        0.01,
+                        0.1,
+                        "%.3f",
+                        0.0,
+                    )
 
             layout.end_disabled()
             layout.end_table()

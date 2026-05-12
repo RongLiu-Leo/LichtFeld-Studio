@@ -217,6 +217,7 @@
           <option value="1" data-tooltip="training.tooltip.opt.bg_mode.modulation">{{label_bg_option_modulation}}</option>
           <option value="2" data-tooltip="training.tooltip.opt.bg_mode.image">{{label_bg_option_image}}</option>
           <option value="3" data-tooltip="training.tooltip.opt.bg_mode.random">{{label_bg_option_random}}</option>
+          <option value="4" data-tooltip="training.tooltip.opt.bg_mode.learned">{{label_bg_option_learned}}</option>
         </select>
       </div>
       <div class="setting-row setting-row--aligned" data-tooltip="training.tooltip.bg_color" data-if="dep_bg_color">
@@ -238,6 +239,56 @@
           <span class="prop-label">&#160;</span>
           <button class="btn btn--secondary" data-tooltip="training.tooltip.bg_image_browse" data-event-click="action('browse_bg')">{{label_bg_browse}}</button>
           <button class="btn btn--secondary" data-tooltip="training.tooltip.bg_image_clear" data-if="has_bg_clear" data-event-click="action('clear_bg')">{{label_bg_clear}}</button>
+        </div>
+      </div>
+      <div data-if="dep_bg_learned">
+        <div class="setting-row" data-tooltip="training.tooltip.bg_learned_degree">
+          <span class="prop-label">{{label_bg_learned_degree}}</span>
+          <input type="text" class="number-input" data-value="bg_learned_degree_str" />
+          <button class="num-step-btn" data-event-mousedown="num_step('bg_learned_degree', -1)">-</button>
+          <button class="num-step-btn" data-event-mousedown="num_step('bg_learned_degree', 1)">+</button>
+        </div>
+        <div class="setting-row" data-tooltip="training.tooltip.bg_learned_lr">
+          <span class="prop-label">{{label_bg_learned_lr}}</span>
+          <input type="text" class="number-input" data-value="bg_learned_lr_str" />
+          <button class="num-step-btn" data-event-mousedown="num_step('bg_learned_lr', -1)">-</button>
+          <button class="num-step-btn" data-event-mousedown="num_step('bg_learned_lr', 1)">+</button>
+        </div>
+        <div class="setting-row" data-tooltip="training.tooltip.bg_learned_l2">
+          <span class="prop-label">{{label_bg_learned_l2}}</span>
+          <input type="text" class="number-input" data-value="bg_learned_l2_str" />
+          <button class="num-step-btn" data-event-mousedown="num_step('bg_learned_l2', -1)">-</button>
+          <button class="num-step-btn" data-event-mousedown="num_step('bg_learned_l2', 1)">+</button>
+        </div>
+        <div class="setting-row" data-tooltip="training.tooltip.bg_learned_start_iter">
+          <span class="prop-label">{{label_bg_learned_start_iter}}</span>
+          <input type="text" class="number-input" data-value="bg_learned_start_iter_str" />
+          <button class="num-step-btn" data-event-mousedown="num_step('bg_learned_start_iter', -1)">-</button>
+          <button class="num-step-btn" data-event-mousedown="num_step('bg_learned_start_iter', 1)">+</button>
+        </div>
+        <div class="setting-row" data-tooltip="training.tooltip.bg_alpha_release">
+          <span class="prop-label">{{label_bg_alpha_release}}</span>
+          <input type="text" class="number-input" data-value="bg_alpha_release_str" />
+          <button class="num-step-btn" data-event-mousedown="num_step('bg_alpha_release', -1)">-</button>
+          <button class="num-step-btn" data-event-mousedown="num_step('bg_alpha_release', 1)">+</button>
+        </div>
+        <div class="setting-row" data-tooltip="training.tooltip.bg_auto_sky_gate">
+          <span class="prop-label">{{label_bg_auto_sky_gate}}</span>
+          <input type="checkbox" data-checked="bg_auto_sky_gate" />
+        </div>
+        <div data-if="bg_auto_sky_gate">
+          <div class="setting-row" data-tooltip="training.tooltip.bg_sky_gate_threshold">
+            <span class="prop-label">{{label_bg_sky_gate_threshold}}</span>
+            <input type="text" class="number-input" data-value="bg_sky_gate_threshold_str" />
+            <button class="num-step-btn" data-event-mousedown="num_step('bg_sky_gate_threshold', -1)">-</button>
+            <button class="num-step-btn" data-event-mousedown="num_step('bg_sky_gate_threshold', 1)">+</button>
+          </div>
+          <div class="setting-row" data-tooltip="training.tooltip.bg_sky_opacity_decay">
+            <span class="prop-label">{{label_bg_sky_opacity_decay}}</span>
+            <input type="text" class="number-input" data-value="bg_sky_opacity_decay_str" />
+            <button class="num-step-btn" data-event-mousedown="num_step('bg_sky_opacity_decay', -1)">-</button>
+            <button class="num-step-btn" data-event-mousedown="num_step('bg_sky_opacity_decay', 1)">+</button>
+          </div>
         </div>
       </div>
     </div>

@@ -10,7 +10,9 @@
 #include "window/vulkan_context.hpp"
 
 #include <OpenImageIO/imageio.h>
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -27,7 +29,7 @@ namespace lfs::vis {
             float cam_to_world[16];
             float intrinsics[4];
             float viewport_exposure[4]; // size.xy, exposure, rotation_radians
-            float flags[4];             // x = is_equirectangular_view
+            float flags[4];             // x = is_equirectangular_view, y = sampled texture is display-linear learned sky
         };
         static_assert(sizeof(EnvPush) == 112);
 
@@ -64,6 +66,67 @@ namespace lfs::vis {
             return static_cast<std::uint16_t>((sign << 15) | (exp << 10) | (mant >> 13));
         }
 
+        [[nodiscard]] float sigmoidClamped(const float value) {
+            const float clamped = std::clamp(value, -16.0f, 16.0f);
+            return 1.0f / (1.0f + std::exp(-clamped));
+        }
+
+        [[nodiscard]] glm::vec3 evaluateLearnedSky(const lfs::rendering::LearnedSkyRenderState& sky,
+                                                   const glm::vec3& dir) {
+            float basis[9] = {1.0f};
+            if (sky.degree >= 1) {
+                basis[1] = dir.x;
+                basis[2] = dir.y;
+                basis[3] = dir.z;
+            }
+            if (sky.degree >= 2) {
+                basis[4] = dir.x * dir.y;
+                basis[5] = dir.y * dir.z;
+                basis[6] = dir.z * dir.x;
+                basis[7] = dir.x * dir.x - dir.y * dir.y;
+                basis[8] = 3.0f * dir.z * dir.z - 1.0f;
+            }
+
+            const int basis_count = std::clamp((sky.degree + 1) * (sky.degree + 1), 1, 9);
+            glm::vec3 raw(0.0f);
+            for (int b = 0; b < basis_count; ++b) {
+                raw += sky.coeffs[static_cast<size_t>(b)] * basis[b];
+            }
+            return glm::vec3(
+                sigmoidClamped(raw.r),
+                sigmoidClamped(raw.g),
+                sigmoidClamped(raw.b));
+        }
+
+        [[nodiscard]] std::vector<std::uint16_t> makeLearnedSkyTexture(
+            const lfs::rendering::LearnedSkyRenderState& sky,
+            const int width,
+            const int height) {
+            constexpr float kPi = 3.14159265358979323846f;
+            std::vector<std::uint16_t> rgba(static_cast<std::size_t>(width) * height * 4u);
+            for (int y = 0; y < height; ++y) {
+                const float v = (static_cast<float>(y) + 0.5f) / static_cast<float>(height);
+                const float latitude = (0.5f - v) * kPi;
+                const float cos_lat = std::cos(latitude);
+                for (int x = 0; x < width; ++x) {
+                    const float u = (static_cast<float>(x) + 0.5f) / static_cast<float>(width);
+                    const float longitude = (u - 0.5f) * (2.0f * kPi);
+                    const glm::vec3 dir = glm::normalize(glm::vec3(
+                        std::sin(longitude) * cos_lat,
+                        std::sin(latitude),
+                        -std::cos(longitude) * cos_lat));
+                    const glm::vec3 color = evaluateLearnedSky(sky, dir);
+                    const std::size_t index =
+                        (static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x)) * 4u;
+                    rgba[index + 0] = floatToHalf(color.r);
+                    rgba[index + 1] = floatToHalf(color.g);
+                    rgba[index + 2] = floatToHalf(color.b);
+                    rgba[index + 3] = floatToHalf(1.0f);
+                }
+            }
+            return rgba;
+        }
+
     } // namespace
 
     struct VulkanEnvironmentPass::Impl {
@@ -87,6 +150,9 @@ namespace lfs::vis {
         VkImageView image_view = VK_NULL_HANDLE;
         std::filesystem::path loaded_path;
         bool load_failed_for_path = false;
+        bool loaded_learned_sky = false;
+        std::uint64_t loaded_learned_generation = 0;
+        int loaded_learned_degree = -1;
 
         ~Impl() { destroy(); }
 
@@ -155,6 +221,9 @@ namespace lfs::vis {
                 image_alloc = VK_NULL_HANDLE;
             }
             loaded_path.clear();
+            loaded_learned_sky = false;
+            loaded_learned_generation = 0;
+            loaded_learned_degree = -1;
         }
 
         bool createSampler() {
@@ -367,6 +436,139 @@ namespace lfs::vis {
             return r == VK_SUCCESS;
         }
 
+        bool uploadRgba16F(const int w,
+                           const int h,
+                           const std::vector<std::uint16_t>& rgba,
+                           const std::filesystem::path& marker_path) {
+            destroyImage();
+            if (w <= 0 || h <= 0 ||
+                rgba.size() != static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 4u) {
+                return false;
+            }
+
+            VkImageCreateInfo img{};
+            img.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+            img.imageType = VK_IMAGE_TYPE_2D;
+            img.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+            img.extent = {static_cast<std::uint32_t>(w), static_cast<std::uint32_t>(h), 1};
+            img.mipLevels = 1;
+            img.arrayLayers = 1;
+            img.samples = VK_SAMPLE_COUNT_1_BIT;
+            img.tiling = VK_IMAGE_TILING_OPTIMAL;
+            img.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            img.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            img.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            VmaAllocationCreateInfo ai{};
+            ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+            if (vmaCreateImage(allocator, &img, &ai, &image, &image_alloc, nullptr) != VK_SUCCESS) {
+                return false;
+            }
+
+            const VkDeviceSize bytes = static_cast<VkDeviceSize>(rgba.size()) * sizeof(std::uint16_t);
+            VkBuffer staging = VK_NULL_HANDLE;
+            VmaAllocation staging_alloc = VK_NULL_HANDLE;
+            VkBufferCreateInfo bi{};
+            bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            bi.size = bytes;
+            bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            VmaAllocationCreateInfo sa{};
+            sa.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+            sa.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+            if (vmaCreateBuffer(allocator, &bi, &sa, &staging, &staging_alloc, nullptr) != VK_SUCCESS) {
+                destroyImage();
+                return false;
+            }
+            void* mapped = nullptr;
+            if (vmaMapMemory(allocator, staging_alloc, &mapped) != VK_SUCCESS) {
+                vmaDestroyBuffer(allocator, staging, staging_alloc);
+                destroyImage();
+                return false;
+            }
+            std::memcpy(mapped, rgba.data(), static_cast<std::size_t>(bytes));
+            vmaFlushAllocation(allocator, staging_alloc, 0, bytes);
+            vmaUnmapMemory(allocator, staging_alloc);
+
+            VkCommandBuffer cb = beginCmds();
+            if (cb == VK_NULL_HANDLE) {
+                vmaDestroyBuffer(allocator, staging, staging_alloc);
+                destroyImage();
+                return false;
+            }
+
+            VkImageMemoryBarrier to_dst{};
+            to_dst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            to_dst.image = image;
+            to_dst.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            to_dst.subresourceRange.levelCount = 1;
+            to_dst.subresourceRange.layerCount = 1;
+            to_dst.srcAccessMask = 0;
+            to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 0, 0, nullptr, 0, nullptr, 1, &to_dst);
+
+            VkBufferImageCopy region{};
+            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.imageSubresource.layerCount = 1;
+            region.imageExtent = {static_cast<std::uint32_t>(w), static_cast<std::uint32_t>(h), 1};
+            vkCmdCopyBufferToImage(cb, staging, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+            VkImageMemoryBarrier to_shader{};
+            to_shader.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            to_shader.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            to_shader.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            to_shader.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            to_shader.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            to_shader.image = image;
+            to_shader.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            to_shader.subresourceRange.levelCount = 1;
+            to_shader.subresourceRange.layerCount = 1;
+            to_shader.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            to_shader.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                 0, 0, nullptr, 0, nullptr, 1, &to_shader);
+
+            const bool ok = endCmds(cb);
+            vmaDestroyBuffer(allocator, staging, staging_alloc);
+            if (!ok) {
+                destroyImage();
+                return false;
+            }
+
+            VkImageViewCreateInfo iv{};
+            iv.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            iv.image = image;
+            iv.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            iv.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+            iv.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            iv.subresourceRange.levelCount = 1;
+            iv.subresourceRange.layerCount = 1;
+            if (vkCreateImageView(device, &iv, nullptr, &image_view) != VK_SUCCESS) {
+                destroyImage();
+                return false;
+            }
+
+            VkDescriptorImageInfo dii{};
+            dii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            dii.imageView = image_view;
+            dii.sampler = sampler;
+            VkWriteDescriptorSet write{};
+            write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            write.dstSet = desc_set;
+            write.dstBinding = 0;
+            write.descriptorCount = 1;
+            write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            write.pImageInfo = &dii;
+            vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+
+            loaded_path = marker_path;
+            return true;
+        }
+
         bool loadFromPath(const std::filesystem::path& path) {
             destroyImage();
             if (path.empty()) {
@@ -415,6 +617,8 @@ namespace lfs::vis {
                 rgba[i * 4 + 2] = floatToHalf(b);
                 rgba[i * 4 + 3] = floatToHalf(1.0f);
             }
+
+            return uploadRgba16F(w, h, rgba, path);
 
             VkImageCreateInfo img{};
             img.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -540,12 +744,35 @@ namespace lfs::vis {
         }
 
         void prepare(const VulkanEnvironmentParams& params) {
-            if (!params.enabled) {
+            if (!params.enabled && !params.learned_sky.enabled) {
                 if (image != VK_NULL_HANDLE)
                     destroyImage();
                 load_failed_for_path = false;
                 return;
             }
+
+            if (params.learned_sky.enabled) {
+                if (loaded_learned_sky &&
+                    image != VK_NULL_HANDLE &&
+                    loaded_learned_generation == params.learned_sky.generation &&
+                    loaded_learned_degree == params.learned_sky.degree) {
+                    return;
+                }
+                constexpr int kLearnedSkyWidth = 512;
+                constexpr int kLearnedSkyHeight = 256;
+                const auto rgba = makeLearnedSkyTexture(params.learned_sky, kLearnedSkyWidth, kLearnedSkyHeight);
+                const bool ok = uploadRgba16F(
+                    kLearnedSkyWidth,
+                    kLearnedSkyHeight,
+                    rgba,
+                    std::filesystem::path("__lfs_learned_sky__"));
+                loaded_learned_sky = ok;
+                loaded_learned_generation = ok ? params.learned_sky.generation : 0;
+                loaded_learned_degree = ok ? params.learned_sky.degree : -1;
+                load_failed_for_path = !ok;
+                return;
+            }
+
             if (params.map_path == loaded_path && image != VK_NULL_HANDLE) {
                 return;
             }
@@ -604,6 +831,7 @@ namespace lfs::vis {
             push.viewport_exposure[2] = params.exposure;
             push.viewport_exposure[3] = params.rotation_radians;
             push.flags[0] = params.equirectangular_view ? 1.0f : 0.0f;
+            push.flags[1] = params.learned_sky.enabled ? 1.0f : 0.0f;
             vkCmdPushConstants(cb, pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
                                0, sizeof(push), &push);
             vkCmdDraw(cb, 6, 1, 0, 0);

@@ -33,6 +33,7 @@
 #include "strategies/mcmc.hpp"
 #include "strategies/strategy_factory.hpp"
 #include "training/kernels/camera_loss_heatmap.cuh"
+#include "training/kernels/directional_background.hpp"
 #include "training/kernels/grad_alpha.hpp"
 #include "training/kernels/mrnf_kernels.hpp"
 
@@ -1843,6 +1844,15 @@ namespace lfs::training {
                 LOG_INFO("Background color set to RGB({:.2f}, {:.2f}, {:.2f})", bg_color[0], bg_color[1], bg_color[2]);
             }
 
+            if (params.optimization.bg_mode == lfs::core::param::BackgroundMode::LearnedDirectional) {
+                if (!directional_background_) {
+                    directional_background_ = std::make_unique<DirectionalBackground>();
+                }
+                directional_background_->ensure_initialized(
+                    params.optimization.bg_color,
+                    params.optimization.bg_learned_degree);
+            }
+
             // Initialize image cache loader before any code path that calls getInstance()
             auto& cache_loader = lfs::io::CacheLoader::getInstance(
                 params_.dataset.loading_params.use_cpu_memory,
@@ -2097,15 +2107,20 @@ namespace lfs::training {
 
             auto& model = strategy_->get_model();
             auto& background = background_;
+            auto bg_image = get_background_image_for_camera(
+                camera,
+                camera.image_width(),
+                camera.image_height(),
+                current_iteration_.load());
 
             RenderOutput output;
             if (params_.optimization.gut) {
                 output = gsplat_rasterize(
                     camera, model, background,
-                    1.0f, false, GsplatRenderMode::RGB, true);
+                    1.0f, false, GsplatRenderMode::RGB, true, bg_image);
             } else {
                 output = fast_rasterize(
-                    camera, model, background, params_.optimization.mip_filter);
+                    camera, model, background, params_.optimization.mip_filter, bg_image);
             }
 
             rendered = output.image;
@@ -2266,6 +2281,23 @@ namespace lfs::training {
             bg_ptr[2] = bg_color[2];
             background_ = bg_cpu.to(lfs::core::Device::CUDA);
         }
+
+        if (params_.optimization.bg_mode == lfs::core::param::BackgroundMode::LearnedDirectional) {
+            if (!directional_background_) {
+                directional_background_ = std::make_unique<DirectionalBackground>();
+            }
+            directional_background_->ensure_initialized(
+                params_.optimization.bg_color,
+                params_.optimization.bg_learned_degree);
+        }
+    }
+
+    std::optional<DirectionalBackgroundSnapshot> Trainer::learnedDirectionalBackgroundSnapshot() const {
+        if (params_.optimization.bg_mode != lfs::core::param::BackgroundMode::LearnedDirectional ||
+            !directional_background_) {
+            return std::nullopt;
+        }
+        return directional_background_->snapshot();
     }
 
     TrainingProgress::Phase Trainer::get_progress_phase(
@@ -2373,7 +2405,10 @@ namespace lfs::training {
     } // anonymous namespace
 
     lfs::core::Tensor& Trainer::background_for_step(int iter) {
-        if (!params_.optimization.bg_modulation) {
+        const bool use_modulation =
+            params_.optimization.bg_modulation ||
+            params_.optimization.bg_mode == lfs::core::param::BackgroundMode::Modulation;
+        if (!use_modulation) {
             return background_;
         }
 
@@ -2444,6 +2479,34 @@ namespace lfs::training {
         LOG_DEBUG("Background image resized: {}x{} -> {}x{}", src_w, src_h, width, height);
 
         return resized;
+    }
+
+    lfs::core::Tensor Trainer::get_background_image_for_camera(
+        const lfs::core::Camera& camera,
+        const int width,
+        const int height,
+        const int iteration) {
+        switch (params_.optimization.bg_mode) {
+        case lfs::core::param::BackgroundMode::Image:
+            return get_background_image_for_camera(width, height);
+        case lfs::core::param::BackgroundMode::Random:
+            return get_random_background_for_camera(width, height, iteration);
+        case lfs::core::param::BackgroundMode::LearnedDirectional:
+            if (iteration < params_.optimization.bg_learned_start_iter) {
+                return {};
+            }
+            if (!directional_background_) {
+                directional_background_ = std::make_unique<DirectionalBackground>();
+            }
+            directional_background_->ensure_initialized(
+                params_.optimization.bg_color,
+                params_.optimization.bg_learned_degree);
+            return directional_background_->render(camera, width, height, 0, 0, width, height);
+        case lfs::core::param::BackgroundMode::SolidColor:
+        case lfs::core::param::BackgroundMode::Modulation:
+            return {};
+        }
+        return {};
     }
 
     lfs::core::Tensor Trainer::get_random_background_for_camera(int width, int height, int iteration) {
@@ -2534,12 +2597,14 @@ namespace lfs::training {
             lfs::core::Tensor& bg = background_for_step(iter);
             nvtxRangePop();
 
-            lfs::core::Tensor bg_image;
-            if (params_.optimization.bg_mode == lfs::core::param::BackgroundMode::Image) {
-                bg_image = get_background_image_for_camera(cam->image_width(), cam->image_height());
-            } else if (params_.optimization.bg_mode == lfs::core::param::BackgroundMode::Random) {
-                bg_image = get_random_background_for_camera(cam->image_width(), cam->image_height(), iter);
-            }
+            lfs::core::Tensor bg_image = get_background_image_for_camera(
+                *cam, cam->image_width(), cam->image_height(), iter);
+            const bool learned_directional_bg_active =
+                params_.optimization.bg_mode == lfs::core::param::BackgroundMode::LearnedDirectional &&
+                bg_image.is_valid() &&
+                !bg_image.is_empty() &&
+                directional_background_ &&
+                directional_background_->is_initialized();
 
             // Configurable tile-based training to reduce peak memory in 3DGUT.
             const int full_width = cam->image_width();
@@ -2731,6 +2796,60 @@ namespace lfs::training {
                     }
                 }
 
+                lfs::core::Tensor sky_gate_tile;
+                lfs::core::Tensor sky_gate_target;
+                if (learned_directional_bg_active && params_.optimization.bg_auto_sky_gate) {
+                    sky_gate_target = gt_tile;
+                    if (sky_gate_target.dtype() == lfs::core::DataType::UInt8) {
+                        sky_gate_target = sky_gate_target.to(lfs::core::DataType::Float32) / 255.0f;
+                    } else if (sky_gate_target.dtype() != lfs::core::DataType::Float32) {
+                        sky_gate_target = sky_gate_target.to(lfs::core::DataType::Float32);
+                    }
+                    if (sky_gate_target.device() != lfs::core::Device::CUDA) {
+                        sky_gate_target = sky_gate_target.cuda();
+                    }
+                    sky_gate_target = sky_gate_target.is_contiguous()
+                                          ? sky_gate_target
+                                          : sky_gate_target.contiguous();
+
+                    const bool target_layout_ok =
+                        sky_gate_target.ndim() == 3 &&
+                        (sky_gate_target.shape()[0] == 3 || sky_gate_target.shape()[2] == 3);
+                    const bool target_chw = target_layout_ok && sky_gate_target.shape()[0] == 3;
+                    const int target_h = target_chw
+                                             ? static_cast<int>(sky_gate_target.shape()[1])
+                                             : (target_layout_ok ? static_cast<int>(sky_gate_target.shape()[0]) : 0);
+                    const int target_w = target_chw
+                                             ? static_cast<int>(sky_gate_target.shape()[2])
+                                             : (target_layout_ok ? static_cast<int>(sky_gate_target.shape()[1]) : 0);
+                    if (target_layout_ok && target_h == tile_height && target_w == tile_width) {
+                        sky_gate_tile = lfs::core::Tensor::empty(
+                            {static_cast<size_t>(tile_height), static_cast<size_t>(tile_width)},
+                            lfs::core::Device::CUDA,
+                            lfs::core::DataType::Float32);
+                        sky_gate_tile.set_stream(sky_gate_target.stream());
+                        const auto [fx, fy, cx, cy] = cam->get_intrinsics();
+                        lfs::training::kernels::launch_compute_auto_sky_gate(
+                            sky_gate_target.ptr<float>(),
+                            target_chw,
+                            sky_gate_tile.ptr<float>(),
+                            tile_height,
+                            tile_width,
+                            full_height,
+                            full_width,
+                            tile_x_offset,
+                            tile_y_offset,
+                            fx,
+                            fy,
+                            cx,
+                            cy,
+                            cam->world_view_transform_ptr(),
+                            static_cast<int>(cam->camera_model_type()),
+                            params_.optimization.bg_sky_gate_threshold,
+                            sky_gate_target.stream());
+                    }
+                }
+
                 // Render the tile
                 nvtxRangePush("rasterize_forward");
 
@@ -2785,7 +2904,7 @@ namespace lfs::training {
                     output = std::move(rasterize_result->first);
                     fast_ctx.emplace(std::move(rasterize_result->second));
 
-                    if (fast_ctx->forward_ctx.n_instances == 0) {
+                    if (fast_ctx->forward_ctx.n_instances == 0 && !learned_directional_bg_active) {
                         fast_ctx->release_forward_context();
                         nvtxRangePop();
                         nvtxRangePop();
@@ -2985,6 +3104,104 @@ namespace lfs::training {
                         tile_grad_raw = result->grad_raw;
                     }
 
+                    if (learned_directional_bg_active &&
+                        (params_.optimization.bg_alpha_release > 0.0f ||
+                         (sky_gate_tile.is_valid() && params_.optimization.bg_sky_opacity_decay > 0.0f)) &&
+                        bg_tile.is_valid() &&
+                        !bg_tile.is_empty() &&
+                        output.alpha.is_valid() &&
+                        output.alpha.numel() > 0) {
+                        lfs::core::Tensor release_rendered = corrected_image;
+                        if (release_rendered.dtype() != lfs::core::DataType::Float32) {
+                            release_rendered = release_rendered.to(lfs::core::DataType::Float32);
+                        }
+                        if (release_rendered.device() != lfs::core::Device::CUDA) {
+                            release_rendered = release_rendered.cuda();
+                        }
+                        release_rendered = release_rendered.is_contiguous()
+                                               ? release_rendered
+                                               : release_rendered.contiguous();
+
+                        lfs::core::Tensor release_target = gt_tile;
+                        if (release_target.dtype() == lfs::core::DataType::UInt8) {
+                            release_target = release_target.to(lfs::core::DataType::Float32) / 255.0f;
+                        } else if (release_target.dtype() != lfs::core::DataType::Float32) {
+                            release_target = release_target.to(lfs::core::DataType::Float32);
+                        }
+                        if (release_target.device() != lfs::core::Device::CUDA) {
+                            release_target = release_target.cuda();
+                        }
+                        release_target = release_target.is_contiguous()
+                                             ? release_target
+                                             : release_target.contiguous();
+
+                        lfs::core::Tensor release_bg = bg_tile;
+                        if (release_bg.device() != lfs::core::Device::CUDA) {
+                            release_bg = release_bg.cuda();
+                        }
+                        release_bg = release_bg.is_contiguous() ? release_bg : release_bg.contiguous();
+
+                        const bool rendered_layout_ok =
+                            release_rendered.ndim() == 3 &&
+                            (release_rendered.shape()[0] == 3 || release_rendered.shape()[2] == 3);
+                        const bool target_layout_ok =
+                            release_target.ndim() == 3 &&
+                            (release_target.shape()[0] == 3 || release_target.shape()[2] == 3);
+                        const bool rendered_chw = rendered_layout_ok && release_rendered.shape()[0] == 3;
+                        const bool target_chw = target_layout_ok && release_target.shape()[0] == 3;
+                        const int release_h = rendered_chw
+                                                  ? static_cast<int>(release_rendered.shape()[1])
+                                                  : (rendered_layout_ok ? static_cast<int>(release_rendered.shape()[0]) : 0);
+                        const int release_w = rendered_chw
+                                                  ? static_cast<int>(release_rendered.shape()[2])
+                                                  : (rendered_layout_ok ? static_cast<int>(release_rendered.shape()[1]) : 0);
+                        const int target_h = target_chw
+                                                 ? static_cast<int>(release_target.shape()[1])
+                                                 : (target_layout_ok ? static_cast<int>(release_target.shape()[0]) : 0);
+                        const int target_w = target_chw
+                                                 ? static_cast<int>(release_target.shape()[2])
+                                                 : (target_layout_ok ? static_cast<int>(release_target.shape()[1]) : 0);
+                        if (rendered_layout_ok &&
+                            target_layout_ok &&
+                            release_h == tile_height &&
+                            release_w == tile_width &&
+                            target_h == tile_height &&
+                            target_w == tile_width &&
+                            release_bg.ndim() == 3 &&
+                            release_bg.shape()[0] == 3 &&
+                            static_cast<int>(release_bg.shape()[1]) == tile_height &&
+                            static_cast<int>(release_bg.shape()[2]) == tile_width) {
+                            if (!tile_grad_alpha.is_valid() || tile_grad_alpha.numel() == 0) {
+                                tile_grad_alpha = lfs::core::Tensor::zeros(
+                                    {static_cast<size_t>(tile_height), static_cast<size_t>(tile_width)},
+                                    lfs::core::Device::CUDA);
+                            } else {
+                                if (tile_grad_alpha.device() != lfs::core::Device::CUDA) {
+                                    tile_grad_alpha = tile_grad_alpha.cuda();
+                                }
+                                tile_grad_alpha = tile_grad_alpha.is_contiguous()
+                                                      ? tile_grad_alpha
+                                                      : tile_grad_alpha.contiguous();
+                            }
+                            tile_grad_alpha.set_stream(release_rendered.stream());
+                            lfs::training::kernels::launch_learned_sky_alpha_release(
+                                release_rendered.ptr<float>(),
+                                rendered_chw,
+                                release_bg.ptr<float>(),
+                                release_target.ptr<float>(),
+                                target_chw,
+                                output.alpha.ptr<float>(),
+                                sky_gate_tile.is_valid() ? sky_gate_tile.ptr<float>() : nullptr,
+                                tile_grad_alpha.ptr<float>(),
+                                tile_height,
+                                tile_width,
+                                params_.optimization.bg_alpha_release,
+                                sky_gate_tile.is_valid() ? params_.optimization.bg_sky_opacity_decay : 0.0f,
+                                0.03f,
+                                release_rendered.stream());
+                        }
+                    }
+
                     // 2) Extract error map from workspace's ssim_map
                     if (use_pixel_error_densification) {
                         if (use_ssim_error && params_.optimization.lambda_dssim > 0.0f) {
@@ -3166,6 +3383,20 @@ namespace lfs::training {
                         raster_grad = raster_grad + tile_grad_raw;
                     }
 
+                    if (learned_directional_bg_active) {
+                        nvtxRangePush("directional_background_backward");
+                        directional_background_->accumulate_gradient(
+                            *cam,
+                            raster_grad,
+                            output.alpha,
+                            sky_gate_tile,
+                            tile_x_offset,
+                            tile_y_offset,
+                            full_width,
+                            full_height);
+                        nvtxRangePop();
+                    }
+
                     nvtxRangePush("rasterize_backward");
                     if (gsplat_ctx) {
                         auto grad_alpha = tile_grad_alpha.is_valid()
@@ -3177,7 +3408,7 @@ namespace lfs::training {
                                                   use_pixel_error_densification ? tile_error_map : lfs::core::Tensor{});
                     } else {
                         tile_context_guard.release();
-                        if (run_fastgs_gaussian_backward) {
+                        if (run_fastgs_gaussian_backward && fast_ctx->forward_ctx.n_instances > 0) {
                             fast_rasterize_backward(*fast_ctx, raster_grad, strategy_->get_model(),
                                                     strategy_->get_optimizer(), tile_grad_alpha,
                                                     use_pixel_error_densification ? tile_error_map : lfs::core::Tensor{},
@@ -3267,6 +3498,13 @@ namespace lfs::training {
                     ppisp_->zero_grad();
                     ppisp_->scheduler_step();
 
+                    nvtxRangePop();
+                }
+
+                if (learned_directional_bg_active) {
+                    nvtxRangePush("directional_background_step");
+                    directional_background_->add_l2_gradient(params_.optimization.bg_learned_l2);
+                    directional_background_->optimizer_step(params_.optimization.bg_learned_lr);
                     nvtxRangePop();
                 }
             }
@@ -3402,7 +3640,8 @@ namespace lfs::training {
                     auto metrics = evaluator_->evaluate(iter,
                                                         strategy_->get_model(),
                                                         val_dataset_,
-                                                        background_);
+                                                        background_,
+                                                        directional_background_.get());
                     LOG_INFO("{}", metrics.to_string());
                 }
 
@@ -3445,11 +3684,19 @@ namespace lfs::training {
                             }
 
                             RenderOutput rendered_timelapse_output;
+                            auto timelapse_bg_image = get_background_image_for_camera(
+                                *cam_to_use,
+                                cam_to_use->image_width(),
+                                cam_to_use->image_height(),
+                                iter);
                             if (params_.optimization.gut) {
                                 rendered_timelapse_output = gsplat_rasterize(*cam_to_use, strategy_->get_model(), background_,
-                                                                             1.0f, false, GsplatRenderMode::RGB, true);
+                                                                             1.0f, false, GsplatRenderMode::RGB, true,
+                                                                             timelapse_bg_image);
                             } else {
-                                rendered_timelapse_output = fast_rasterize(*cam_to_use, strategy_->get_model(), background_);
+                                rendered_timelapse_output = fast_rasterize(*cam_to_use, strategy_->get_model(), background_,
+                                                                           params_.optimization.mip_filter,
+                                                                           timelapse_bg_image);
                             }
 
                             // Get folder name to save in by stripping file extension
@@ -3828,7 +4075,8 @@ namespace lfs::training {
 
         if (save_checkpoint_file) {
             auto ckpt_result = lfs::training::save_checkpoint(save_path, iter_num, *strategy_, params_,
-                                                              bilateral_grid_.get(), ppisp_.get(), controller_to_save);
+                                                              bilateral_grid_.get(), directional_background_.get(),
+                                                              ppisp_.get(), controller_to_save);
             if (!ckpt_result) {
                 LOG_WARN("Failed to save checkpoint: {}", ckpt_result.error());
             }
@@ -3861,7 +4109,8 @@ namespace lfs::training {
         PPISPControllerPool* controller_to_save = controller_pool_for_save(iteration);
 
         return lfs::training::save_checkpoint(params_.dataset.output_path, iteration, *strategy_, params_,
-                                              bilateral_grid_.get(), ppisp_.get(), controller_to_save);
+                                              bilateral_grid_.get(), directional_background_.get(),
+                                              ppisp_.get(), controller_to_save);
     }
 
     std::expected<void, std::string> Trainer::save_checkpoint_to(const std::filesystem::path& output_path,
@@ -3873,7 +4122,8 @@ namespace lfs::training {
         PPISPControllerPool* controller_to_save = controller_pool_for_save(iteration);
 
         return lfs::training::save_checkpoint(output_path, iteration, *strategy_, params_,
-                                              bilateral_grid_.get(), ppisp_.get(), controller_to_save);
+                                              bilateral_grid_.get(), directional_background_.get(),
+                                              ppisp_.get(), controller_to_save);
     }
 
     lfs::core::Tensor Trainer::applyPPISPForViewport(const lfs::core::Tensor& rgb, const int camera_uid,
@@ -3951,6 +4201,17 @@ namespace lfs::training {
             }
         }
 
+        if (!directional_background_) {
+            const auto checkpoint_header = lfs::core::load_checkpoint_header(checkpoint_path);
+            const bool checkpoint_has_directional_bg =
+                checkpoint_header &&
+                lfs::core::has_flag(checkpoint_header->flags, lfs::core::CheckpointFlags::HAS_DIRECTIONAL_BACKGROUND);
+            if (checkpoint_has_directional_bg ||
+                params_.optimization.bg_mode == lfs::core::param::BackgroundMode::LearnedDirectional) {
+                directional_background_ = std::make_unique<DirectionalBackground>();
+            }
+        }
+
         // Create PPISP before loading if needed
         if (params_.optimization.use_ppisp && !ppisp_) {
             if (auto init_result = initialize_ppisp(); !init_result) {
@@ -3983,7 +4244,7 @@ namespace lfs::training {
         }
 
         auto result = lfs::training::load_checkpoint(
-            checkpoint_path, *strategy_, params_, bilateral_grid_.get(), ppisp_.get(),
+            checkpoint_path, *strategy_, params_, bilateral_grid_.get(), directional_background_.get(), ppisp_.get(),
             ppisp_controller_pool_.get());
         if (!result) {
             return result;
@@ -3998,6 +4259,15 @@ namespace lfs::training {
             }
         }
         sync_strategy_optimization_params();
+
+        if (params_.optimization.bg_mode == lfs::core::param::BackgroundMode::LearnedDirectional) {
+            if (!directional_background_) {
+                directional_background_ = std::make_unique<DirectionalBackground>();
+            }
+            directional_background_->ensure_initialized(
+                params_.optimization.bg_color,
+                params_.optimization.bg_learned_degree);
+        }
 
         current_iteration_ = *result;
 

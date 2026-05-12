@@ -3,6 +3,7 @@
 
 #include "checkpoint.hpp"
 #include "components/bilateral_grid.hpp"
+#include "components/directional_background.hpp"
 #include "components/ppisp.hpp"
 #include "components/ppisp_controller_pool.hpp"
 #include "core/events.hpp"
@@ -57,6 +58,7 @@ namespace lfs::training {
         const IStrategy& strategy,
         const lfs::core::param::TrainingParameters& params,
         const BilateralGrid* bilateral_grid,
+        const DirectionalBackground* directional_background,
         const PPISP* ppisp,
         const PPISPControllerPool* ppisp_controller_pool) {
 
@@ -156,6 +158,8 @@ namespace lfs::training {
             header.flags = CheckpointFlags::NONE;
             if (bilateral_grid)
                 header.flags = header.flags | CheckpointFlags::HAS_BILATERAL_GRID;
+            if (directional_background && directional_background->is_initialized())
+                header.flags = header.flags | CheckpointFlags::HAS_DIRECTIONAL_BACKGROUND;
             if (ppisp)
                 header.flags = header.flags | CheckpointFlags::HAS_PPISP;
             if (ppisp_controller_pool)
@@ -179,6 +183,12 @@ namespace lfs::training {
                 bilateral_grid->serialize(file);
                 LOG_DEBUG("Bilateral grid state saved (step={}, lr={:.2e})",
                           bilateral_grid->get_step(), bilateral_grid->get_lr());
+            }
+
+            if (directional_background && directional_background->is_initialized()) {
+                directional_background->serialize(file);
+                LOG_DEBUG("Learned directional background saved (degree={}, step={})",
+                          directional_background->degree(), directional_background->step());
             }
 
             // PPISP (if present)
@@ -223,6 +233,8 @@ namespace lfs::training {
             std::string extras;
             if (bilateral_grid)
                 extras += ", +bilateral";
+            if (directional_background && directional_background->is_initialized())
+                extras += ", +dir_bg";
             if (ppisp)
                 extras += ", +ppisp";
             if (ppisp_controller_pool)
@@ -246,6 +258,7 @@ namespace lfs::training {
         IStrategy& strategy,
         lfs::core::param::TrainingParameters& params,
         BilateralGrid* bilateral_grid,
+        DirectionalBackground* directional_background,
         PPISP* ppisp,
         PPISPControllerPool* ppisp_controller_pool) {
 
@@ -325,6 +338,19 @@ namespace lfs::training {
                 }
             } else if (bilateral_grid) {
                 LOG_WARN("Bilateral grid requested but not in checkpoint - using fresh state");
+            }
+
+            if (has_flag(header.flags, CheckpointFlags::HAS_DIRECTIONAL_BACKGROUND)) {
+                if (directional_background) {
+                    directional_background->deserialize(file);
+                } else {
+                    LOG_WARN("Checkpoint has learned directional background but none provided - skipping data");
+                    DirectionalBackground temp;
+                    temp.deserialize(file);
+                }
+            } else if (directional_background &&
+                       params.optimization.bg_mode == lfs::core::param::BackgroundMode::LearnedDirectional) {
+                LOG_WARN("Learned directional background requested but not in checkpoint - using fresh state");
             }
 
             // PPISP (if present in checkpoint)

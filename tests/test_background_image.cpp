@@ -315,6 +315,9 @@ TEST_F(BackgroundImageTest, Checkpoint_BackgroundParamsSerialized) {
     params.bg_mode = BackgroundMode::Image;
     params.bg_color = {0.1f, 0.2f, 0.3f};
     params.bg_image_path = "/path/to/background.png";
+    params.bg_auto_sky_gate = false;
+    params.bg_sky_gate_threshold = 0.35f;
+    params.bg_sky_opacity_decay = 0.07f;
 
     const nlohmann::json j = params.to_json();
 
@@ -325,6 +328,9 @@ TEST_F(BackgroundImageTest, Checkpoint_BackgroundParamsSerialized) {
     EXPECT_FLOAT_EQ(j["bg_color"][1].get<float>(), 0.2f);
     EXPECT_FLOAT_EQ(j["bg_color"][2].get<float>(), 0.3f);
     EXPECT_EQ(j["bg_image_path"], "/path/to/background.png");
+    EXPECT_FALSE(j["bg_auto_sky_gate"].get<bool>());
+    EXPECT_FLOAT_EQ(j["bg_sky_gate_threshold"].get<float>(), 0.35f);
+    EXPECT_FLOAT_EQ(j["bg_sky_opacity_decay"].get<float>(), 0.07f);
 }
 
 TEST_F(BackgroundImageTest, Checkpoint_BackgroundParamsDeserialized) {
@@ -345,6 +351,9 @@ TEST_F(BackgroundImageTest, Checkpoint_BackgroundParamsDeserialized) {
     j["bg_mode"] = "image";
     j["bg_color"] = {0.4f, 0.5f, 0.6f};
     j["bg_image_path"] = "/custom/bg.jpg";
+    j["bg_auto_sky_gate"] = false;
+    j["bg_sky_gate_threshold"] = 0.3f;
+    j["bg_sky_opacity_decay"] = 0.02f;
 
     const auto params = OptimizationParameters::from_json(j);
 
@@ -353,6 +362,9 @@ TEST_F(BackgroundImageTest, Checkpoint_BackgroundParamsDeserialized) {
     EXPECT_FLOAT_EQ(params.bg_color[1], 0.5f);
     EXPECT_FLOAT_EQ(params.bg_color[2], 0.6f);
     EXPECT_EQ(params.bg_image_path, "/custom/bg.jpg");
+    EXPECT_FALSE(params.bg_auto_sky_gate);
+    EXPECT_FLOAT_EQ(params.bg_sky_gate_threshold, 0.3f);
+    EXPECT_FLOAT_EQ(params.bg_sky_opacity_decay, 0.02f);
 }
 
 TEST_F(BackgroundImageTest, Checkpoint_OldCheckpointLoadsWithDefaults) {
@@ -378,12 +390,15 @@ TEST_F(BackgroundImageTest, Checkpoint_OldCheckpointLoadsWithDefaults) {
     EXPECT_FLOAT_EQ(params.bg_color[1], 0.0f);
     EXPECT_FLOAT_EQ(params.bg_color[2], 0.0f);
     EXPECT_TRUE(params.bg_image_path.empty());
+    EXPECT_TRUE(params.bg_auto_sky_gate);
+    EXPECT_FLOAT_EQ(params.bg_sky_gate_threshold, 0.25f);
+    EXPECT_FLOAT_EQ(params.bg_sky_opacity_decay, 0.05f);
 }
 
 TEST_F(BackgroundImageTest, Checkpoint_AllBackgroundModesSerialize) {
-    static constexpr const char* EXPECTED_NAMES[] = {"solid_color", "modulation", "image"};
+    static constexpr const char* EXPECTED_NAMES[] = {"solid_color", "modulation", "image", "random", "learned_directional"};
 
-    for (int mode_int = 0; mode_int < 3; ++mode_int) {
+    for (int mode_int = 0; mode_int < 5; ++mode_int) {
         OptimizationParameters params;
         params.bg_mode = static_cast<BackgroundMode>(mode_int);
 

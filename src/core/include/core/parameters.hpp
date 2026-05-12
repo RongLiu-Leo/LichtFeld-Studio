@@ -29,10 +29,11 @@ namespace lfs::core {
 
         // Background mode for training - only one can be active at a time
         enum class BackgroundMode {
-            SolidColor, // Use bg_color RGB values
-            Modulation, // Sinusoidal background modulation
-            Image,      // Use custom background image
-            Random      // Random per-pixel colors each iteration
+            SolidColor,        // Use bg_color RGB values
+            Modulation,        // Sinusoidal background modulation
+            Image,             // Use custom background image
+            Random,            // Random per-pixel colors each iteration
+            LearnedDirectional // Learn a low-frequency directional background
         };
 
         inline constexpr std::string_view kStrategyMCMC = "mcmc";
@@ -131,6 +132,14 @@ namespace lfs::core {
             BackgroundMode bg_mode = BackgroundMode::SolidColor; // Which background mode to use
             std::array<float, 3> bg_color = {0.0f, 0.0f, 0.0f};  // RGB background color [0-1]
             std::filesystem::path bg_image_path = {};            // Custom background image path
+            int bg_learned_degree = 2;                           // SH degree for learned directional background (0-2)
+            float bg_learned_lr = 1e-2f;                         // Learning rate for learned directional background
+            float bg_learned_l2 = 1e-4f;                         // L2 on non-constant learned background coefficients
+            int bg_learned_start_iter = 0;                       // Iteration at which learned background starts updating
+            float bg_alpha_release = 0.1f;                       // Extra alpha gradient where learned sky explains pixels better
+            bool bg_auto_sky_gate = true;                        // Restrict learned-sky updates to sky-like pixels
+            float bg_sky_gate_threshold = 0.25f;                 // Confidence threshold for automatic sky gating
+            float bg_sky_opacity_decay = 0.05f;                  // Extra opacity decay in gated sky regions
 
             // Bilateral grid parameters
             bool use_bilateral_grid = false;

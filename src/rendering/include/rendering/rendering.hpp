@@ -356,12 +356,20 @@ namespace lfs::rendering {
         bool transparent_background = false;
     };
 
+    struct LearnedSkyRenderState {
+        bool enabled = false;
+        int degree = 0;
+        std::uint64_t generation = 0;
+        std::array<glm::vec3, 9> coeffs{};
+    };
+
     struct EnvironmentRenderOptions {
         bool enabled = false;
         std::filesystem::path map_path;
         float exposure = 0.0f;
         float rotation_degrees = 0.0f;
         bool equirectangular = false;
+        LearnedSkyRenderState learned_sky;
     };
 
     struct MeshFrameItem {

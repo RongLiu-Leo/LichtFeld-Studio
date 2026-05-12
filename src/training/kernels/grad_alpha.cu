@@ -155,6 +155,63 @@ namespace lfs::training::kernels {
         grad_alpha[idx] = -sum;
     }
 
+    __device__ inline float read_rgb_pixel(
+        const float* __restrict__ image,
+        const bool is_chw,
+        const int c,
+        const int idx,
+        const int HW) {
+        return is_chw ? image[c * HW + idx] : image[idx * 3 + c];
+    }
+
+    __global__ void learned_sky_alpha_release_kernel(
+        const float* __restrict__ rendered_image,
+        const bool rendered_is_chw,
+        const float* __restrict__ bg_image,
+        const float* __restrict__ target_image,
+        const bool target_is_chw,
+        const float* __restrict__ alpha,
+        const float* __restrict__ sky_gate,
+        float* __restrict__ grad_alpha,
+        const int H,
+        const int W,
+        const float weight,
+        const float sky_opacity_decay,
+        const float margin) {
+        const int idx = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+        const int HW = H * W;
+        if (idx >= HW)
+            return;
+
+        const float gate = sky_gate ? fminf(fmaxf(sky_gate[idx], 0.0f), 1.0f) : 1.0f;
+        if (gate <= 0.0f)
+            return;
+
+        const float opacity = fminf(fmaxf(alpha[idx], 0.0f), 1.0f);
+        if (opacity <= 0.05f)
+            return;
+
+        if (sky_opacity_decay > 0.0f) {
+            grad_alpha[idx] += (gate * sky_opacity_decay * opacity) / static_cast<float>(HW);
+        }
+
+        if (weight > 0.0f) {
+            float render_err = 0.0f;
+            float sky_err = 0.0f;
+            for (int c = 0; c < 3; ++c) {
+                const float target = read_rgb_pixel(target_image, target_is_chw, c, idx, HW);
+                const float rendered = read_rgb_pixel(rendered_image, rendered_is_chw, c, idx, HW);
+                const float sky = bg_image[c * HW + idx];
+                render_err += fabsf(rendered - target);
+                sky_err += fabsf(sky - target);
+            }
+            const float advantage = (render_err - sky_err) * (1.0f / 3.0f) - margin;
+            if (advantage > 0.0f) {
+                grad_alpha[idx] += (gate * weight * advantage * opacity) / static_cast<float>(HW);
+            }
+        }
+    }
+
     void launch_fused_grad_alpha_with_image(
         const float* grad_image,
         const float* bg_image,
@@ -166,6 +223,41 @@ namespace lfs::training::kernels {
 
         fused_grad_alpha_with_image_kernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
             grad_image, bg_image, grad_alpha, H, W);
+    }
+
+    void launch_learned_sky_alpha_release(
+        const float* rendered_image,
+        const bool rendered_is_chw,
+        const float* bg_image,
+        const float* target_image,
+        const bool target_is_chw,
+        const float* alpha,
+        const float* sky_gate,
+        float* grad_alpha,
+        const int H,
+        const int W,
+        const float weight,
+        const float sky_opacity_decay,
+        const float margin,
+        cudaStream_t stream) {
+        if (weight <= 0.0f && sky_opacity_decay <= 0.0f)
+            return;
+        const int total = H * W;
+        const unsigned int blocks = num_blocks_1d(total);
+        learned_sky_alpha_release_kernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
+            rendered_image,
+            rendered_is_chw,
+            bg_image,
+            target_image,
+            target_is_chw,
+            alpha,
+            sky_gate,
+            grad_alpha,
+            H,
+            W,
+            weight,
+            sky_opacity_decay,
+            margin);
     }
 
     void launch_fused_background_blend(

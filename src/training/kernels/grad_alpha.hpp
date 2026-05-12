@@ -26,6 +26,23 @@ namespace lfs::training::kernels {
         int H, int W,
         cudaStream_t stream = nullptr);
 
+    // Adds a conservative positive alpha gradient where the learned sky image is
+    // closer to the target than the current rendered image.
+    void launch_learned_sky_alpha_release(
+        const float* rendered_image,
+        bool rendered_is_chw,
+        const float* bg_image,
+        const float* target_image,
+        bool target_is_chw,
+        const float* alpha,
+        const float* sky_gate,
+        float* grad_alpha,
+        int H, int W,
+        float weight,
+        float sky_opacity_decay,
+        float margin,
+        cudaStream_t stream = nullptr);
+
     // Computes output[c,h,w] = image[c,h,w] + (1 - alpha[h,w]) * bg_color[c].
     void launch_fused_background_blend(
         const float* image,

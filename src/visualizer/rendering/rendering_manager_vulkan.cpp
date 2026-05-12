@@ -19,6 +19,7 @@
 #include "vksplat_viewport_renderer.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <expected>
 #include <format>
 #include <shared_mutex>
@@ -38,6 +39,51 @@ namespace lfs::vis {
                 }
             }
             return lock;
+        }
+
+        [[nodiscard]] std::uint64_t hashLearnedSkySnapshot(
+            const lfs::training::DirectionalBackgroundSnapshot& snapshot) {
+            std::uint64_t hash = 1469598103934665603ull;
+            const auto mix = [&hash](const std::uint32_t value) {
+                hash ^= static_cast<std::uint64_t>(value);
+                hash *= 1099511628211ull;
+            };
+            mix(static_cast<std::uint32_t>(snapshot.degree));
+            mix(static_cast<std::uint32_t>(snapshot.step));
+            mix(static_cast<std::uint32_t>(snapshot.step >> 32));
+            for (const auto& coeff : snapshot.coeffs) {
+                for (const float channel : coeff) {
+                    std::uint32_t bits = 0;
+                    std::memcpy(&bits, &channel, sizeof(bits));
+                    mix(bits);
+                }
+            }
+            return hash;
+        }
+
+        [[nodiscard]] std::optional<lfs::rendering::LearnedSkyRenderState> captureLearnedSkyRenderState(
+            const SceneManager* const scene_manager) {
+            const auto* const tm = scene_manager ? scene_manager->getTrainerManager() : nullptr;
+            const auto* const trainer = tm ? tm->getTrainer() : nullptr;
+            if (!trainer) {
+                return std::nullopt;
+            }
+            const auto snapshot = trainer->learnedDirectionalBackgroundSnapshot();
+            if (!snapshot) {
+                return std::nullopt;
+            }
+
+            lfs::rendering::LearnedSkyRenderState state;
+            state.enabled = true;
+            state.degree = snapshot->degree;
+            state.generation = hashLearnedSkySnapshot(*snapshot);
+            for (size_t i = 0; i < state.coeffs.size(); ++i) {
+                state.coeffs[i] = glm::vec3(
+                    snapshot->coeffs[i][0],
+                    snapshot->coeffs[i][1],
+                    snapshot->coeffs[i][2]);
+            }
+            return state;
         }
 
         [[nodiscard]] std::vector<ViewportInteractionPanel> buildVulkanInteractionPanels(
@@ -330,7 +376,8 @@ namespace lfs::vis {
         [[nodiscard]] RenderingManager::VulkanMeshFrame populateMeshFrame(
             const FrameContext& frame_ctx,
             const RenderSettings& settings,
-            const VulkanSplitViewParams& split_view_params) {
+            const VulkanSplitViewParams& split_view_params,
+            const std::optional<lfs::rendering::LearnedSkyRenderState>& learned_sky) {
             RenderingManager::VulkanMeshFrame frame;
             const auto vp_data = frame_ctx.makeViewportData();
             frame.view_projection = vp_data.getProjectionMatrix() * vp_data.getViewMatrix();
@@ -375,7 +422,7 @@ namespace lfs::vis {
             }
 
             const auto frame_view = frame_ctx.makeFrameView();
-            frame.environment.enabled = environmentBackgroundEnabled(settings);
+            frame.environment.enabled = environmentBackgroundEnabled(settings) || learned_sky.has_value();
             frame.environment.map_path = settings.environment_map_path;
             frame.environment.camera_to_world = vp_data.rotation;
             frame.environment.viewport_size =
@@ -393,6 +440,12 @@ namespace lfs::vis {
             frame.environment.exposure = settings.environment_exposure;
             frame.environment.rotation_radians = glm::radians(settings.environment_rotation_degrees);
             frame.environment.equirectangular_view = settings.equirectangular;
+            if (learned_sky) {
+                frame.environment.map_path.clear();
+                frame.environment.exposure = 0.0f;
+                frame.environment.rotation_radians = 0.0f;
+                frame.environment.learned_sky = *learned_sky;
+            }
 
             frame.split_view = split_view_params;
 
@@ -540,7 +593,10 @@ namespace lfs::vis {
         const bool has_meshes = std::any_of(scene_state.meshes.begin(),
                                             scene_state.meshes.end(),
                                             [](const auto& mesh) { return mesh.mesh != nullptr; });
-        const bool has_environment = environmentBackgroundEnabled(settings_);
+        const auto learned_sky = captureLearnedSkyRenderState(scene_manager);
+        const bool has_environment = environmentBackgroundEnabled(settings_) || learned_sky.has_value();
+        const bool learned_sky_transparent =
+            learned_sky.has_value() && !splitViewEnabled(settings_.split_view_mode);
         const bool has_render_content = has_renderable_model || has_point_cloud || has_meshes || has_environment;
         const size_t model_ptr = reinterpret_cast<size_t>(model);
 
@@ -767,6 +823,9 @@ namespace lfs::vis {
                          .node_visibility_mask = {}},
                     .filters = state.filters,
                     .transparent_background = environmentBackgroundUsesTransparentViewerCompositing(settings_)};
+                if (learned_sky_transparent) {
+                    request.transparent_background = true;
+                }
                 auto result = engine_->renderPointCloudImage(*frame_ctx.scene_state.point_cloud, request);
                 if (!result || !result->image) {
                     return std::unexpected(result ? "Raw point-cloud panel render returned no image"
@@ -801,6 +860,9 @@ namespace lfs::vis {
                     .scene = scene,
                     .filters = state.filters,
                     .transparent_background = environmentBackgroundUsesTransparentViewerCompositing(settings_)};
+                if (learned_sky_transparent) {
+                    request.transparent_background = true;
+                }
                 auto result = engine_->renderPointCloudImage(*panel_model, request);
                 if (!result || !result->image) {
                     return std::unexpected(result ? "Point-cloud panel render returned no image"
@@ -824,6 +886,9 @@ namespace lfs::vis {
             }
             if (node_visibility_override) {
                 request.scene.node_visibility_mask = *node_visibility_override;
+            }
+            if (learned_sky_transparent) {
+                request.transparent_background = true;
             }
 
             const bool vksplat_panel_supported =
@@ -1135,6 +1200,9 @@ namespace lfs::vis {
             }
             auto pc_request = buildPointCloudRenderRequest(
                 frame_ctx, render_size, *transforms_for_request);
+            if (learned_sky_transparent) {
+                pc_request.transparent_background = true;
+            }
 
             // Vulkan-native path: skip CUDA staging, drive an external VkImage
             // straight through the same plumbing the VkSplat backend uses.
@@ -1257,9 +1325,8 @@ namespace lfs::vis {
                 viewport_interaction_context_.scene_manager = scene_manager;
                 split_view_service_.updateInfo(FrameResources{});
 
-                if (!frame_ctx.scene_state.meshes.empty() ||
-                    environmentBackgroundEnabled(settings_)) {
-                    auto mesh_frame = populateMeshFrame(frame_ctx, settings_, pending_split_view);
+                if (!frame_ctx.scene_state.meshes.empty() || has_environment) {
+                    auto mesh_frame = populateMeshFrame(frame_ctx, settings_, pending_split_view, learned_sky);
                     populate_independent_split_mesh_panels(mesh_frame);
                     if (render_result->depth_image_view != VK_NULL_HANDLE) {
                         // Hardware depth attachment stores Vulkan-native NDC z; the
@@ -1300,6 +1367,9 @@ namespace lfs::vis {
             }
         } else if (has_renderable_model) {
             auto request = buildViewportRenderRequest(frame_ctx, render_size);
+            if (learned_sky_transparent) {
+                request.transparent_background = true;
+            }
             // VkSplat is editing/viewing only — splat files loaded with no
             // trainer attached. As soon as a dataset is present (ready, paused,
             // or running), its persistent Vulkan-side sort buffers can be
@@ -1367,9 +1437,8 @@ namespace lfs::vis {
                         // below. Republish it here so the viewport pass sees the
                         // current camera and can depth-test meshes against the
                         // GPU-native VkSplat depth image.
-                        if (!frame_ctx.scene_state.meshes.empty() ||
-                            environmentBackgroundEnabled(settings_)) {
-                            auto mesh_frame = populateMeshFrame(frame_ctx, settings_, pending_split_view);
+                        if (!frame_ctx.scene_state.meshes.empty() || has_environment) {
+                            auto mesh_frame = populateMeshFrame(frame_ctx, settings_, pending_split_view, learned_sky);
                             populate_independent_split_mesh_panels(mesh_frame);
                             if (render_result->depth_image_view != VK_NULL_HANDLE) {
                                 mesh_frame.depth_blit.external_image_view = render_result->depth_image_view;
@@ -1422,9 +1491,8 @@ namespace lfs::vis {
         }
 
         if ((rendered_image || render_error.empty() || pending_split_view.enabled) &&
-            (environmentBackgroundEnabled(settings_) || !frame_ctx.scene_state.meshes.empty() ||
-             pending_split_view.enabled)) {
-            VulkanMeshFrame gpu_mesh_frame = populateMeshFrame(frame_ctx, settings_, pending_split_view);
+            (has_environment || !frame_ctx.scene_state.meshes.empty() || pending_split_view.enabled)) {
+            VulkanMeshFrame gpu_mesh_frame = populateMeshFrame(frame_ctx, settings_, pending_split_view, learned_sky);
             populate_independent_split_mesh_panels(gpu_mesh_frame);
 
             // Splat depth → mesh-pass z-test source. Only meaningful when the splat
@@ -1452,7 +1520,7 @@ namespace lfs::vis {
 
         const bool has_gpu_only_pass =
             !frame_ctx.scene_state.meshes.empty() ||
-            environmentBackgroundEnabled(settings_) ||
+            has_environment ||
             pending_split_view.enabled;
 
         if (!rendered_image && has_gpu_only_pass) {

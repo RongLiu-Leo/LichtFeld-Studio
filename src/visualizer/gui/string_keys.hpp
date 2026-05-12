@@ -44,7 +44,7 @@ namespace lichtfeld::Strings {
             inline constexpr const char* MENU = "menu.help";
             inline constexpr const char* ABOUT = "menu.help.about";
         } // namespace Help
-    } // namespace Menu
+    }     // namespace Menu
 
     namespace Window {
         inline constexpr const char* ABOUT = "window.about";
@@ -89,7 +89,7 @@ namespace lichtfeld::Strings {
             inline constexpr const char* ENABLED = "about.interop.enabled";
             inline constexpr const char* DISABLED = "about.interop.disabled";
         } // namespace Interop
-    } // namespace About
+    }     // namespace About
 
     namespace Training {
         namespace Section {
@@ -278,7 +278,7 @@ namespace lichtfeld::Strings {
             inline constexpr const char* ADD = "training.button.add";
             inline constexpr const char* REMOVE = "training.button.remove";
         } // namespace Button
-    } // namespace Training
+    }     // namespace Training
 
     namespace Scene {
         inline constexpr const char* ADD_PLY = "scene.add_ply";
@@ -760,9 +760,18 @@ namespace lichtfeld::Strings {
         inline constexpr const char* BG_MODE_MODULATION = "training_params.bg_mode_modulation";
         inline constexpr const char* BG_MODE_IMAGE = "training_params.bg_mode_image";
         inline constexpr const char* BG_MODE_RANDOM = "training_params.bg_mode_random";
+        inline constexpr const char* BG_MODE_LEARNED = "training_params.bg_mode_learned";
         inline constexpr const char* BG_MODULATION = "training_params.bg_modulation";
         inline constexpr const char* BG_COLOR = "training_params.bg_color";
         inline constexpr const char* BG_IMAGE = "training_params.bg_image";
+        inline constexpr const char* BG_LEARNED_DEGREE = "training_params.bg_learned_degree";
+        inline constexpr const char* BG_LEARNED_LR = "training_params.bg_learned_lr";
+        inline constexpr const char* BG_LEARNED_L2 = "training_params.bg_learned_l2";
+        inline constexpr const char* BG_LEARNED_START_ITER = "training_params.bg_learned_start_iter";
+        inline constexpr const char* BG_ALPHA_RELEASE = "training_params.bg_alpha_release";
+        inline constexpr const char* BG_AUTO_SKY_GATE = "training_params.bg_auto_sky_gate";
+        inline constexpr const char* BG_SKY_GATE_THRESHOLD = "training_params.bg_sky_gate_threshold";
+        inline constexpr const char* BG_SKY_OPACITY_DECAY = "training_params.bg_sky_opacity_decay";
         inline constexpr const char* BG_IMAGE_BROWSE = "training_params.bg_image_browse";
         inline constexpr const char* BG_IMAGE_CLEAR = "training_params.bg_image_clear";
         inline constexpr const char* INIT_OPACITY = "training_params.init_opacity";

@@ -11,6 +11,7 @@
 #include "core/splat_data.hpp"
 #include "core/tensor.hpp"
 #include "io/video/video_export_options.hpp"
+#include "rendering/rendering.hpp"
 #include <expected>
 #include <glm/glm.hpp>
 #include <memory>
@@ -57,6 +58,7 @@ namespace lfs::vis::gui {
         std::vector<VideoExportCropBoxSnapshot> cropboxes;
         int selected_cropbox_index = -1;
         std::optional<VideoExportEllipsoidSnapshot> active_ellipsoid;
+        lfs::rendering::LearnedSkyRenderState learned_sky;
 
         [[nodiscard]] bool hasRenderableContent() const {
             return (combined_model && combined_model->size() > 0) ||

@@ -132,10 +132,11 @@ namespace lfs::training {
         float scaling_modifier = 1.0f,
         bool antialiased = false,
         GsplatRenderMode render_mode = GsplatRenderMode::RGB,
-        bool use_gut = false) {
+        bool use_gut = false,
+        const lfs::core::Tensor& bg_image = {}) {
         auto result = gsplat_rasterize_forward(
             viewpoint_camera, gaussian_model, bg_color, 0, 0, 0, 0,
-            scaling_modifier, antialiased, render_mode, use_gut);
+            scaling_modifier, antialiased, render_mode, use_gut, bg_image);
         if (!result) {
             throw std::runtime_error(result.error());
         }
@@ -161,7 +162,8 @@ namespace lfs::training {
         float scaling_modifier = 1.0f,
         bool antialiased = false,
         GsplatRenderMode render_mode = GsplatRenderMode::RGB,
-        bool use_gut = false) {
+        bool use_gut = false,
+        const lfs::core::Tensor& bg_image = {}) {
         return gsplat_rasterize(
             const_cast<lfs::core::Camera&>(viewpoint_camera),
             gaussian_model,
@@ -169,7 +171,8 @@ namespace lfs::training {
             scaling_modifier,
             antialiased,
             render_mode,
-            use_gut);
+            use_gut,
+            bg_image);
     }
 
 } // namespace lfs::training
