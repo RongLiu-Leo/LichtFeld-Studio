@@ -92,8 +92,15 @@ namespace lfs::vis::gui {
                 hash *= 1099511628211ull;
             };
             mix(static_cast<std::uint32_t>(snapshot.degree));
+            mix(static_cast<std::uint32_t>(snapshot.texture_width));
+            mix(static_cast<std::uint32_t>(snapshot.texture_height));
             mix(static_cast<std::uint32_t>(snapshot.step));
             mix(static_cast<std::uint32_t>(snapshot.step >> 32));
+            for (const float value : snapshot.texture) {
+                std::uint32_t bits = 0;
+                std::memcpy(&bits, &value, sizeof(bits));
+                mix(bits);
+            }
             for (const auto& coeff : snapshot.coeffs) {
                 for (const float channel : coeff) {
                     std::uint32_t bits = 0;
@@ -119,6 +126,11 @@ namespace lfs::vis::gui {
             lfs::rendering::LearnedSkyRenderState state;
             state.enabled = true;
             state.degree = snapshot->degree;
+            state.texture_width = snapshot->texture_width;
+            state.texture_height = snapshot->texture_height;
+            state.texture = snapshot->texture;
+            state.lobe_dirs = snapshot->lobe_dirs;
+            state.lobe_colors = snapshot->lobe_colors;
             state.generation = hashLearnedSkySnapshot(*snapshot);
             for (size_t i = 0; i < state.coeffs.size(); ++i) {
                 state.coeffs[i] = glm::vec3(

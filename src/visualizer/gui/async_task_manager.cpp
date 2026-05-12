@@ -361,7 +361,8 @@ namespace lfs::vis::gui {
                          .transform_indices = snapshot.transform_indices,
                          .node_visibility_mask = snapshot.node_visibility_mask},
                     .filters = {},
-                    .transparent_background = render_environment};
+                    .transparent_background = render_environment,
+                    .learned_sky = {}};
                 applyVideoExportPointCloudFilters(request.filters, snapshot, render_settings);
 
                 if (!requires_composite_pass) {
@@ -410,7 +411,8 @@ namespace lfs::vis::gui {
                               .dim_non_emphasized = render_settings.desaturate_unselected,
                               .flash_intensity = 0.0f,
                               .focused_gaussian_id = -1}},
-                    .transparent_background = render_environment};
+                    .transparent_background = render_environment,
+                    .learned_sky = {}};
                 applyVideoExportGaussianFilters(request.filters, snapshot, render_settings);
 
                 if (!requires_composite_pass) {
@@ -442,7 +444,8 @@ namespace lfs::vis::gui {
                      .transform_indices = nullptr,
                      .node_visibility_mask = {}},
                 .filters = {},
-                .transparent_background = render_environment};
+                .transparent_background = render_environment,
+                .learned_sky = {}};
             applyVideoExportPointCloudFilters(request.filters, snapshot, render_settings);
 
             auto render_result = engine.renderPointCloudGpuFrame(*snapshot.point_cloud, request);

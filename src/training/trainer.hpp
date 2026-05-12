@@ -355,6 +355,7 @@ namespace lfs::training {
                       bool save_checkpoint = true);
         void updateGTLoadConfigSnapshot();
         void clearActiveImageLoader();
+        void constrain_learned_sky_shell();
 
         struct CameraLossHeatmapState {
             std::vector<int> camera_uids;
@@ -406,6 +407,12 @@ namespace lfs::training {
         std::unordered_map<uint64_t, lfs::core::Tensor> bg_image_cache_; // Cache of resized bg images keyed by (H << 32) | W
         lfs::core::Tensor random_bg_buffer_{};                           // Reusable buffer for random background
         std::unique_ptr<DirectionalBackground> directional_background_;
+        size_t learned_sky_shell_start_ = 0;
+        size_t learned_sky_shell_count_ = 0;
+        lfs::core::Tensor learned_sky_shell_means_;
+        lfs::core::Tensor learned_sky_shell_scaling_;
+        lfs::core::Tensor learned_sky_shell_rotation_;
+        lfs::core::Tensor learned_sky_shell_sh0_prior_;
         std::unique_ptr<TrainingProgress> progress_;
         size_t train_dataset_size_ = 0;
         size_t total_cameras_count_ = 0;

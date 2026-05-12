@@ -68,6 +68,7 @@ namespace lfs::rendering {
             GaussianFilterState filters;
             GaussianOverlayState overlay;
             bool transparent_background = false;
+            LearnedSkyRenderState learned_sky;
             unsigned long long* hovered_depth_id = nullptr;
             Tensor* screen_positions_out = nullptr;
         };
@@ -211,6 +212,34 @@ namespace lfs::rendering {
 
         [[nodiscard]] glm::vec3 evaluateLearnedSky(const LearnedSkyRenderState& sky,
                                                    const glm::vec3& dir) {
+            if (sky.texture_width > 0 &&
+                sky.texture_height > 0 &&
+                sky.texture.size() == static_cast<size_t>(sky.texture_width) * static_cast<size_t>(sky.texture_height) * 3UL) {
+                const float longitude = std::atan2(dir.x, dir.z);
+                const float latitude = std::asin(std::clamp(dir.y, -1.0f, 1.0f));
+                float u = longitude / (2.0f * glm::pi<float>()) + 0.5f;
+                const float v = 0.5f - latitude / glm::pi<float>();
+                u = u - std::floor(u);
+                const float x = u * static_cast<float>(sky.texture_width) - 0.5f;
+                const float y = std::clamp(v, 0.0f, 1.0f) * static_cast<float>(sky.texture_height - 1);
+                const int x0 = static_cast<int>(std::floor(x));
+                const int y0 = static_cast<int>(std::floor(y));
+                const float wx = x - static_cast<float>(x0);
+                const float wy = y - static_cast<float>(y0);
+                const int x0w = (x0 % sky.texture_width + sky.texture_width) % sky.texture_width;
+                const int x1w = (x0w + 1) % sky.texture_width;
+                const int y0c = std::clamp(y0, 0, sky.texture_height - 1);
+                const int y1c = std::clamp(y0c + 1, 0, sky.texture_height - 1);
+                const auto fetch = [&](const int px, const int py) {
+                    const size_t index =
+                        (static_cast<size_t>(py) * static_cast<size_t>(sky.texture_width) + static_cast<size_t>(px)) * 3UL;
+                    return glm::vec3(sky.texture[index + 0], sky.texture[index + 1], sky.texture[index + 2]);
+                };
+                const glm::vec3 top = glm::mix(fetch(x0w, y0c), fetch(x1w, y0c), wx);
+                const glm::vec3 bottom = glm::mix(fetch(x0w, y1c), fetch(x1w, y1c), wx);
+                return glm::mix(top, bottom, wy);
+            }
+
             float basis[9] = {1.0f};
             if (sky.degree >= 1) {
                 basis[1] = dir.x;
@@ -388,6 +417,88 @@ namespace lfs::rendering {
                 }
             }
             return image;
+        }
+
+        Result<Tensor> renderLearnedSkyBackgroundTensor(const FrameView& frame_view,
+                                                        const bool equirectangular,
+                                                        const LearnedSkyRenderState& sky) {
+            const int width = frame_view.size.x;
+            const int height = frame_view.size.y;
+            if (!sky.enabled || width <= 0 || height <= 0) {
+                return std::unexpected("Invalid learned sky background request");
+            }
+
+            VideoCompositeFrameRequest request{};
+            request.frame_view = frame_view;
+            request.background_color = frame_view.background_color;
+            request.environment.enabled = true;
+            request.environment.equirectangular = equirectangular;
+            request.environment.learned_sky = sky;
+
+            auto background = renderEnvironmentBackground(request, width, height);
+            if (!background) {
+                return std::unexpected(background.error());
+            }
+            return Tensor::from_vector(
+                *background,
+                {static_cast<size_t>(3),
+                 static_cast<size_t>(height),
+                 static_cast<size_t>(width)},
+                lfs::core::Device::CUDA);
+        }
+
+        Result<void> compositeRasterWithLearnedSky(RasterImageResult& result,
+                                                   const GaussianRasterRequest& request) {
+            if (!request.learned_sky.enabled) {
+                return {};
+            }
+            if (!result.image.is_valid() || result.image.ndim() != 3 || result.image.size(0) < 4) {
+                return std::unexpected("Learned sky compositing requires an RGBA Gaussian raster result");
+            }
+
+            auto background = renderLearnedSkyBackgroundTensor(
+                request.frame_view,
+                request.equirectangular,
+                request.learned_sky);
+            if (!background) {
+                return std::unexpected(background.error());
+            }
+
+            Tensor rgb = result.image.slice(0, 0, 3).clamp(0.0f, 1.0f);
+            Tensor alpha = result.image.slice(0, 3, 4).clamp(0.0f, 1.0f);
+            Tensor one_minus_alpha = alpha * -1.0f + 1.0f;
+            Tensor composited = rgb + (one_minus_alpha * *background);
+            composited.clamp_(0.0f, 1.0f);
+            result.image = std::move(composited);
+            result.color_has_alpha = false;
+            return {};
+        }
+
+        Result<void> compositePointCloudWithLearnedSky(RasterImageResult& result,
+                                                       const PointCloudRenderRequest& request) {
+            if (!request.learned_sky.enabled) {
+                return {};
+            }
+            if (!result.image.is_valid() || result.image.ndim() != 3 || result.image.size(0) < 4) {
+                return std::unexpected("Learned sky compositing requires an RGBA point-cloud raster result");
+            }
+
+            auto background = renderLearnedSkyBackgroundTensor(
+                request.frame_view,
+                request.render.equirectangular,
+                request.learned_sky);
+            if (!background) {
+                return std::unexpected(background.error());
+            }
+
+            Tensor rgb = result.image.slice(0, 0, 3).clamp(0.0f, 1.0f);
+            Tensor alpha = result.image.slice(0, 3, 4).clamp(0.0f, 1.0f);
+            Tensor one_minus_alpha = alpha * -1.0f + 1.0f;
+            Tensor composited = rgb + (one_minus_alpha * *background);
+            composited.clamp_(0.0f, 1.0f);
+            result.image = std::move(composited);
+            result.color_has_alpha = false;
+            return {};
         }
 
         [[nodiscard]] bool tensorMatchesGaussianCount(const Tensor* const tensor,
@@ -1018,7 +1129,10 @@ namespace lfs::rendering {
 
             const int width = request.frame_view.size.x;
             const int height = request.frame_view.size.y;
-            const int channels = request.transparent_background ? 4 : 3;
+            const bool learned_sky_composite = request.learned_sky.enabled;
+            const bool raster_transparent_background =
+                request.transparent_background || learned_sky_composite;
+            const int channels = raster_transparent_background ? 4 : 3;
 
             Tensor image_tensor = Tensor::empty(
                 {static_cast<size_t>(channels), static_cast<size_t>(height), static_cast<size_t>(width)},
@@ -1067,7 +1181,7 @@ namespace lfs::rendering {
             params.bg_g = request.frame_view.background_color.g;
             params.bg_b = request.frame_view.background_color.b;
             params.bg_a = 1.0f;
-            params.transparent_background = request.transparent_background;
+            params.transparent_background = raster_transparent_background;
             params.image = image_tensor.ptr<float>();
             params.depth = depth_tensor.ptr<float>();
             params.stream = image_tensor.stream();
@@ -1078,13 +1192,17 @@ namespace lfs::rendering {
                                                    cudaGetErrorString(status)));
             }
 
-            return RasterImageResult{
+            RasterImageResult result{
                 .image = std::move(image_tensor),
                 .depth = std::move(depth_tensor),
                 .valid = true,
                 .far_plane = request.frame_view.far_plane,
                 .orthographic = request.frame_view.orthographic,
-                .color_has_alpha = request.transparent_background};
+                .color_has_alpha = raster_transparent_background};
+            if (auto composite = compositePointCloudWithLearnedSky(result, request); !composite) {
+                return std::unexpected(composite.error());
+            }
+            return result;
         }
 
         [[nodiscard]] Result<Tensor> toCpuChwFloatTensor(const Tensor& image) {
@@ -2020,7 +2138,8 @@ namespace lfs::rendering {
                     .scene = request.scene,
                     .filters = request.filters,
                     .overlay = request.overlay,
-                    .transparent_background = request.transparent_background});
+                    .transparent_background = request.transparent_background,
+                    .learned_sky = request.learned_sky});
             if (!result) {
                 return std::unexpected(result.error());
             }
@@ -2367,8 +2486,8 @@ namespace lfs::rendering {
             std::unique_ptr<Tensor> transform_indices_cuda;
             Tensor* transform_indices_ptr = cudaTensorPointer(request.scene.transform_indices, transform_indices_cuda);
             if (!tensorMatchesGaussianCount(transform_indices_ptr, gaussian_count)) {
-                LOG_WARN("Ignoring transform_indices with stale size: model has {}, tensor has {}",
-                         gaussian_count, transform_indices_ptr->numel());
+                LOG_DEBUG("Ignoring transform_indices with stale size: model has {}, tensor has {}",
+                          gaussian_count, transform_indices_ptr->numel());
                 transform_indices_ptr = nullptr;
                 transform_indices_cuda.reset();
             }
@@ -2397,6 +2516,10 @@ namespace lfs::rendering {
             applyEllipsoidToRaster(request, resources);
             applyViewVolumeToRaster(request, resources);
 
+            const bool learned_sky_composite = request.learned_sky.enabled;
+            const bool raster_transparent_background =
+                request.transparent_background || learned_sky_composite;
+
             try {
                 if (request.gut ||
                     isGutBackend(request.raster_backend) ||
@@ -2414,15 +2537,19 @@ namespace lfs::rendering {
                         model_transforms_tensor.get(),
                         transform_indices_ptr,
                         request.scene.node_visibility_mask,
-                        request.transparent_background);
-                    return RasterImageResult{
+                        raster_transparent_background);
+                    RasterImageResult result{
                         .image = std::move(render_output.image),
                         .depth = std::move(render_output.depth),
                         .valid = true,
                         .flip_y = true,
                         .far_plane = request.frame_view.far_plane,
                         .orthographic = request.frame_view.orthographic,
-                        .color_has_alpha = request.transparent_background};
+                        .color_has_alpha = raster_transparent_background};
+                    if (auto composite = compositeRasterWithLearnedSky(result, request); !composite) {
+                        return std::unexpected(composite.error());
+                    }
+                    return result;
                 }
 
                 auto [image, depth] = rasterize_tensor(
@@ -2471,15 +2598,19 @@ namespace lfs::rendering {
                     request.frame_view.orthographic,
                     request.frame_view.ortho_scale,
                     request.mip_filter,
-                    request.transparent_background);
+                    raster_transparent_background);
 
-                return RasterImageResult{
+                RasterImageResult result{
                     .image = std::move(image),
                     .depth = std::move(depth),
                     .valid = true,
                     .far_plane = request.frame_view.far_plane,
                     .orthographic = request.frame_view.orthographic,
-                    .color_has_alpha = request.transparent_background};
+                    .color_has_alpha = raster_transparent_background};
+                if (auto composite = compositeRasterWithLearnedSky(result, request); !composite) {
+                    return std::unexpected(composite.error());
+                }
+                return result;
             } catch (const std::exception& e) {
                 return std::unexpected(std::format("Rasterization failed: {}", e.what()));
             }

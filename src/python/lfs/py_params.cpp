@@ -295,28 +295,28 @@ namespace lfs::python {
                         {"LearnedDirectional", BackgroundMode::LearnedDirectional}},
                        "Background mode")
             .int_prop(&OptimizationParameters::bg_learned_degree,
-                      "bg_learned_degree", "Learned BG Degree", 2, 0, 2,
-                      "Spherical-harmonic degree for learned directional background")
+                      "bg_learned_degree", "Learned Sky Detail", 2, 0, 2,
+                      "Detail level for learned sky Gaussian lobes")
             .float_prop(&OptimizationParameters::bg_learned_lr,
                         "bg_learned_lr", "Learned BG LR", 1e-2f, 0.0f, 0.1f,
                         "Learning rate for learned directional background")
             .float_prop(&OptimizationParameters::bg_learned_l2,
                         "bg_learned_l2", "Learned BG L2", 1e-4f, 0.0f, 1e-2f,
-                        "L2 regularization on non-constant learned background coefficients")
+                        "Smoothness regularization for learned sky Gaussian lobes")
             .int_prop(&OptimizationParameters::bg_learned_start_iter,
                       "bg_learned_start_iter", "Learned BG Start", 0, 0, 30000,
                       "Iteration at which learned directional background starts updating")
             .float_prop(&OptimizationParameters::bg_alpha_release,
-                        "bg_alpha_release", "Learned BG Alpha Release", 0.1f, 0.0f, 2.0f,
+                        "bg_alpha_release", "Learned BG Alpha Release", 0.12f, 0.0f, 2.0f,
                         "Extra alpha gradient where learned sky explains pixels better than splats")
             .bool_prop(&OptimizationParameters::bg_auto_sky_gate,
                        "bg_auto_sky_gate", "Auto Sky Gate", true,
                        "Restrict learned sky updates to automatically detected sky pixels")
             .float_prop(&OptimizationParameters::bg_sky_gate_threshold,
-                        "bg_sky_gate_threshold", "Sky Gate Threshold", 0.25f, 0.0f, 1.0f,
+                        "bg_sky_gate_threshold", "Sky Gate Threshold", 0.45f, 0.0f, 1.0f,
                         "Confidence threshold for automatic learned-sky gating")
             .float_prop(&OptimizationParameters::bg_sky_opacity_decay,
-                        "bg_sky_opacity_decay", "Sky Opacity Decay", 0.05f, 0.0f, 1.0f,
+                        "bg_sky_opacity_decay", "Sky Opacity Decay", 0.06f, 0.0f, 1.0f,
                         "Extra opacity decay applied only in automatic sky regions")
             .build();
     }
@@ -1246,7 +1246,7 @@ namespace lfs::python {
                 "bg_learned_degree",
                 [](PyOptimizationParams& self) { return self.params().bg_learned_degree; },
                 [](PyOptimizationParams&, int v) { modify_params([v](auto& p) { p.bg_learned_degree = v; }); },
-                "SH degree for learned directional background")
+                "Detail level for learned sky Gaussian lobes")
             .def_prop_rw(
                 "bg_learned_lr",
                 [](PyOptimizationParams& self) { return self.params().bg_learned_lr; },

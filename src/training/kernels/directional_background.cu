@@ -10,6 +10,7 @@ namespace lfs::training::kernels {
 
     namespace {
         constexpr int kThreadsPerBlock = 256;
+        constexpr int kTopLobes = 8;
         constexpr float kPi = 3.14159265358979323846f;
         constexpr float kTwoPi = 6.28318530717958647692f;
 
@@ -94,26 +95,6 @@ namespace lfs::training::kernels {
             normalize3(x, y, z);
         }
 
-        __host__ __device__ inline int sh_basis_count(const int degree) {
-            return (degree + 1) * (degree + 1);
-        }
-
-        __device__ inline void eval_basis(const int degree, const float x, const float y, const float z, float* basis) {
-            basis[0] = 1.0f;
-            if (degree >= 1) {
-                basis[1] = x;
-                basis[2] = y;
-                basis[3] = z;
-            }
-            if (degree >= 2) {
-                basis[4] = x * y;
-                basis[5] = y * z;
-                basis[6] = z * x;
-                basis[7] = x * x - y * y;
-                basis[8] = 3.0f * z * z - 1.0f;
-            }
-        }
-
         __device__ inline float sigmoid_clamped(const float x) {
             const float clamped = fminf(fmaxf(x, -16.0f), 16.0f);
             return 1.0f / (1.0f + expf(-clamped));
@@ -126,6 +107,79 @@ namespace lfs::training::kernels {
         __device__ inline float smoothstep01(const float edge0, const float edge1, const float x) {
             const float t = saturate((x - edge0) / fmaxf(edge1 - edge0, 1.0e-6f));
             return t * t * (3.0f - 2.0f * t);
+        }
+
+        __device__ inline void insert_top_lobe(
+            const int index,
+            const float dot,
+            int (&top_indices)[kTopLobes],
+            float (&top_dots)[kTopLobes]) {
+            if (dot <= top_dots[kTopLobes - 1]) {
+                return;
+            }
+            int slot = kTopLobes - 1;
+            while (slot > 0 && dot > top_dots[slot - 1]) {
+                top_dots[slot] = top_dots[slot - 1];
+                top_indices[slot] = top_indices[slot - 1];
+                --slot;
+            }
+            top_dots[slot] = dot;
+            top_indices[slot] = index;
+        }
+
+        __device__ inline void find_top_lobes(
+            const float* __restrict__ lobe_dirs,
+            const int lobe_count,
+            const float x,
+            const float y,
+            const float z,
+            int (&top_indices)[kTopLobes],
+            float (&top_dots)[kTopLobes]) {
+            for (int i = 0; i < kTopLobes; ++i) {
+                top_indices[i] = -1;
+                top_dots[i] = -1.0e20f;
+            }
+            for (int i = 0; i < lobe_count; ++i) {
+                const int base = i * 3;
+                const float dot =
+                    x * lobe_dirs[base + 0] +
+                    y * lobe_dirs[base + 1] +
+                    z * lobe_dirs[base + 2];
+                insert_top_lobe(i, dot, top_indices, top_dots);
+            }
+        }
+
+        __device__ inline void evaluate_lobe_color(
+            const float* __restrict__ lobe_logits,
+            const int (&top_indices)[kTopLobes],
+            const float (&top_dots)[kTopLobes],
+            const float sharpness,
+            float (&rgb)[3],
+            float (&weights)[kTopLobes],
+            float& weight_sum) {
+            rgb[0] = 0.0f;
+            rgb[1] = 0.0f;
+            rgb[2] = 0.0f;
+            weight_sum = 0.0f;
+            const float max_dot = top_dots[0];
+            for (int k = 0; k < kTopLobes; ++k) {
+                weights[k] = 0.0f;
+                const int lobe = top_indices[k];
+                if (lobe < 0) {
+                    continue;
+                }
+                const float weight = expf(sharpness * (top_dots[k] - max_dot));
+                weights[k] = weight;
+                weight_sum += weight;
+                const int base = lobe * 3;
+                rgb[0] += weight * sigmoid_clamped(lobe_logits[base + 0]);
+                rgb[1] += weight * sigmoid_clamped(lobe_logits[base + 1]);
+                rgb[2] += weight * sigmoid_clamped(lobe_logits[base + 2]);
+            }
+            const float inv_weight_sum = weight_sum > 1.0e-8f ? 1.0f / weight_sum : 1.0f;
+            rgb[0] *= inv_weight_sum;
+            rgb[1] *= inv_weight_sum;
+            rgb[2] *= inv_weight_sum;
         }
 
         __device__ inline float read_rgb_pixel(
@@ -200,8 +254,11 @@ namespace lfs::training::kernels {
             const float up_prior = smoothstep01(-0.10f, 0.35f, y);
             const float placement = saturate(fmaxf(top_prior, 0.75f * up_prior));
 
-            const float white_sky = smoothstep01(0.55f, 0.82f, luma) *
-                                    (1.0f - smoothstep01(0.10f, 0.34f, sat));
+            const float warm_bias = fmaxf(r - b, g - b);
+            const float cool_or_neutral = 1.0f - smoothstep01(0.02f, 0.12f, warm_bias);
+            const float white_sky = smoothstep01(0.68f, 0.88f, luma) *
+                                    (1.0f - smoothstep01(0.08f, 0.22f, sat)) *
+                                    cool_or_neutral;
             const float blue_sky = smoothstep01(0.02f, 0.18f, b - r) *
                                    smoothstep01(0.02f, 0.16f, b - g) *
                                    smoothstep01(0.38f, 0.65f, b);
@@ -222,10 +279,12 @@ namespace lfs::training::kernels {
             sky_gate[idx] = smoothstep01(lo, hi, confidence);
         }
 
-        __global__ void render_directional_background_sh_kernel(
-            const float* __restrict__ coeffs,
+        __global__ void render_directional_background_lobes_kernel(
+            const float* __restrict__ lobe_dirs,
+            const float* __restrict__ lobe_logits,
             float* __restrict__ output,
-            const int degree,
+            const int lobe_count,
+            const float lobe_sharpness,
             const int height,
             const int width,
             const int full_height,
@@ -253,31 +312,29 @@ namespace lfs::training::kernels {
                              focal_x, focal_y, center_x, center_y, x, y, z);
             world_direction(world_view_transform, x, y, z);
 
-            float basis[9];
-            eval_basis(degree, x, y, z, basis);
-            const int basis_count = sh_basis_count(degree);
-
-            float rgb[3] = {0.0f, 0.0f, 0.0f};
-            for (int b = 0; b < basis_count; ++b) {
-                const float sh = basis[b];
-                rgb[0] += coeffs[b * 3 + 0] * sh;
-                rgb[1] += coeffs[b * 3 + 1] * sh;
-                rgb[2] += coeffs[b * 3 + 2] * sh;
-            }
+            int top_indices[kTopLobes];
+            float top_dots[kTopLobes];
+            float weights[kTopLobes];
+            float weight_sum = 0.0f;
+            float rgb[3];
+            find_top_lobes(lobe_dirs, lobe_count, x, y, z, top_indices, top_dots);
+            evaluate_lobe_color(lobe_logits, top_indices, top_dots, lobe_sharpness, rgb, weights, weight_sum);
 
             const int HW = total;
-            output[0 * HW + idx] = sigmoid_clamped(rgb[0]);
-            output[1 * HW + idx] = sigmoid_clamped(rgb[1]);
-            output[2 * HW + idx] = sigmoid_clamped(rgb[2]);
+            output[0 * HW + idx] = rgb[0];
+            output[1 * HW + idx] = rgb[1];
+            output[2 * HW + idx] = rgb[2];
         }
 
-        __global__ void accumulate_directional_background_sh_grad_kernel(
-            const float* __restrict__ coeffs,
+        __global__ void accumulate_directional_background_lobe_grad_kernel(
+            const float* __restrict__ lobe_dirs,
+            const float* __restrict__ lobe_logits,
             const float* __restrict__ grad_image,
             const float* __restrict__ alpha,
             const float* __restrict__ sky_gate,
-            float* __restrict__ grad_coeffs,
-            const int degree,
+            float* __restrict__ grad_lobes,
+            const int lobe_count,
+            const float lobe_sharpness,
             const int height,
             const int width,
             const int full_height,
@@ -290,84 +347,202 @@ namespace lfs::training::kernels {
             const float center_y,
             const float* __restrict__ world_view_transform,
             const int camera_model) {
-            __shared__ float block_grad[27];
-            if (threadIdx.x < 27) {
-                block_grad[threadIdx.x] = 0.0f;
-            }
-            __syncthreads();
-
             const int idx = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
             const int total = height * width;
-            if (idx < total) {
-                const int x_pix = idx % width;
-                const int y_pix = idx / width;
-                const float px_full = static_cast<float>(x_pix + tile_x_offset) + 0.5f;
-                const float py_full = static_cast<float>(y_pix + tile_y_offset) + 0.5f;
-
-                float x, y, z;
-                camera_direction(camera_model, px_full, py_full, full_width, full_height,
-                                 focal_x, focal_y, center_x, center_y, x, y, z);
-                world_direction(world_view_transform, x, y, z);
-
-                float basis[9];
-                eval_basis(degree, x, y, z, basis);
-                const int basis_count = sh_basis_count(degree);
-                const float gate = sky_gate ? saturate(sky_gate[idx]) : 1.0f;
-                const float visibility = (1.0f - alpha[idx]) * gate;
-                const int HW = total;
-
-                float raw_rgb[3] = {0.0f, 0.0f, 0.0f};
-                for (int b = 0; b < basis_count; ++b) {
-                    const float sh = basis[b];
-                    raw_rgb[0] += coeffs[b * 3 + 0] * sh;
-                    raw_rgb[1] += coeffs[b * 3 + 1] * sh;
-                    raw_rgb[2] += coeffs[b * 3 + 2] * sh;
-                }
-                const float rgb[3] = {
-                    sigmoid_clamped(raw_rgb[0]),
-                    sigmoid_clamped(raw_rgb[1]),
-                    sigmoid_clamped(raw_rgb[2]),
-                };
-                const float grad_rgb[3] = {
-                    grad_image[0 * HW + idx] * visibility * rgb[0] * (1.0f - rgb[0]),
-                    grad_image[1 * HW + idx] * visibility * rgb[1] * (1.0f - rgb[1]),
-                    grad_image[2 * HW + idx] * visibility * rgb[2] * (1.0f - rgb[2])};
-
-                for (int b = 0; b < basis_count; ++b) {
-                    const float sh = basis[b];
-                    atomicAdd(&block_grad[b * 3 + 0], grad_rgb[0] * sh);
-                    atomicAdd(&block_grad[b * 3 + 1], grad_rgb[1] * sh);
-                    atomicAdd(&block_grad[b * 3 + 2], grad_rgb[2] * sh);
-                }
+            if (idx >= total) {
+                return;
             }
-            __syncthreads();
 
-            const int basis_count = sh_basis_count(degree);
-            const int gradient_count = basis_count * 3;
-            if (threadIdx.x < gradient_count) {
-                atomicAdd(&grad_coeffs[threadIdx.x], block_grad[threadIdx.x]);
+            const int x_pix = idx % width;
+            const int y_pix = idx / width;
+            const float px_full = static_cast<float>(x_pix + tile_x_offset) + 0.5f;
+            const float py_full = static_cast<float>(y_pix + tile_y_offset) + 0.5f;
+
+            float x, y, z;
+            camera_direction(camera_model, px_full, py_full, full_width, full_height,
+                             focal_x, focal_y, center_x, center_y, x, y, z);
+            world_direction(world_view_transform, x, y, z);
+
+            const float gate = sky_gate ? saturate(sky_gate[idx]) : 1.0f;
+            const float visibility = (1.0f - alpha[idx]) * gate;
+            if (visibility <= 0.0f) {
+                return;
+            }
+
+            int top_indices[kTopLobes];
+            float top_dots[kTopLobes];
+            float weights[kTopLobes];
+            float weight_sum = 0.0f;
+            float rgb[3];
+            find_top_lobes(lobe_dirs, lobe_count, x, y, z, top_indices, top_dots);
+            evaluate_lobe_color(lobe_logits, top_indices, top_dots, lobe_sharpness, rgb, weights, weight_sum);
+
+            const int HW = total;
+            const float inv_weight_sum = weight_sum > 1.0e-8f ? 1.0f / weight_sum : 1.0f;
+            for (int k = 0; k < kTopLobes; ++k) {
+                const int lobe = top_indices[k];
+                if (lobe < 0) {
+                    continue;
+                }
+                const float normalized_weight = weights[k] * inv_weight_sum;
+                const int base = lobe * 3;
+                for (int c = 0; c < 3; ++c) {
+                    const float lobe_rgb = sigmoid_clamped(lobe_logits[base + c]);
+                    const float grad_raw =
+                        grad_image[c * HW + idx] *
+                        visibility *
+                        normalized_weight *
+                        lobe_rgb *
+                        (1.0f - lobe_rgb);
+                    atomicAdd(&grad_lobes[base + c], grad_raw);
+                }
             }
         }
 
-        __global__ void directional_background_l2_grad_kernel(
-            const float* __restrict__ coeffs,
-            float* __restrict__ grad_coeffs,
-            const int num_coeffs,
+        __global__ void attenuate_sky_foreground_rgb_gradient_kernel(
+            float* __restrict__ grad_image,
+            const bool grad_is_chw,
+            const float* __restrict__ sky_gate,
+            const int height,
+            const int width,
+            const float strength) {
+            const int idx = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+            const int total = height * width;
+            if (idx >= total) {
+                return;
+            }
+
+            const float sky = sky_gate ? saturate(sky_gate[idx]) : 0.0f;
+            const float attenuation = saturate(strength) * sky;
+            const float factor = 1.0f - attenuation;
+            const int HW = total;
+            for (int c = 0; c < 3; ++c) {
+                const int offset = grad_is_chw ? c * HW + idx : idx * 3 + c;
+                grad_image[offset] *= factor;
+            }
+        }
+
+        __global__ void attenuate_sky_foreground_error_map_kernel(
+            float* __restrict__ error_map,
+            const float* __restrict__ sky_gate,
+            const int height,
+            const int width,
+            const float strength) {
+            const int idx = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+            const int total = height * width;
+            if (idx >= total) {
+                return;
+            }
+
+            const float sky = sky_gate ? saturate(sky_gate[idx]) : 0.0f;
+            const float attenuation = saturate(strength) * sky;
+            error_map[idx] *= 1.0f - attenuation;
+        }
+
+        __global__ void directional_background_lobe_smoothness_grad_kernel(
+            const float* __restrict__ lobe_dirs,
+            const float* __restrict__ lobe_logits,
+            float* __restrict__ grad_lobes,
+            const int lobe_count,
             const float weight) {
             const int idx = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
-            if (idx >= num_coeffs)
+            const int total = lobe_count * 3;
+            if (idx >= total) {
                 return;
-            if (idx < 3)
+            }
+
+            const int lobe = idx / 3;
+            const int channel = idx % 3;
+            const int dir_base = lobe * 3;
+            const float x = lobe_dirs[dir_base + 0];
+            const float y = lobe_dirs[dir_base + 1];
+            const float z = lobe_dirs[dir_base + 2];
+            const float center = lobe_logits[idx];
+
+            float neighbor_sum = 0.0f;
+            float weight_sum = 0.0f;
+            for (int other = 0; other < lobe_count; ++other) {
+                if (other == lobe) {
+                    continue;
+                }
+                const int other_dir_base = other * 3;
+                const float dot =
+                    x * lobe_dirs[other_dir_base + 0] +
+                    y * lobe_dirs[other_dir_base + 1] +
+                    z * lobe_dirs[other_dir_base + 2];
+                const float w = expf(18.0f * (dot - 1.0f));
+                neighbor_sum += w * lobe_logits[other * 3 + channel];
+                weight_sum += w;
+            }
+            if (weight_sum <= 1.0e-8f) {
                 return;
-            grad_coeffs[idx] += weight * coeffs[idx];
+            }
+            const float neighbor_mean = neighbor_sum / weight_sum;
+            grad_lobes[idx] += weight * (center - neighbor_mean) / static_cast<float>(lobe_count);
+        }
+
+        __global__ void constrain_learned_sky_shell_kernel(
+            float* __restrict__ means,
+            float* __restrict__ scaling,
+            float* __restrict__ rotation,
+            float* __restrict__ opacity,
+            float* __restrict__ sh0,
+            float* __restrict__ shN,
+            unsigned char* __restrict__ deleted,
+            const float* __restrict__ shell_means,
+            const float* __restrict__ shell_scaling,
+            const float* __restrict__ shell_rotation,
+            const float* __restrict__ shell_sh0_prior,
+            const int start,
+            const int count,
+            const int sh_rest,
+            const float opacity_min,
+            const float opacity_max,
+            const float sh0_min,
+            const float sh0_max,
+            const float prior_mix) {
+            const int i = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+            if (i >= count) {
+                return;
+            }
+
+            const int row = start + i;
+            for (int c = 0; c < 3; ++c) {
+                means[row * 3 + c] = shell_means[i * 3 + c];
+                scaling[row * 3 + c] = shell_scaling[i * 3 + c];
+            }
+            for (int c = 0; c < 4; ++c) {
+                rotation[row * 4 + c] = shell_rotation[i * 4 + c];
+            }
+
+            opacity[row] = fminf(opacity_max, fmaxf(opacity_min, opacity[row]));
+
+            const float keep = 1.0f - prior_mix;
+            for (int c = 0; c < 3; ++c) {
+                const float mixed = sh0[row * 3 + c] * keep + shell_sh0_prior[i * 3 + c] * prior_mix;
+                sh0[row * 3 + c] = fminf(sh0_max, fmaxf(sh0_min, mixed));
+            }
+
+            if (shN && sh_rest > 0) {
+                const int base = row * sh_rest * 3;
+                for (int k = 0; k < sh_rest * 3; ++k) {
+                    shN[base + k] = 0.0f;
+                }
+            }
+
+            if (deleted) {
+                deleted[row] = 0;
+            }
         }
 
     } // namespace
 
-    void launch_render_directional_background_sh(
-        const float* coeffs,
+    void launch_render_directional_background_lobes(
+        const float* lobe_dirs,
+        const float* lobe_logits,
         float* output,
-        const int degree,
+        const int lobe_count,
+        const float lobe_sharpness,
         const int height,
         const int width,
         const int full_height,
@@ -382,18 +557,20 @@ namespace lfs::training::kernels {
         const int camera_model,
         cudaStream_t stream) {
         const int total = height * width;
-        render_directional_background_sh_kernel<<<num_blocks_1d(total), kThreadsPerBlock, 0, stream>>>(
-            coeffs, output, degree, height, width, full_height, full_width, tile_x_offset, tile_y_offset,
-            focal_x, focal_y, center_x, center_y, world_view_transform, camera_model);
+        render_directional_background_lobes_kernel<<<num_blocks_1d(total), kThreadsPerBlock, 0, stream>>>(
+            lobe_dirs, lobe_logits, output, lobe_count, lobe_sharpness, height, width, full_height, full_width,
+            tile_x_offset, tile_y_offset, focal_x, focal_y, center_x, center_y, world_view_transform, camera_model);
     }
 
-    void launch_accumulate_directional_background_sh_grad(
-        const float* coeffs,
+    void launch_accumulate_directional_background_lobe_grad(
+        const float* lobe_dirs,
+        const float* lobe_logits,
         const float* grad_image,
         const float* alpha,
         const float* sky_gate,
-        float* grad_coeffs,
-        const int degree,
+        float* grad_lobes,
+        const int lobe_count,
+        const float lobe_sharpness,
         const int height,
         const int width,
         const int full_height,
@@ -408,9 +585,9 @@ namespace lfs::training::kernels {
         const int camera_model,
         cudaStream_t stream) {
         const int total = height * width;
-        accumulate_directional_background_sh_grad_kernel<<<num_blocks_1d(total), kThreadsPerBlock, 0, stream>>>(
-            coeffs, grad_image, alpha, sky_gate, grad_coeffs, degree, height, width, full_height, full_width,
-            tile_x_offset, tile_y_offset, focal_x, focal_y, center_x, center_y,
+        accumulate_directional_background_lobe_grad_kernel<<<num_blocks_1d(total), kThreadsPerBlock, 0, stream>>>(
+            lobe_dirs, lobe_logits, grad_image, alpha, sky_gate, grad_lobes, lobe_count, lobe_sharpness, height, width,
+            full_height, full_width, tile_x_offset, tile_y_offset, focal_x, focal_y, center_x, center_y,
             world_view_transform, camera_model);
     }
 
@@ -452,15 +629,87 @@ namespace lfs::training::kernels {
             threshold);
     }
 
-    void launch_directional_background_l2_grad(
-        const float* coeffs,
-        float* grad_coeffs,
-        const int degree,
+    void launch_attenuate_sky_foreground_rgb_gradient(
+        float* grad_image,
+        const bool grad_is_chw,
+        const float* sky_gate,
+        const int height,
+        const int width,
+        const float strength,
+        cudaStream_t stream) {
+        const int total = height * width;
+        attenuate_sky_foreground_rgb_gradient_kernel<<<num_blocks_1d(total), kThreadsPerBlock, 0, stream>>>(
+            grad_image, grad_is_chw, sky_gate, height, width, strength);
+    }
+
+    void launch_attenuate_sky_foreground_error_map(
+        float* error_map,
+        const float* sky_gate,
+        const int height,
+        const int width,
+        const float strength,
+        cudaStream_t stream) {
+        const int total = height * width;
+        attenuate_sky_foreground_error_map_kernel<<<num_blocks_1d(total), kThreadsPerBlock, 0, stream>>>(
+            error_map, sky_gate, height, width, strength);
+    }
+
+    void launch_directional_background_lobe_smoothness_grad(
+        const float* lobe_dirs,
+        const float* lobe_logits,
+        float* grad_lobes,
+        const int lobe_count,
         const float weight,
         cudaStream_t stream) {
-        const int num_coeffs = sh_basis_count(degree) * 3;
-        directional_background_l2_grad_kernel<<<num_blocks_1d(num_coeffs), kThreadsPerBlock, 0, stream>>>(
-            coeffs, grad_coeffs, num_coeffs, weight);
+        const int total = lobe_count * 3;
+        directional_background_lobe_smoothness_grad_kernel<<<num_blocks_1d(total), kThreadsPerBlock, 0, stream>>>(
+            lobe_dirs, lobe_logits, grad_lobes, lobe_count, weight);
+    }
+
+    void launch_constrain_learned_sky_shell(
+        float* means,
+        float* scaling,
+        float* rotation,
+        float* opacity,
+        float* sh0,
+        float* shN,
+        unsigned char* deleted,
+        const float* shell_means,
+        const float* shell_scaling,
+        const float* shell_rotation,
+        const float* shell_sh0_prior,
+        const int start,
+        const int count,
+        const int sh_rest,
+        const float opacity_min,
+        const float opacity_max,
+        const float sh0_min,
+        const float sh0_max,
+        const float prior_mix,
+        cudaStream_t stream) {
+        if (count <= 0) {
+            return;
+        }
+        constrain_learned_sky_shell_kernel<<<num_blocks_1d(count), kThreadsPerBlock, 0, stream>>>(
+            means,
+            scaling,
+            rotation,
+            opacity,
+            sh0,
+            shN,
+            deleted,
+            shell_means,
+            shell_scaling,
+            shell_rotation,
+            shell_sh0_prior,
+            start,
+            count,
+            sh_rest,
+            opacity_min,
+            opacity_max,
+            sh0_min,
+            sh0_max,
+            prior_mix);
     }
 
 } // namespace lfs::training::kernels

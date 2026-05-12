@@ -278,7 +278,9 @@ namespace lfs::vis {
                  .transform_indices = render_state.transform_indices,
                  .node_visibility_mask = render_state.node_visibility_mask},
             .filters = {},
-            .overlay = {}};
+            .overlay = {},
+            .transparent_background = false,
+            .learned_sky = {}};
 
         auto result = engine_->renderGaussiansImage(*model, request);
         render_lock.reset();

@@ -41,6 +41,7 @@
 #include <fstream>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
@@ -484,6 +485,541 @@ namespace lfs::training {
             scene->syncTrainingModelTopology(static_cast<size_t>(model.size()));
         }
 
+        [[nodiscard]] bool use_learned_sky_gaussian_shell(
+            const lfs::core::param::OptimizationParameters& params) {
+            return params.bg_mode == lfs::core::param::BackgroundMode::LearnedDirectional;
+        }
+
+        [[nodiscard]] float safe_logit(float p) {
+            p = std::clamp(p, 1e-4f, 1.0f - 1e-4f);
+            return std::log(p / (1.0f - p));
+        }
+
+        [[nodiscard]] size_t learned_sky_shell_count_for_detail(const int detail) {
+            if (detail <= 0) {
+                return 768;
+            }
+            if (detail == 1) {
+                return 1536;
+            }
+            return 3072;
+        }
+
+        [[nodiscard]] float rgb_to_sh0(const float value) {
+            constexpr float SH_C0 = 0.28209479177387814f;
+            return (value - 0.5f) / SH_C0;
+        }
+
+        [[nodiscard]] std::array<float, 3> neutral_sky_fallback_color(
+            const std::array<float, 3>& fallback_color) {
+            const float fallback_energy = fallback_color[0] + fallback_color[1] + fallback_color[2];
+            if (fallback_energy > 0.05f) {
+                return {
+                    std::clamp(fallback_color[0], 0.0f, 1.0f),
+                    std::clamp(fallback_color[1], 0.0f, 1.0f),
+                    std::clamp(fallback_color[2], 0.0f, 1.0f)};
+            }
+            return {0.72f, 0.74f, 0.76f};
+        }
+
+        [[nodiscard]] float vec3_dot(const std::array<float, 3>& a,
+                                     const std::array<float, 3>& b) {
+            return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        }
+
+        [[nodiscard]] float vec3_length(const std::array<float, 3>& v) {
+            return std::sqrt(std::max(vec3_dot(v, v), 0.0f));
+        }
+
+        [[nodiscard]] std::array<float, 3> vec3_normalize(const std::array<float, 3>& v,
+                                                          const std::array<float, 3>& fallback = {0.0f, 1.0f, 0.0f}) {
+            const float len = vec3_length(v);
+            if (!std::isfinite(len) || len <= 1.0e-6f) {
+                return fallback;
+            }
+            return {v[0] / len, v[1] / len, v[2] / len};
+        }
+
+        [[nodiscard]] std::array<float, 3> vec3_cross(const std::array<float, 3>& a,
+                                                      const std::array<float, 3>& b) {
+            return {
+                a[1] * b[2] - a[2] * b[1],
+                a[2] * b[0] - a[0] * b[2],
+                a[0] * b[1] - a[1] * b[0]};
+        }
+
+        [[nodiscard]] std::array<float, 3> estimate_sky_up_axis_from_cameras(
+            const std::vector<std::shared_ptr<lfs::core::Camera>>& cameras) {
+            std::array<float, 3> sum{0.0f, 0.0f, 0.0f};
+            size_t used = 0;
+
+            for (const auto& camera : cameras) {
+                if (!camera || !camera->world_view_transform().is_valid()) {
+                    continue;
+                }
+
+                const auto w2c_cpu = camera->world_view_transform().squeeze(0).cpu().contiguous();
+                if (w2c_cpu.numel() < 16) {
+                    continue;
+                }
+
+                const float* const w2c = w2c_cpu.ptr<float>();
+                const auto camera_image_up = vec3_normalize(
+                    {-w2c[4], -w2c[5], -w2c[6]},
+                    {0.0f, 0.0f, 0.0f});
+                if (vec3_length(camera_image_up) <= 1.0e-6f) {
+                    continue;
+                }
+
+                sum[0] += camera_image_up[0];
+                sum[1] += camera_image_up[1];
+                sum[2] += camera_image_up[2];
+                ++used;
+            }
+
+            const auto up = vec3_normalize(sum);
+            if (used == 0) {
+                LOG_WARN("Learned Sky: could not estimate scene up from cameras; falling back to world +Y");
+            }
+            return up;
+        }
+
+        [[nodiscard]] std::array<float, 3> tangent_axis_for_up(const std::array<float, 3>& up) {
+            const std::array<float, 3> reference =
+                (std::abs(up[0]) < 0.75f) ? std::array<float, 3>{1.0f, 0.0f, 0.0f}
+                                          : std::array<float, 3>{0.0f, 1.0f, 0.0f};
+            auto tangent = vec3_normalize(vec3_cross(reference, up), {0.0f, 0.0f, 0.0f});
+            if (vec3_length(tangent) <= 1.0e-6f) {
+                tangent = vec3_normalize(vec3_cross({0.0f, 0.0f, 1.0f}, up), {1.0f, 0.0f, 0.0f});
+            }
+            return tangent;
+        }
+
+        [[nodiscard]] float sky_pixel_confidence(const float r,
+                                                 const float g,
+                                                 const float b,
+                                                 const float v_norm) {
+            if (v_norm > 0.72f) {
+                return 0.0f;
+            }
+
+            const float max_c = std::max({r, g, b});
+            const float min_c = std::min({r, g, b});
+            const float sat = max_c - min_c;
+            const float lum = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+            const float green_dom = g - std::max(r, b);
+
+            const bool neutral_overcast =
+                lum > 0.54f &&
+                sat < 0.16f &&
+                std::abs(r - g) < 0.13f &&
+                std::abs(g - b) < 0.13f;
+            const bool blue_or_hazy =
+                lum > 0.34f &&
+                b + 0.08f >= g &&
+                b + 0.04f >= r &&
+                green_dom < 0.08f;
+
+            if (!neutral_overcast && !blue_or_hazy) {
+                return 0.0f;
+            }
+
+            const float top_weight = std::clamp((0.72f - v_norm) / 0.72f, 0.0f, 1.0f);
+            const float green_reject = std::clamp(1.0f - std::max(0.0f, green_dom) * 8.0f, 0.0f, 1.0f);
+            return std::max(0.18f, top_weight) * green_reject;
+        }
+
+        struct DatasetSkyShellPrior {
+            std::vector<float> rgb;
+            std::vector<float> confidence;
+            std::array<float, 3> fallback{0.72f, 0.74f, 0.76f};
+            size_t accepted_samples = 0;
+            size_t cameras_used = 0;
+            size_t observed_shells = 0;
+        };
+
+        [[nodiscard]] DatasetSkyShellPrior estimate_dataset_sky_shell_prior(
+            const std::vector<std::shared_ptr<lfs::core::Camera>>& cameras,
+            const std::vector<float>& sky_means,
+            const std::vector<float>& sky_up,
+            const std::array<float, 3>& fallback_color,
+            const size_t sky_count) {
+            constexpr int PRIOR_IMAGE_MAX_WIDTH = 512;
+            constexpr size_t MAX_PRIOR_CAMERAS = 96;
+
+            DatasetSkyShellPrior prior;
+            prior.rgb.assign(sky_count * 3, 0.0f);
+            prior.confidence.assign(sky_count, 0.0f);
+            prior.fallback = neutral_sky_fallback_color(fallback_color);
+
+            if (sky_count == 0 || sky_means.size() < sky_count * 3 || cameras.empty()) {
+                return prior;
+            }
+
+            std::vector<double> sum_rgb(sky_count * 3, 0.0);
+            std::vector<double> sum_weight(sky_count, 0.0);
+            std::array<double, 3> global_sum{0.0, 0.0, 0.0};
+            double global_weight = 0.0;
+
+            const size_t camera_stride = std::max<size_t>(1, cameras.size() / MAX_PRIOR_CAMERAS);
+            for (size_t camera_index = 0;
+                 camera_index < cameras.size() && prior.cameras_used < MAX_PRIOR_CAMERAS;
+                 camera_index += camera_stride) {
+                const auto& camera = cameras[camera_index];
+                if (!camera ||
+                    camera->camera_model_type() != lfs::core::CameraModelType::PINHOLE ||
+                    !camera->world_view_transform().is_valid() ||
+                    !std::filesystem::exists(camera->image_path())) {
+                    continue;
+                }
+
+                unsigned char* raw_image = nullptr;
+                int image_width = 0;
+                int image_height = 0;
+                int channels = 0;
+                try {
+                    std::tie(raw_image, image_width, image_height, channels) =
+                        lfs::core::load_image(camera->image_path(), -1, PRIOR_IMAGE_MAX_WIDTH);
+                } catch (const std::exception& e) {
+                    LOG_WARN("Learned Sky: failed to sample sky prior from {}: {}",
+                             camera->image_name(), e.what());
+                    continue;
+                }
+
+                std::unique_ptr<unsigned char, decltype(&lfs::core::free_image)> image(
+                    raw_image, &lfs::core::free_image);
+                if (!image || image_width <= 0 || image_height <= 0 || channels < 3) {
+                    continue;
+                }
+
+                const int reference_width = std::max(1, camera->image_width());
+                const int reference_height = std::max(1, camera->image_height());
+                const auto [fx, fy, cx, cy] = camera->get_intrinsics();
+                const float x_scale = static_cast<float>(image_width) / static_cast<float>(reference_width);
+                const float y_scale = static_cast<float>(image_height) / static_cast<float>(reference_height);
+                const float scaled_fx = fx * x_scale;
+                const float scaled_fy = fy * y_scale;
+                const float scaled_cx = cx * x_scale;
+                const float scaled_cy = cy * y_scale;
+                if (scaled_fx <= 0.0f || scaled_fy <= 0.0f) {
+                    continue;
+                }
+
+                const auto w2c_cpu = camera->world_view_transform().squeeze(0).cpu().contiguous();
+                if (w2c_cpu.numel() < 16) {
+                    continue;
+                }
+                const float* const w2c = w2c_cpu.ptr<float>();
+
+                ++prior.cameras_used;
+                for (size_t i = 0; i < sky_count; ++i) {
+                    const float wx = sky_means[i * 3 + 0];
+                    const float wy = sky_means[i * 3 + 1];
+                    const float wz = sky_means[i * 3 + 2];
+
+                    const float cam_x = w2c[0] * wx + w2c[1] * wy + w2c[2] * wz + w2c[3];
+                    const float cam_y = w2c[4] * wx + w2c[5] * wy + w2c[6] * wz + w2c[7];
+                    const float cam_z = w2c[8] * wx + w2c[9] * wy + w2c[10] * wz + w2c[11];
+                    if (cam_z <= 1e-4f) {
+                        continue;
+                    }
+
+                    const float u = scaled_fx * (cam_x / cam_z) + scaled_cx;
+                    const float v = scaled_fy * (cam_y / cam_z) + scaled_cy;
+                    if (u < 0.0f || v < 0.0f ||
+                        u >= static_cast<float>(image_width) ||
+                        v >= static_cast<float>(image_height)) {
+                        continue;
+                    }
+
+                    const int px = std::clamp(static_cast<int>(std::lround(u)), 0, image_width - 1);
+                    const int py = std::clamp(static_cast<int>(std::lround(v)), 0, image_height - 1);
+                    const size_t offset = (static_cast<size_t>(py) * static_cast<size_t>(image_width) +
+                                           static_cast<size_t>(px)) *
+                                          static_cast<size_t>(channels);
+                    const float r = static_cast<float>(image.get()[offset + 0]) / 255.0f;
+                    const float g = static_cast<float>(image.get()[offset + 1]) / 255.0f;
+                    const float b = static_cast<float>(image.get()[offset + 2]) / 255.0f;
+                    const float v_norm = static_cast<float>(py) / static_cast<float>(std::max(1, image_height - 1));
+                    const float confidence = sky_pixel_confidence(r, g, b, v_norm);
+                    if (confidence <= 0.0f) {
+                        continue;
+                    }
+
+                    const float up_weight = std::clamp((sky_up[i] - 0.05f) / 0.95f, 0.0f, 1.0f);
+                    const double weight = static_cast<double>(confidence * (0.35f + 0.65f * up_weight));
+                    sum_rgb[i * 3 + 0] += static_cast<double>(r) * weight;
+                    sum_rgb[i * 3 + 1] += static_cast<double>(g) * weight;
+                    sum_rgb[i * 3 + 2] += static_cast<double>(b) * weight;
+                    sum_weight[i] += weight;
+
+                    global_sum[0] += static_cast<double>(r) * weight;
+                    global_sum[1] += static_cast<double>(g) * weight;
+                    global_sum[2] += static_cast<double>(b) * weight;
+                    global_weight += weight;
+                    ++prior.accepted_samples;
+                }
+            }
+
+            if (global_weight > 0.0) {
+                prior.fallback = {
+                    static_cast<float>(global_sum[0] / global_weight),
+                    static_cast<float>(global_sum[1] / global_weight),
+                    static_cast<float>(global_sum[2] / global_weight)};
+            }
+
+            for (size_t i = 0; i < sky_count; ++i) {
+                if (sum_weight[i] > 0.0) {
+                    const float sample_mix = std::clamp(static_cast<float>(sum_weight[i] / 2.5), 0.0f, 1.0f);
+                    for (int c = 0; c < 3; ++c) {
+                        const float sampled = static_cast<float>(sum_rgb[i * 3 + c] / sum_weight[i]);
+                        prior.rgb[i * 3 + c] =
+                            prior.fallback[c] + (sampled - prior.fallback[c]) * sample_mix;
+                    }
+                    prior.confidence[i] = std::clamp(
+                        static_cast<float>(sum_weight[i] / std::max(1.0, static_cast<double>(prior.cameras_used) * 0.10)),
+                        0.0f,
+                        1.0f);
+                    ++prior.observed_shells;
+                } else {
+                    prior.rgb[i * 3 + 0] = prior.fallback[0];
+                    prior.rgb[i * 3 + 1] = prior.fallback[1];
+                    prior.rgb[i * 3 + 2] = prior.fallback[2];
+                    prior.confidence[i] = 0.0f;
+                }
+            }
+
+            return prior;
+        }
+
+        struct LearnedSkyShellAppendResult {
+            size_t count = 0;
+            size_t start = 0;
+            float radius = 0.0f;
+            float scale = 0.0f;
+            size_t prior_sample_count = 0;
+            size_t prior_camera_count = 0;
+            size_t prior_observed_shell_count = 0;
+            lfs::core::Tensor means;
+            lfs::core::Tensor scaling;
+            lfs::core::Tensor rotation;
+            lfs::core::Tensor sh0_prior;
+        };
+
+        [[nodiscard]] LearnedSkyShellAppendResult append_learned_sky_gaussian_shell(
+            lfs::core::SplatData& splat,
+            const lfs::core::param::OptimizationParameters& params,
+            const std::vector<std::shared_ptr<lfs::core::Camera>>& cameras) {
+            LearnedSkyShellAppendResult result;
+            if (!use_learned_sky_gaussian_shell(params) ||
+                !splat.means().is_valid() ||
+                splat.size() == 0) {
+                return result;
+            }
+
+            constexpr float SH_C0 = 0.28209479177387814f;
+            constexpr float GOLDEN_ANGLE = 2.39996322972865332f;
+            constexpr float MIN_UP = 0.08f;
+
+            const size_t sky_count = learned_sky_shell_count_for_detail(params.bg_learned_degree);
+            const size_t sky_start = static_cast<size_t>(splat.size());
+            const auto device = splat.means().device();
+
+            auto means_cpu = splat.means().cpu();
+            auto means = means_cpu.accessor<float, 2>();
+            const size_t n_existing = static_cast<size_t>(means_cpu.shape()[0]);
+
+            std::array<float, 3> min_p{
+                std::numeric_limits<float>::max(),
+                std::numeric_limits<float>::max(),
+                std::numeric_limits<float>::max()};
+            std::array<float, 3> max_p{
+                std::numeric_limits<float>::lowest(),
+                std::numeric_limits<float>::lowest(),
+                std::numeric_limits<float>::lowest()};
+
+            for (size_t i = 0; i < n_existing; ++i) {
+                for (size_t axis = 0; axis < 3; ++axis) {
+                    const float value = means(i, axis);
+                    min_p[axis] = std::min(min_p[axis], value);
+                    max_p[axis] = std::max(max_p[axis], value);
+                }
+            }
+
+            std::array<float, 3> center{
+                0.5f * (min_p[0] + max_p[0]),
+                0.5f * (min_p[1] + max_p[1]),
+                0.5f * (min_p[2] + max_p[2])};
+
+            float bbox_radius = 0.0f;
+            for (size_t axis = 0; axis < 3; ++axis) {
+                const float half_extent = 0.5f * (max_p[axis] - min_p[axis]);
+                bbox_radius += half_extent * half_extent;
+            }
+            bbox_radius = std::sqrt(std::max(bbox_radius, 0.0f));
+
+            float camera_radius = 0.0f;
+            for (const auto& camera : cameras) {
+                if (!camera || !camera->cam_position().is_valid() || camera->cam_position().numel() < 3) {
+                    continue;
+                }
+
+                const auto cam_pos = camera->cam_position().cpu();
+                const float* const p = cam_pos.ptr<float>();
+                const float dx = p[0] - center[0];
+                const float dy = p[1] - center[1];
+                const float dz = p[2] - center[2];
+                camera_radius = std::max(camera_radius, std::sqrt(dx * dx + dy * dy + dz * dz));
+            }
+
+            const float scene_scale = std::max(std::abs(splat.get_scene_scale()), 1e-4f);
+            const float radius = std::max({
+                4.0f,
+                bbox_radius * 2.5f,
+                camera_radius * 1.75f,
+                scene_scale * 220.0f});
+            const float shell_scale = std::max(scene_scale * 14.0f, radius * 0.04f);
+            const float raw_scale = std::log(std::max(shell_scale, 1e-4f));
+            const auto shell_up_axis = estimate_sky_up_axis_from_cameras(cameras);
+            const auto shell_right_axis = tangent_axis_for_up(shell_up_axis);
+            const auto shell_forward_axis = vec3_normalize(vec3_cross(shell_up_axis, shell_right_axis));
+            LOG_INFO("Learned Sky: shell frame up {:.3f}/{:.3f}/{:.3f}, right {:.3f}/{:.3f}/{:.3f}, forward {:.3f}/{:.3f}/{:.3f}",
+                     shell_up_axis[0],
+                     shell_up_axis[1],
+                     shell_up_axis[2],
+                     shell_right_axis[0],
+                     shell_right_axis[1],
+                     shell_right_axis[2],
+                     shell_forward_axis[0],
+                     shell_forward_axis[1],
+                     shell_forward_axis[2]);
+
+            std::vector<float> sky_means;
+            std::vector<float> sky_up;
+            std::vector<float> sky_scaling;
+            std::vector<float> sky_rotation;
+            std::vector<float> sky_opacity;
+            std::vector<float> sky_sh0;
+            sky_means.reserve(sky_count * 3);
+            sky_up.reserve(sky_count);
+            sky_scaling.reserve(sky_count * 3);
+            sky_rotation.reserve(sky_count * 4);
+            sky_opacity.reserve(sky_count);
+            sky_sh0.reserve(sky_count * 3);
+
+            for (size_t i = 0; i < sky_count; ++i) {
+                const float u = (static_cast<float>(i) + 0.5f) / static_cast<float>(sky_count);
+                const float y = MIN_UP + (1.0f - MIN_UP) * u;
+                const float ring = std::sqrt(std::max(0.0f, 1.0f - y * y));
+                const float phi = GOLDEN_ANGLE * static_cast<float>(i);
+                const float x = std::cos(phi) * ring;
+                const float z = std::sin(phi) * ring;
+                const std::array<float, 3> direction{
+                    shell_right_axis[0] * x + shell_up_axis[0] * y + shell_forward_axis[0] * z,
+                    shell_right_axis[1] * x + shell_up_axis[1] * y + shell_forward_axis[1] * z,
+                    shell_right_axis[2] * x + shell_up_axis[2] * y + shell_forward_axis[2] * z};
+
+                sky_means.push_back(center[0] + direction[0] * radius);
+                sky_means.push_back(center[1] + direction[1] * radius);
+                sky_means.push_back(center[2] + direction[2] * radius);
+                sky_up.push_back(y);
+
+                sky_scaling.push_back(raw_scale);
+                sky_scaling.push_back(raw_scale);
+                sky_scaling.push_back(raw_scale);
+
+                sky_rotation.push_back(1.0f);
+                sky_rotation.push_back(0.0f);
+                sky_rotation.push_back(0.0f);
+                sky_rotation.push_back(0.0f);
+            }
+
+            const auto sky_prior = estimate_dataset_sky_shell_prior(
+                cameras,
+                sky_means,
+                sky_up,
+                params.bg_color,
+                sky_count);
+
+            if (sky_prior.accepted_samples > 0) {
+                LOG_INFO("Learned Sky: initialized sky shell from dataset ({} sky samples, {} cameras, {}/{} shell splats observed; fallback rgb {:.3f}/{:.3f}/{:.3f})",
+                         sky_prior.accepted_samples,
+                         sky_prior.cameras_used,
+                         sky_prior.observed_shells,
+                         sky_count,
+                         sky_prior.fallback[0],
+                         sky_prior.fallback[1],
+                         sky_prior.fallback[2]);
+            } else {
+                LOG_WARN("Learned Sky: no reliable dataset sky samples found; using neutral fallback rgb {:.3f}/{:.3f}/{:.3f}",
+                         sky_prior.fallback[0],
+                         sky_prior.fallback[1],
+                         sky_prior.fallback[2]);
+            }
+
+            for (size_t i = 0; i < sky_count; ++i) {
+                const float confidence = (i < sky_prior.confidence.size()) ? sky_prior.confidence[i] : 0.0f;
+                const float up_weight = std::clamp((sky_up[i] - MIN_UP) / (1.0f - MIN_UP), 0.0f, 1.0f);
+                const float initial_alpha = std::clamp(
+                    0.015f + 0.43f * confidence * (0.35f + 0.65f * up_weight),
+                    0.005f,
+                    0.48f);
+                sky_opacity.push_back(safe_logit(initial_alpha));
+
+                sky_sh0.push_back((sky_prior.rgb[i * 3 + 0] - 0.5f) / SH_C0);
+                sky_sh0.push_back((sky_prior.rgb[i * 3 + 1] - 0.5f) / SH_C0);
+                sky_sh0.push_back((sky_prior.rgb[i * 3 + 2] - 0.5f) / SH_C0);
+            }
+
+            result.count = sky_count;
+            result.start = sky_start;
+            result.radius = radius;
+            result.scale = shell_scale;
+            result.prior_sample_count = sky_prior.accepted_samples;
+            result.prior_camera_count = sky_prior.cameras_used;
+            result.prior_observed_shell_count = sky_prior.observed_shells;
+
+            const auto sky_means_tensor = lfs::core::Tensor::from_vector(
+                sky_means, {sky_count, 3}, device);
+            const auto sky_scaling_tensor = lfs::core::Tensor::from_vector(
+                sky_scaling, {sky_count, 3}, device);
+            const auto sky_rotation_tensor = lfs::core::Tensor::from_vector(
+                sky_rotation, {sky_count, 4}, device);
+            auto sky_opacity_tensor = lfs::core::Tensor::from_vector(
+                sky_opacity, {sky_count}, device);
+            if (splat.opacity_raw().ndim() == 2) {
+                sky_opacity_tensor = sky_opacity_tensor.unsqueeze(-1);
+            }
+            const auto sky_sh0_tensor = lfs::core::Tensor::from_vector(
+                sky_sh0, {sky_count, 1, 3}, device);
+
+            result.means = sky_means_tensor;
+            result.scaling = sky_scaling_tensor;
+            result.rotation = sky_rotation_tensor;
+            result.sh0_prior = sky_sh0_tensor;
+
+            const size_t sh_rest = (splat.shN().is_valid() && splat.shN().ndim() >= 3)
+                                       ? splat.shN().shape()[1]
+                                       : 0;
+            const auto sky_shN_tensor = lfs::core::Tensor::zeros(
+                {sky_count, sh_rest, 3}, device, lfs::core::DataType::Float32);
+
+            splat.means() = lfs::core::Tensor::cat({splat.means(), sky_means_tensor}, 0);
+            splat.scaling_raw() = lfs::core::Tensor::cat({splat.scaling_raw(), sky_scaling_tensor}, 0);
+            splat.rotation_raw() = lfs::core::Tensor::cat({splat.rotation_raw(), sky_rotation_tensor}, 0);
+            splat.opacity_raw() = lfs::core::Tensor::cat({splat.opacity_raw(), sky_opacity_tensor}, 0);
+            splat.sh0() = lfs::core::Tensor::cat({splat.sh0(), sky_sh0_tensor}, 0);
+            if (splat.shN().is_valid()) {
+                splat.shN() = lfs::core::Tensor::cat({splat.shN(), sky_shN_tensor}, 0);
+            }
+            if (splat.deleted().is_valid()) {
+                const auto sky_deleted = lfs::core::Tensor::zeros_bool({sky_count}, splat.deleted().device());
+                splat.deleted() = lfs::core::Tensor::cat({splat.deleted(), sky_deleted}, 0);
+            }
+
+            return result;
+        }
+
         [[nodiscard]] std::array<float, 3> lerp_color(const std::array<float, 3>& a,
                                                       const std::array<float, 3>& b,
                                                       const float t) {
@@ -682,6 +1218,12 @@ namespace lfs::training {
         current_loss_ = 0.0f;
         train_dataset_size_ = 0;
         total_cameras_count_ = 0;
+        learned_sky_shell_start_ = 0;
+        learned_sky_shell_count_ = 0;
+        learned_sky_shell_means_ = {};
+        learned_sky_shell_scaling_ = {};
+        learned_sky_shell_rotation_ = {};
+        learned_sky_shell_sh0_prior_ = {};
         setCameraLossHeatmap(nullptr);
 
         LOG_DEBUG("Trainer cleanup complete");
@@ -1740,11 +2282,29 @@ namespace lfs::training {
 
             train_dataset_size_ = train_dataset_->size();
 
+            LearnedSkyShellAppendResult learned_sky_shell_append;
+
             // If using Scene mode and no strategy yet, create one
             if (scene_ && !strategy_) {
                 auto* model = scene_->getTrainingModel();
                 if (!model) {
                     return std::unexpected("Scene has no training model set");
+                }
+
+                if (!params_.resume_checkpoint.has_value() &&
+                    learned_sky_shell_count_ == 0 &&
+                    use_learned_sky_gaussian_shell(params_.optimization)) {
+                    learned_sky_shell_append = append_learned_sky_gaussian_shell(
+                        *model, params_.optimization, source_cameras);
+                    if (learned_sky_shell_append.count > 0) {
+                        learned_sky_shell_start_ = learned_sky_shell_append.start;
+                        learned_sky_shell_count_ = learned_sky_shell_append.count;
+                        learned_sky_shell_means_ = learned_sky_shell_append.means;
+                        learned_sky_shell_scaling_ = learned_sky_shell_append.scaling;
+                        learned_sky_shell_rotation_ = learned_sky_shell_append.rotation;
+                        learned_sky_shell_sh0_prior_ = learned_sky_shell_append.sh0_prior;
+                        syncTrainingSceneTopology(scene_, *model);
+                    }
                 }
 
                 auto result = StrategyFactory::instance().create(params.optimization.strategy, *model);
@@ -1757,8 +2317,43 @@ namespace lfs::training {
 
             auto& splat = strategy_->get_model();
 
-            int max_cap = params.optimization.max_cap;
-            if (max_cap < splat.size()) {
+            if (!params_.resume_checkpoint.has_value() &&
+                learned_sky_shell_count_ == 0 &&
+                use_learned_sky_gaussian_shell(params_.optimization)) {
+                learned_sky_shell_append = append_learned_sky_gaussian_shell(
+                    splat, params_.optimization, source_cameras);
+                if (learned_sky_shell_append.count > 0) {
+                    learned_sky_shell_start_ = learned_sky_shell_append.start;
+                    learned_sky_shell_count_ = learned_sky_shell_append.count;
+                    learned_sky_shell_means_ = learned_sky_shell_append.means;
+                    learned_sky_shell_scaling_ = learned_sky_shell_append.scaling;
+                    learned_sky_shell_rotation_ = learned_sky_shell_append.rotation;
+                    learned_sky_shell_sh0_prior_ = learned_sky_shell_append.sh0_prior;
+                    syncTrainingSceneTopology(scene_, splat);
+                }
+            }
+
+            if (learned_sky_shell_count_ > 0 && params_.optimization.max_cap > 0) {
+                const auto current_model_size = static_cast<size_t>(splat.size());
+                if (static_cast<size_t>(params_.optimization.max_cap) < current_model_size) {
+                    params_.optimization.max_cap = static_cast<int>(std::min<size_t>(
+                        current_model_size,
+                        static_cast<size_t>(std::numeric_limits<int>::max())));
+                }
+            }
+
+            if (learned_sky_shell_append.count > 0) {
+                LOG_INFO("Learned Sky: appended {} real trainable FastGS sky-shell Gaussians (radius {:.3f}, scale {:.3f}); hidden directional background is disabled",
+                         learned_sky_shell_append.count,
+                         learned_sky_shell_append.radius,
+                         learned_sky_shell_append.scale);
+            } else if (learned_sky_shell_count_ > 0 &&
+                       use_learned_sky_gaussian_shell(params_.optimization)) {
+                LOG_INFO("Learned Sky: using existing {} trainable sky-shell Gaussians", learned_sky_shell_count_);
+            }
+
+            int max_cap = params_.optimization.max_cap;
+            if (max_cap > 0 && static_cast<size_t>(max_cap) < splat.size()) {
                 LOG_WARN("Max cap is less than to {} initial splats {}. Choosing randomly {} splats", max_cap, splat.size(), max_cap);
                 lfs::core::random_choose(splat, max_cap);
                 syncTrainingSceneTopology(scene_, splat);
@@ -1844,13 +2439,8 @@ namespace lfs::training {
                 LOG_INFO("Background color set to RGB({:.2f}, {:.2f}, {:.2f})", bg_color[0], bg_color[1], bg_color[2]);
             }
 
-            if (params.optimization.bg_mode == lfs::core::param::BackgroundMode::LearnedDirectional) {
-                if (!directional_background_) {
-                    directional_background_ = std::make_unique<DirectionalBackground>();
-                }
-                directional_background_->ensure_initialized(
-                    params.optimization.bg_color,
-                    params.optimization.bg_learned_degree);
+            if (use_learned_sky_gaussian_shell(params_.optimization)) {
+                directional_background_.reset();
             }
 
             // Initialize image cache loader before any code path that calls getInstance()
@@ -2282,19 +2872,13 @@ namespace lfs::training {
             background_ = bg_cpu.to(lfs::core::Device::CUDA);
         }
 
-        if (params_.optimization.bg_mode == lfs::core::param::BackgroundMode::LearnedDirectional) {
-            if (!directional_background_) {
-                directional_background_ = std::make_unique<DirectionalBackground>();
-            }
-            directional_background_->ensure_initialized(
-                params_.optimization.bg_color,
-                params_.optimization.bg_learned_degree);
+        if (use_learned_sky_gaussian_shell(params_.optimization)) {
+            directional_background_.reset();
         }
     }
 
     std::optional<DirectionalBackgroundSnapshot> Trainer::learnedDirectionalBackgroundSnapshot() const {
-        if (params_.optimization.bg_mode != lfs::core::param::BackgroundMode::LearnedDirectional ||
-            !directional_background_) {
+        if (!directional_background_) {
             return std::nullopt;
         }
         return directional_background_->snapshot();
@@ -2486,27 +3070,72 @@ namespace lfs::training {
         const int width,
         const int height,
         const int iteration) {
+        (void)camera;
         switch (params_.optimization.bg_mode) {
         case lfs::core::param::BackgroundMode::Image:
             return get_background_image_for_camera(width, height);
         case lfs::core::param::BackgroundMode::Random:
             return get_random_background_for_camera(width, height, iteration);
         case lfs::core::param::BackgroundMode::LearnedDirectional:
-            if (iteration < params_.optimization.bg_learned_start_iter) {
-                return {};
-            }
-            if (!directional_background_) {
-                directional_background_ = std::make_unique<DirectionalBackground>();
-            }
-            directional_background_->ensure_initialized(
-                params_.optimization.bg_color,
-                params_.optimization.bg_learned_degree);
-            return directional_background_->render(camera, width, height, 0, 0, width, height);
+            return {};
         case lfs::core::param::BackgroundMode::SolidColor:
         case lfs::core::param::BackgroundMode::Modulation:
             return {};
         }
         return {};
+    }
+
+    void Trainer::constrain_learned_sky_shell() {
+        if (!strategy_ ||
+            learned_sky_shell_count_ == 0 ||
+            params_.optimization.bg_mode != lfs::core::param::BackgroundMode::LearnedDirectional) {
+            return;
+        }
+
+        auto& model = strategy_->get_model();
+        const size_t start = learned_sky_shell_start_;
+        const size_t end = start + learned_sky_shell_count_;
+        if (start >= static_cast<size_t>(model.size()) ||
+            end > static_cast<size_t>(model.size())) {
+            return;
+        }
+        if (!learned_sky_shell_means_.is_valid() ||
+            !learned_sky_shell_scaling_.is_valid() ||
+            !learned_sky_shell_rotation_.is_valid() ||
+            !learned_sky_shell_sh0_prior_.is_valid() ||
+            learned_sky_shell_means_.shape()[0] != learned_sky_shell_count_ ||
+            learned_sky_shell_scaling_.shape()[0] != learned_sky_shell_count_ ||
+            learned_sky_shell_rotation_.shape()[0] != learned_sky_shell_count_ ||
+            learned_sky_shell_sh0_prior_.shape()[0] != learned_sky_shell_count_) {
+            return;
+        }
+
+        const int sh_rest = (model.shN().is_valid() && model.shN().ndim() >= 3)
+                                ? static_cast<int>(model.shN().shape()[1])
+                                : 0;
+        lfs::training::kernels::launch_constrain_learned_sky_shell(
+            model.means().ptr<float>(),
+            model.scaling_raw().ptr<float>(),
+            model.rotation_raw().ptr<float>(),
+            model.opacity_raw().ptr<float>(),
+            model.sh0().ptr<float>(),
+            (model.shN().is_valid() && sh_rest > 0) ? model.shN().ptr<float>() : nullptr,
+            (model.deleted().is_valid() && model.deleted().shape()[0] >= end)
+                ? model.deleted().ptr<unsigned char>()
+                : nullptr,
+            learned_sky_shell_means_.ptr<float>(),
+            learned_sky_shell_scaling_.ptr<float>(),
+            learned_sky_shell_rotation_.ptr<float>(),
+            learned_sky_shell_sh0_prior_.ptr<float>(),
+            static_cast<int>(start),
+            static_cast<int>(learned_sky_shell_count_),
+            sh_rest,
+            safe_logit(0.005f),
+            safe_logit(0.62f),
+            rgb_to_sh0(0.0f),
+            rgb_to_sh0(1.0f),
+            0.06f,
+            model.means().stream());
     }
 
     lfs::core::Tensor Trainer::get_random_background_for_camera(int width, int height, int iteration) {
@@ -3273,6 +3902,26 @@ namespace lfs::training {
                                     : mask_tile;
                             tile_error_map.mul_(mask_for_error);
                         }
+
+                        if (learned_directional_bg_active &&
+                            sky_gate_tile.is_valid() &&
+                            tile_error_map.is_valid() &&
+                            tile_error_map.dtype() == lfs::core::DataType::Float32 &&
+                            tile_error_map.numel() == sky_gate_tile.numel()) {
+                            if (tile_error_map.device() != lfs::core::Device::CUDA) {
+                                tile_error_map = tile_error_map.cuda();
+                            }
+                            tile_error_map = tile_error_map.is_contiguous()
+                                                 ? tile_error_map
+                                                 : tile_error_map.contiguous();
+                            lfs::training::kernels::launch_attenuate_sky_foreground_error_map(
+                                tile_error_map.ptr<float>(),
+                                sky_gate_tile.ptr<float>(),
+                                tile_height,
+                                tile_width,
+                                1.0f,
+                                tile_error_map.stream());
+                        }
                     }
 
                     if (tile_error_map.is_valid() && core::param::is_mrnf_strategy(params_.optimization.strategy)) {
@@ -3397,19 +4046,56 @@ namespace lfs::training {
                         nvtxRangePop();
                     }
 
+                    lfs::core::Tensor gaussian_raster_grad = raster_grad;
+                    if (learned_directional_bg_active &&
+                        sky_gate_tile.is_valid() &&
+                        raster_grad.is_valid() &&
+                        raster_grad.dtype() == lfs::core::DataType::Float32) {
+                        const bool grad_layout_ok =
+                            raster_grad.ndim() == 3 &&
+                            (raster_grad.shape()[0] == 3 || raster_grad.shape()[2] == 3);
+                        const bool grad_chw = grad_layout_ok && raster_grad.shape()[0] == 3;
+                        const int grad_h = grad_chw
+                                               ? static_cast<int>(raster_grad.shape()[1])
+                                               : (grad_layout_ok ? static_cast<int>(raster_grad.shape()[0]) : 0);
+                        const int grad_w = grad_chw
+                                               ? static_cast<int>(raster_grad.shape()[2])
+                                               : (grad_layout_ok ? static_cast<int>(raster_grad.shape()[1]) : 0);
+                        if (grad_layout_ok &&
+                            grad_h == tile_height &&
+                            grad_w == tile_width &&
+                            sky_gate_tile.numel() == static_cast<size_t>(tile_height * tile_width)) {
+                            gaussian_raster_grad = raster_grad.clone();
+                            if (gaussian_raster_grad.device() != lfs::core::Device::CUDA) {
+                                gaussian_raster_grad = gaussian_raster_grad.cuda();
+                            }
+                            gaussian_raster_grad = gaussian_raster_grad.is_contiguous()
+                                                     ? gaussian_raster_grad
+                                                     : gaussian_raster_grad.contiguous();
+                            lfs::training::kernels::launch_attenuate_sky_foreground_rgb_gradient(
+                                gaussian_raster_grad.ptr<float>(),
+                                grad_chw,
+                                sky_gate_tile.ptr<float>(),
+                                tile_height,
+                                tile_width,
+                                1.0f,
+                                gaussian_raster_grad.stream());
+                        }
+                    }
+
                     nvtxRangePush("rasterize_backward");
                     if (gsplat_ctx) {
                         auto grad_alpha = tile_grad_alpha.is_valid()
                                               ? tile_grad_alpha
                                               : lfs::core::Tensor::zeros_like(output.alpha);
                         tile_context_guard.release();
-                        gsplat_rasterize_backward(*gsplat_ctx, raster_grad, grad_alpha,
+                        gsplat_rasterize_backward(*gsplat_ctx, gaussian_raster_grad, grad_alpha,
                                                   strategy_->get_model(), strategy_->get_optimizer(),
                                                   use_pixel_error_densification ? tile_error_map : lfs::core::Tensor{});
                     } else {
                         tile_context_guard.release();
                         if (run_fastgs_gaussian_backward && fast_ctx->forward_ctx.n_instances > 0) {
-                            fast_rasterize_backward(*fast_ctx, raster_grad, strategy_->get_model(),
+                            fast_rasterize_backward(*fast_ctx, gaussian_raster_grad, strategy_->get_model(),
                                                     strategy_->get_optimizer(), tile_grad_alpha,
                                                     use_pixel_error_densification ? tile_error_map : lfs::core::Tensor{},
                                                     densification_type,
@@ -3613,6 +4299,7 @@ namespace lfs::training {
                     if (!freeze_gaussians) {
                         strategy_->step(iter);
                     }
+                    constrain_learned_sky_shell();
 
                     if (sparsity_optimizer_ &&
                         sparsity_optimizer_->is_initialized() &&
@@ -4201,7 +4888,9 @@ namespace lfs::training {
             }
         }
 
-        if (!directional_background_) {
+        if (use_learned_sky_gaussian_shell(params_.optimization)) {
+            directional_background_.reset();
+        } else if (!directional_background_) {
             const auto checkpoint_header = lfs::core::load_checkpoint_header(checkpoint_path);
             const bool checkpoint_has_directional_bg =
                 checkpoint_header &&
@@ -4260,13 +4949,8 @@ namespace lfs::training {
         }
         sync_strategy_optimization_params();
 
-        if (params_.optimization.bg_mode == lfs::core::param::BackgroundMode::LearnedDirectional) {
-            if (!directional_background_) {
-                directional_background_ = std::make_unique<DirectionalBackground>();
-            }
-            directional_background_->ensure_initialized(
-                params_.optimization.bg_color,
-                params_.optimization.bg_learned_degree);
+        if (use_learned_sky_gaussian_shell(params_.optimization)) {
+            directional_background_.reset();
         }
 
         current_iteration_ = *result;

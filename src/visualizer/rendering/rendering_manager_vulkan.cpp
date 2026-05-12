@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "core/logger.hpp"
+#include "core/point_cloud.hpp"
 #include "core/splat_data.hpp"
 #include "core/tensor.hpp"
 #include "model_renderability.hpp"
@@ -49,8 +50,15 @@ namespace lfs::vis {
                 hash *= 1099511628211ull;
             };
             mix(static_cast<std::uint32_t>(snapshot.degree));
+            mix(static_cast<std::uint32_t>(snapshot.texture_width));
+            mix(static_cast<std::uint32_t>(snapshot.texture_height));
             mix(static_cast<std::uint32_t>(snapshot.step));
             mix(static_cast<std::uint32_t>(snapshot.step >> 32));
+            for (const float value : snapshot.texture) {
+                std::uint32_t bits = 0;
+                std::memcpy(&bits, &value, sizeof(bits));
+                mix(bits);
+            }
             for (const auto& coeff : snapshot.coeffs) {
                 for (const float channel : coeff) {
                     std::uint32_t bits = 0;
@@ -76,6 +84,11 @@ namespace lfs::vis {
             lfs::rendering::LearnedSkyRenderState state;
             state.enabled = true;
             state.degree = snapshot->degree;
+            state.texture_width = snapshot->texture_width;
+            state.texture_height = snapshot->texture_height;
+            state.texture = snapshot->texture;
+            state.lobe_dirs = snapshot->lobe_dirs;
+            state.lobe_colors = snapshot->lobe_colors;
             state.generation = hashLearnedSkySnapshot(*snapshot);
             for (size_t i = 0; i < state.coeffs.size(); ++i) {
                 state.coeffs[i] = glm::vec3(
@@ -84,6 +97,158 @@ namespace lfs::vis {
                     snapshot->coeffs[i][2]);
             }
             return state;
+        }
+
+        [[nodiscard]] glm::vec3 evaluateLearnedSkyDisplayColor(
+            const lfs::rendering::LearnedSkyRenderState& sky,
+            const glm::vec3& dir) {
+            if (sky.texture_width > 0 &&
+                sky.texture_height > 0 &&
+                sky.texture.size() ==
+                    static_cast<size_t>(sky.texture_width) * static_cast<size_t>(sky.texture_height) * 3UL) {
+                constexpr float kPi = 3.14159265358979323846f;
+                const float longitude = std::atan2(dir.x, dir.z);
+                const float latitude = std::asin(std::clamp(dir.y, -1.0f, 1.0f));
+                float u = longitude / (2.0f * kPi) + 0.5f;
+                const float v = 0.5f - latitude / kPi;
+                u = u - std::floor(u);
+
+                const float x = u * static_cast<float>(sky.texture_width) - 0.5f;
+                const float y = std::clamp(v, 0.0f, 1.0f) * static_cast<float>(sky.texture_height - 1);
+                const int x0 = static_cast<int>(std::floor(x));
+                const int y0 = static_cast<int>(std::floor(y));
+                const float wx = x - static_cast<float>(x0);
+                const float wy = y - static_cast<float>(y0);
+                const int x0w = (x0 % sky.texture_width + sky.texture_width) % sky.texture_width;
+                const int x1w = (x0w + 1) % sky.texture_width;
+                const int y0c = std::clamp(y0, 0, sky.texture_height - 1);
+                const int y1c = std::min(y0c + 1, sky.texture_height - 1);
+                const auto fetch = [&](const int px, const int py) {
+                    const size_t index =
+                        (static_cast<size_t>(py) * static_cast<size_t>(sky.texture_width) + static_cast<size_t>(px)) * 3UL;
+                    return glm::vec3(
+                        sky.texture[index + 0],
+                        sky.texture[index + 1],
+                        sky.texture[index + 2]);
+                };
+                return glm::mix(
+                    glm::mix(fetch(x0w, y0c), fetch(x1w, y0c), wx),
+                    glm::mix(fetch(x0w, y1c), fetch(x1w, y1c), wx),
+                    wy);
+            }
+
+            if (!sky.lobe_dirs.empty() &&
+                sky.lobe_dirs.size() == sky.lobe_colors.size() &&
+                sky.lobe_dirs.size() % 3UL == 0) {
+                float best_dot = -2.0f;
+                size_t best = 0;
+                const size_t count = sky.lobe_dirs.size() / 3UL;
+                for (size_t i = 0; i < count; ++i) {
+                    const size_t base = i * 3UL;
+                    const float dot =
+                        dir.x * sky.lobe_dirs[base + 0] +
+                        dir.y * sky.lobe_dirs[base + 1] +
+                        dir.z * sky.lobe_dirs[base + 2];
+                    if (dot > best_dot) {
+                        best_dot = dot;
+                        best = base;
+                    }
+                }
+                return glm::vec3(
+                    sky.lobe_colors[best + 0],
+                    sky.lobe_colors[best + 1],
+                    sky.lobe_colors[best + 2]);
+            }
+
+            return glm::vec3(0.55f, 0.68f, 0.9f);
+        }
+
+        [[nodiscard]] lfs::core::PointCloud makeLearnedSkyPointCloud(
+            const lfs::rendering::LearnedSkyRenderState& sky,
+            const float scene_scale,
+            const lfs::core::Device device) {
+            constexpr size_t kSkyVisualPointCount = 6000;
+            constexpr float kPi = 3.14159265358979323846f;
+            constexpr float kGoldenAngle = kPi * (3.0f - 2.2360679774997896964f);
+            constexpr float kMinY = -0.12f;
+
+            const float radius = std::max(4.0f, scene_scale > 0.0f ? scene_scale * 6.0f : 8.0f);
+            std::vector<float> positions(kSkyVisualPointCount * 3UL);
+            std::vector<float> colors(kSkyVisualPointCount * 3UL);
+            for (size_t i = 0; i < kSkyVisualPointCount; ++i) {
+                const float t = (static_cast<float>(i) + 0.5f) / static_cast<float>(kSkyVisualPointCount);
+                const float y = 1.0f - t * (1.0f - kMinY);
+                const float ring_radius = std::sqrt(std::max(0.0f, 1.0f - y * y));
+                const float theta = static_cast<float>(i) * kGoldenAngle;
+                const glm::vec3 dir = glm::normalize(glm::vec3(
+                    std::cos(theta) * ring_radius,
+                    y,
+                    std::sin(theta) * ring_radius));
+                const glm::vec3 color = glm::clamp(
+                    evaluateLearnedSkyDisplayColor(sky, dir),
+                    glm::vec3(0.0f),
+                    glm::vec3(1.0f));
+
+                const size_t base = i * 3UL;
+                positions[base + 0] = dir.x * radius;
+                positions[base + 1] = dir.y * radius;
+                positions[base + 2] = dir.z * radius;
+                colors[base + 0] = color.r;
+                colors[base + 1] = color.g;
+                colors[base + 2] = color.b;
+            }
+
+            return lfs::core::PointCloud{
+                lfs::core::Tensor::from_vector(positions, {kSkyVisualPointCount, 3UL}, device),
+                lfs::core::Tensor::from_vector(colors, {kSkyVisualPointCount, 3UL}, device)};
+        }
+
+        void appendLearnedSkyPointCloud(
+            lfs::core::Tensor& positions,
+            lfs::core::Tensor& colors,
+            lfs::rendering::PointCloudRenderRequest& request,
+            const std::optional<lfs::rendering::LearnedSkyRenderState>& learned_sky,
+            const float scene_scale) {
+            if (!learned_sky || !learned_sky->enabled || !positions.is_valid() || positions.ndim() != 2 ||
+                positions.size(1) != 3 || !colors.is_valid() || colors.ndim() != 2 || colors.size(1) != 3) {
+                return;
+            }
+
+            const size_t original_count = positions.size(0);
+            const auto device = positions.device();
+            auto sky_cloud = makeLearnedSkyPointCloud(*learned_sky, scene_scale, device);
+            const size_t sky_count = static_cast<size_t>(sky_cloud.size());
+            if (sky_count == 0) {
+                return;
+            }
+
+            positions = lfs::core::Tensor::cat({positions, sky_cloud.means}, 0);
+            colors = lfs::core::Tensor::cat({colors, sky_cloud.colors.to(device)}, 0);
+
+            if (request.scene.model_transforms && !request.scene.model_transforms->empty()) {
+                lfs::core::Tensor original_indices;
+                if (request.scene.transform_indices &&
+                    request.scene.transform_indices->is_valid() &&
+                    request.scene.transform_indices->numel() == original_count) {
+                    original_indices = request.scene.transform_indices->device() == device
+                                           ? *request.scene.transform_indices
+                                           : request.scene.transform_indices->to(device);
+                    if (original_indices.dtype() != lfs::core::DataType::Int32) {
+                        original_indices = original_indices.to(lfs::core::DataType::Int32);
+                    }
+                } else {
+                    original_indices = lfs::core::Tensor::zeros(
+                        {original_count},
+                        device,
+                        lfs::core::DataType::Int32);
+                }
+                auto sky_indices = lfs::core::Tensor::zeros(
+                    {sky_count},
+                    device,
+                    lfs::core::DataType::Int32);
+                request.scene.transform_indices = std::make_shared<lfs::core::Tensor>(
+                    lfs::core::Tensor::cat({original_indices, sky_indices}, 0));
+            }
         }
 
         [[nodiscard]] std::vector<ViewportInteractionPanel> buildVulkanInteractionPanels(
@@ -594,9 +759,30 @@ namespace lfs::vis {
                                             scene_state.meshes.end(),
                                             [](const auto& mesh) { return mesh.mesh != nullptr; });
         const auto learned_sky = captureLearnedSkyRenderState(scene_manager);
+        const std::uint64_t learned_sky_generation = learned_sky ? learned_sky->generation : 0;
+        if (learned_sky_generation != learned_sky_view_generation_) {
+            learned_sky_view_generation_ = learned_sky_generation;
+            markDirty(DirtyFlag::BACKGROUND | DirtyFlag::VIEWPORT);
+        }
         const bool has_environment = environmentBackgroundEnabled(settings_) || learned_sky.has_value();
         const bool learned_sky_transparent =
             learned_sky.has_value() && !splitViewEnabled(settings_.split_view_mode);
+        const auto attach_cuda_learned_sky = [&](lfs::rendering::ViewportRenderRequest& request) {
+            if (learned_sky && !lfs::rendering::isVkSplatBackend(request.raster_backend)) {
+                request.learned_sky = *learned_sky;
+                request.transparent_background = true;
+            } else if (learned_sky_transparent) {
+                request.transparent_background = true;
+            }
+        };
+        const auto attach_cuda_learned_sky_to_point_cloud = [&](lfs::rendering::PointCloudRenderRequest& request) {
+            if (learned_sky) {
+                request.learned_sky = *learned_sky;
+                request.transparent_background = true;
+            } else if (learned_sky_transparent) {
+                request.transparent_background = true;
+            }
+        };
         const bool has_render_content = has_renderable_model || has_point_cloud || has_meshes || has_environment;
         const size_t model_ptr = reinterpret_cast<size_t>(model);
 
@@ -822,10 +1008,9 @@ namespace lfs::vis {
                          .transform_indices = nullptr,
                          .node_visibility_mask = {}},
                     .filters = state.filters,
-                    .transparent_background = environmentBackgroundUsesTransparentViewerCompositing(settings_)};
-                if (learned_sky_transparent) {
-                    request.transparent_background = true;
-                }
+                    .transparent_background = environmentBackgroundUsesTransparentViewerCompositing(settings_),
+                    .learned_sky = {}};
+                attach_cuda_learned_sky_to_point_cloud(request);
                 auto result = engine_->renderPointCloudImage(*frame_ctx.scene_state.point_cloud, request);
                 if (!result || !result->image) {
                     return std::unexpected(result ? "Raw point-cloud panel render returned no image"
@@ -859,10 +1044,9 @@ namespace lfs::vis {
                     .render = state.render,
                     .scene = scene,
                     .filters = state.filters,
-                    .transparent_background = environmentBackgroundUsesTransparentViewerCompositing(settings_)};
-                if (learned_sky_transparent) {
-                    request.transparent_background = true;
-                }
+                    .transparent_background = environmentBackgroundUsesTransparentViewerCompositing(settings_),
+                    .learned_sky = {}};
+                attach_cuda_learned_sky_to_point_cloud(request);
                 auto result = engine_->renderPointCloudImage(*panel_model, request);
                 if (!result || !result->image) {
                     return std::unexpected(result ? "Point-cloud panel render returned no image"
@@ -887,9 +1071,7 @@ namespace lfs::vis {
             if (node_visibility_override) {
                 request.scene.node_visibility_mask = *node_visibility_override;
             }
-            if (learned_sky_transparent) {
-                request.transparent_background = true;
-            }
+            attach_cuda_learned_sky(request);
 
             const bool vksplat_panel_supported =
                 vksplat_output_slot.has_value() &&
@@ -1200,23 +1382,11 @@ namespace lfs::vis {
             }
             auto pc_request = buildPointCloudRenderRequest(
                 frame_ctx, render_size, *transforms_for_request);
-            if (learned_sky_transparent) {
-                pc_request.transparent_background = true;
-            }
+            attach_cuda_learned_sky_to_point_cloud(pc_request);
 
-            // Vulkan-native path: skip CUDA staging, drive an external VkImage
-            // straight through the same plumbing the VkSplat backend uses.
-            auto try_vulkan = [&]() -> std::optional<VulkanFrameResult> {
-                if (!context.vulkan_context) {
-                    return std::nullopt;
-                }
-                if (!point_cloud_vulkan_renderer_) {
-                    point_cloud_vulkan_renderer_ = std::make_unique<PointCloudVulkanRenderer>();
-                }
-
-                lfs::core::Tensor splat_positions;
-                const lfs::core::Tensor* positions_ptr = nullptr;
-                const lfs::core::Tensor* colors_ptr = nullptr;
+            const auto build_display_point_cloud =
+                [&](lfs::rendering::PointCloudRenderRequest& request)
+                -> std::expected<lfs::core::PointCloud, std::string> {
                 if (has_renderable_model) {
                     constexpr float SH_C0 = 0.28209479177387814f;
                     const auto& sh0 = model->sh0_raw();
@@ -1230,18 +1400,49 @@ namespace lfs::vis {
                             point_cloud_colors_cache_ =
                                 (sh0.slice(1, 0, 1).squeeze(1) * SH_C0 + 0.5f).clamp(0.0f, 1.0f);
                         } catch (const std::exception& e) {
-                            LOG_ERROR("Point cloud color derivation failed: {}", e.what());
-                            return std::nullopt;
+                            return std::unexpected(std::format("Point cloud color derivation failed: {}", e.what()));
                         }
                         point_cloud_colors_cache_key_ = sh0_key;
                         point_cloud_colors_cache_size_ = sh0_count;
                     }
-                    splat_positions = model->get_means();
-                    positions_ptr = &splat_positions;
-                    colors_ptr = &point_cloud_colors_cache_;
-                } else {
-                    positions_ptr = &frame_ctx.scene_state.point_cloud->means;
-                    colors_ptr = &frame_ctx.scene_state.point_cloud->colors;
+
+                    auto positions = model->get_means();
+                    auto colors = point_cloud_colors_cache_;
+                    appendLearnedSkyPointCloud(
+                        positions,
+                        colors,
+                        request,
+                        learned_sky,
+                        model->get_scene_scale());
+                    return lfs::core::PointCloud{std::move(positions), std::move(colors)};
+                }
+
+                auto positions = frame_ctx.scene_state.point_cloud->means;
+                auto colors = frame_ctx.scene_state.point_cloud->colors;
+                appendLearnedSkyPointCloud(
+                    positions,
+                    colors,
+                    request,
+                    learned_sky,
+                    1.0f);
+                return lfs::core::PointCloud{std::move(positions), std::move(colors)};
+            };
+
+            // Vulkan-native path: skip CUDA staging, drive an external VkImage
+            // straight through the same plumbing the VkSplat backend uses.
+            auto try_vulkan = [&]() -> std::optional<VulkanFrameResult> {
+                if (!context.vulkan_context) {
+                    return std::nullopt;
+                }
+                if (!point_cloud_vulkan_renderer_) {
+                    point_cloud_vulkan_renderer_ = std::make_unique<PointCloudVulkanRenderer>();
+                }
+
+                auto request = pc_request;
+                auto display_cloud = build_display_point_cloud(request);
+                if (!display_cloud) {
+                    LOG_ERROR("Point cloud display data failed: {}", display_cloud.error());
+                    return std::nullopt;
                 }
 
                 const auto vp_data = frame_ctx.makeViewportData();
@@ -1265,30 +1466,30 @@ namespace lfs::vis {
                     pc_request.frame_view.size.y);
 
                 PointCloudVulkanRenderer::RenderRequest vk_req{};
-                vk_req.positions = positions_ptr;
-                vk_req.colors = colors_ptr;
-                vk_req.model_transforms = pc_request.scene.model_transforms;
-                vk_req.transform_indices = pc_request.scene.transform_indices.get();
-                vk_req.node_visibility_mask = &pc_request.scene.node_visibility_mask;
-                if (pc_request.filters.crop_box.has_value()) {
+                vk_req.positions = &display_cloud->means;
+                vk_req.colors = &display_cloud->colors;
+                vk_req.model_transforms = request.scene.model_transforms;
+                vk_req.transform_indices = request.scene.transform_indices.get();
+                vk_req.node_visibility_mask = &request.scene.node_visibility_mask;
+                if (request.filters.crop_box.has_value()) {
                     PointCloudVulkanRenderer::CropBox crop{};
-                    crop.to_local = pc_request.filters.crop_box->transform;
-                    crop.min = pc_request.filters.crop_box->min;
-                    crop.max = pc_request.filters.crop_box->max;
-                    crop.inverse = pc_request.filters.crop_inverse;
-                    crop.desaturate = pc_request.filters.crop_desaturate;
+                    crop.to_local = request.filters.crop_box->transform;
+                    crop.min = request.filters.crop_box->min;
+                    crop.max = request.filters.crop_box->max;
+                    crop.inverse = request.filters.crop_inverse;
+                    crop.desaturate = request.filters.crop_desaturate;
                     vk_req.crop = crop;
                 }
                 vk_req.view = view;
                 vk_req.view_projection = view_proj;
-                vk_req.size = pc_request.frame_view.size;
-                vk_req.background_color = pc_request.frame_view.background_color;
-                vk_req.transparent_background = pc_request.transparent_background;
-                vk_req.orthographic = pc_request.frame_view.orthographic;
-                vk_req.ortho_scale = pc_request.frame_view.ortho_scale;
+                vk_req.size = request.frame_view.size;
+                vk_req.background_color = request.frame_view.background_color;
+                vk_req.transparent_background = request.transparent_background;
+                vk_req.orthographic = request.frame_view.orthographic;
+                vk_req.ortho_scale = request.frame_view.ortho_scale;
                 vk_req.focal_y = focal_y;
-                vk_req.voxel_size = pc_request.render.voxel_size;
-                vk_req.scaling_modifier = pc_request.render.scaling_modifier;
+                vk_req.voxel_size = request.render.voxel_size;
+                vk_req.scaling_modifier = request.render.scaling_modifier;
 
                 LOG_TIMER("renderVulkanFrame.point_cloud_vulkan");
                 auto render_result = point_cloud_vulkan_renderer_->render(
@@ -1356,9 +1557,11 @@ namespace lfs::vis {
 
             // CUDA fallback (no Vulkan context, or render failed)
             LOG_TIMER("renderVulkanFrame.renderPointCloudImage");
-            auto render_result = has_renderable_model
-                                     ? engine_->renderPointCloudImage(*model, pc_request)
-                                     : engine_->renderPointCloudImage(*frame_ctx.scene_state.point_cloud, pc_request);
+            auto request = pc_request;
+            auto display_cloud = build_display_point_cloud(request);
+            auto render_result = display_cloud
+                                     ? engine_->renderPointCloudImage(*display_cloud, request)
+                                     : std::unexpected(display_cloud.error());
             if (render_result) {
                 rendered_image = std::move(render_result->image);
                 rendered_metadata = std::move(render_result->metadata);
@@ -1367,9 +1570,7 @@ namespace lfs::vis {
             }
         } else if (has_renderable_model) {
             auto request = buildViewportRenderRequest(frame_ctx, render_size);
-            if (learned_sky_transparent) {
-                request.transparent_background = true;
-            }
+            attach_cuda_learned_sky(request);
             // VkSplat is editing/viewing only — splat files loaded with no
             // trainer attached. As soon as a dataset is present (ready, paused,
             // or running), its persistent Vulkan-side sort buffers can be
@@ -1383,6 +1584,7 @@ namespace lfs::vis {
                         ? lfs::rendering::GaussianRasterBackend::Gut
                         : lfs::rendering::GaussianRasterBackend::FastGs;
                 request.gut = lfs::rendering::isGutBackend(request.raster_backend);
+                attach_cuda_learned_sky(request);
             }
             if (lfs::rendering::isVkSplatBackend(request.raster_backend)) {
                 if (!context.vulkan_context) {

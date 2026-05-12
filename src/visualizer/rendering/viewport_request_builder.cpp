@@ -155,7 +155,8 @@ namespace lfs::vis {
                                               overlay_visible)
                                                  ? ctx.cursor_preview.focused_gaussian_id
                                                  : -1}},
-            .transparent_background = environmentBackgroundUsesTransparentViewerCompositing(ctx.settings)};
+            .transparent_background = environmentBackgroundUsesTransparentViewerCompositing(ctx.settings),
+            .learned_sky = {}};
 
         request.overlay.selection_colors[0] = glm::vec4(ctx.settings.selection_color_center_marker, 1.0f);
         request.overlay.selection_colors[lfs::rendering::kSelectionPreviewColorIndex] =
@@ -260,7 +261,8 @@ namespace lfs::vis {
                  .transform_indices = ctx.scene_state.transform_indices,
                  .node_visibility_mask = ctx.scene_state.node_visibility_mask},
             .filters = {},
-            .transparent_background = environmentBackgroundUsesTransparentViewerCompositing(ctx.settings)};
+            .transparent_background = environmentBackgroundUsesTransparentViewerCompositing(ctx.settings),
+            .learned_sky = {}};
 
         applyPointCloudCropBox(request.filters, ctx);
         return request;

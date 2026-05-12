@@ -156,6 +156,19 @@ namespace lfs::rendering {
         std::array<glm::vec4, kSelectionColorTableCount> selection_colors = defaultSelectionColorTable();
     };
 
+    struct LearnedSkyRenderState {
+        bool enabled = false;
+        int degree = 0;
+        int texture_width = 0;
+        int texture_height = 0;
+        std::uint64_t generation = 0;
+        // Row-major RGB display-linear equirectangular texture.
+        std::vector<float> texture;
+        std::vector<float> lobe_dirs;
+        std::vector<float> lobe_colors;
+        std::array<glm::vec3, 9> coeffs{};
+    };
+
     struct ViewportRenderRequest {
         FrameView frame_view;
         float scaling_modifier = 1.0f;
@@ -169,6 +182,7 @@ namespace lfs::rendering {
         GaussianFilterState filters;
         GaussianOverlayState overlay;
         bool transparent_background = false;
+        LearnedSkyRenderState learned_sky;
     };
 
     struct HoveredGaussianQueryRequest {
@@ -214,6 +228,7 @@ namespace lfs::rendering {
         PointCloudSceneState scene;
         PointCloudFilterState filters;
         bool transparent_background = false;
+        LearnedSkyRenderState learned_sky;
     };
 
     struct FramePanelMetadata {
@@ -354,13 +369,6 @@ namespace lfs::rendering {
         float flash_intensity = 0.0f;
         glm::vec3 background_color{0.0f};
         bool transparent_background = false;
-    };
-
-    struct LearnedSkyRenderState {
-        bool enabled = false;
-        int degree = 0;
-        std::uint64_t generation = 0;
-        std::array<glm::vec3, 9> coeffs{};
     };
 
     struct EnvironmentRenderOptions {

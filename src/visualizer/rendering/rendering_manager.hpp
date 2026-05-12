@@ -477,6 +477,7 @@ namespace lfs::vis {
         VkImageLayout vulkan_external_viewport_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
         std::uint64_t vulkan_external_viewport_image_generation_ = 0;
         std::uint64_t split_view_image_generation_ = 0;
+        std::uint64_t learned_sky_view_generation_ = 0;
         glm::ivec2 vulkan_viewport_image_size_{0, 0};
         bool vulkan_viewport_image_flip_y_ = false;
         glm::ivec2 vulkan_gt_comparison_content_size_{0, 0};

@@ -102,6 +102,25 @@ namespace lfs::vis {
             const lfs::rendering::LearnedSkyRenderState& sky,
             const int width,
             const int height) {
+            if (sky.texture_width > 0 &&
+                sky.texture_height > 0 &&
+                sky.texture.size() == static_cast<std::size_t>(sky.texture_width) * static_cast<std::size_t>(sky.texture_height) * 3u) {
+                std::vector<std::uint16_t> rgba(static_cast<std::size_t>(sky.texture_width) * sky.texture_height * 4u);
+                for (int y = 0; y < sky.texture_height; ++y) {
+                    for (int x = 0; x < sky.texture_width; ++x) {
+                        const std::size_t src =
+                            (static_cast<std::size_t>(y) * static_cast<std::size_t>(sky.texture_width) + static_cast<std::size_t>(x)) * 3u;
+                        const std::size_t dst =
+                            (static_cast<std::size_t>(y) * static_cast<std::size_t>(sky.texture_width) + static_cast<std::size_t>(x)) * 4u;
+                        rgba[dst + 0] = floatToHalf(std::clamp(sky.texture[src + 0], 0.0f, 1.0f));
+                        rgba[dst + 1] = floatToHalf(std::clamp(sky.texture[src + 1], 0.0f, 1.0f));
+                        rgba[dst + 2] = floatToHalf(std::clamp(sky.texture[src + 2], 0.0f, 1.0f));
+                        rgba[dst + 3] = floatToHalf(1.0f);
+                    }
+                }
+                return rgba;
+            }
+
             constexpr float kPi = 3.14159265358979323846f;
             std::vector<std::uint16_t> rgba(static_cast<std::size_t>(width) * height * 4u);
             for (int y = 0; y < height; ++y) {
@@ -760,10 +779,12 @@ namespace lfs::vis {
                 }
                 constexpr int kLearnedSkyWidth = 512;
                 constexpr int kLearnedSkyHeight = 256;
-                const auto rgba = makeLearnedSkyTexture(params.learned_sky, kLearnedSkyWidth, kLearnedSkyHeight);
+                const int learned_sky_width = params.learned_sky.texture_width > 0 ? params.learned_sky.texture_width : kLearnedSkyWidth;
+                const int learned_sky_height = params.learned_sky.texture_height > 0 ? params.learned_sky.texture_height : kLearnedSkyHeight;
+                const auto rgba = makeLearnedSkyTexture(params.learned_sky, learned_sky_width, learned_sky_height);
                 const bool ok = uploadRgba16F(
-                    kLearnedSkyWidth,
-                    kLearnedSkyHeight,
+                    learned_sky_width,
+                    learned_sky_height,
                     rgba,
                     std::filesystem::path("__lfs_learned_sky__"));
                 loaded_learned_sky = ok;
