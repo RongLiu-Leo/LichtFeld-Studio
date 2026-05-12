@@ -434,7 +434,27 @@ namespace lfs::training::kernels {
                 return;
             }
 
-            const float sky = sky_gate ? saturate(sky_gate[idx]) : 0.0f;
+            float sky = sky_gate ? saturate(sky_gate[idx]) : 0.0f;
+            if (sky_gate) {
+                // Dampen only very confident sky silhouettes; uncertain foliage/buildings still need growth.
+                const int x = idx % width;
+                const int y = idx / width;
+                float neighbor_sky = sky;
+                for (int dy = -1; dy <= 1; ++dy) {
+                    const int yy = y + dy;
+                    if (yy < 0 || yy >= height) {
+                        continue;
+                    }
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        const int xx = x + dx;
+                        if (xx < 0 || xx >= width) {
+                            continue;
+                        }
+                        neighbor_sky = fmaxf(neighbor_sky, saturate(sky_gate[yy * width + xx]));
+                    }
+                }
+                sky = fmaxf(sky, 0.90f * smoothstep01(0.94f, 0.995f, neighbor_sky));
+            }
             const float clean_sky = smoothstep01(0.82f, 0.98f, sky);
             const float attenuation = saturate(strength) * clean_sky;
             error_map[idx] *= 1.0f - attenuation;
