@@ -9,6 +9,7 @@
 #include "components/directional_background.hpp"
 #include "components/ppisp.hpp"
 #include "components/ppisp_controller_pool.hpp"
+#include "components/sky_discriminator.hpp"
 #include "components/sparsity_optimizer.hpp"
 #include "core/camera.hpp"
 #include "core/parameters.hpp"
@@ -407,6 +408,7 @@ namespace lfs::training {
         std::unordered_map<uint64_t, lfs::core::Tensor> bg_image_cache_; // Cache of resized bg images keyed by (H << 32) | W
         lfs::core::Tensor random_bg_buffer_{};                           // Reusable buffer for random background
         std::unique_ptr<DirectionalBackground> directional_background_;
+        std::unique_ptr<SkyDiscriminator> sky_discriminator_;
         size_t learned_sky_shell_start_ = 0;
         size_t learned_sky_shell_count_ = 0;
         lfs::core::Tensor learned_sky_shell_means_;

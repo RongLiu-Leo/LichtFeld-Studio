@@ -290,6 +290,15 @@
             <button class="num-step-btn" data-event-mousedown="num_step('bg_sky_opacity_decay', 1)">+</button>
           </div>
         </div>
+        <div class="setting-row" data-tooltip="training.tooltip.bg_sky_up">
+          <span class="prop-label">{{label_bg_sky_up}}</span>
+          <span class="text-disabled">{{bg_sky_up_display}}</span>
+        </div>
+        <div class="setting-row">
+          <span class="prop-label">&#160;</span>
+          <button class="btn btn--secondary" data-tooltip="training.tooltip.bg_sky_up_pick" data-event-click="action('pick_sky_up')">{{label_bg_sky_up_pick}}</button>
+          <button class="btn btn--secondary" data-tooltip="training.tooltip.bg_sky_up_reset" data-event-click="action('reset_sky_up')">{{label_bg_sky_up_reset}}</button>
+        </div>
       </div>
     </div>
   </div>

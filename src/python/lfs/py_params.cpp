@@ -1283,6 +1283,16 @@ namespace lfs::python {
                 [](PyOptimizationParams&, float v) { modify_params([v](auto& p) { p.bg_sky_opacity_decay = v; }); },
                 "Extra opacity decay applied only in automatic sky regions")
             .def_prop_rw(
+                "bg_sky_up",
+                [](PyOptimizationParams& self) {
+                    auto& u = self.params().bg_sky_up;
+                    return std::make_tuple(u[0], u[1], u[2]);
+                },
+                [](PyOptimizationParams&, std::tuple<float, float, float> v) {
+                    modify_params([v](auto& p) { p.bg_sky_up = {std::get<0>(v), std::get<1>(v), std::get<2>(v)}; });
+                },
+                "World-space up direction for sky lobes; (0,0,0) auto-estimates from cameras")
+            .def_prop_rw(
                 "random",
                 [](PyOptimizationParams& self) { return self.params().random; },
                 [](PyOptimizationParams&, bool v) { modify_params([v](auto& p) { p.random = v; }); },

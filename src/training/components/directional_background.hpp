@@ -31,8 +31,9 @@ namespace lfs::training {
 
     class DirectionalBackground {
     public:
-        void initialize(const std::array<float, 3>& color, int degree);
-        void ensure_initialized(const std::array<float, 3>& color, int degree);
+        void initialize(const std::array<float, 3>& color, int degree, const std::array<float, 3>& up_axis = {0.0f, 1.0f, 0.0f});
+        void ensure_initialized(const std::array<float, 3>& color, int degree, const std::array<float, 3>& up_axis = {0.0f, 1.0f, 0.0f});
+        [[nodiscard]] const std::array<float, 3>& up_axis() const noexcept { return up_axis_; }
 
         [[nodiscard]] bool is_initialized() const noexcept { return lobe_logits_.is_valid() && lobe_logits_.numel() > 0; }
         [[nodiscard]] int degree() const noexcept { return degree_; }
@@ -82,6 +83,7 @@ namespace lfs::training {
         int render_width_ = 0;
         int render_height_ = 0;
         int64_t step_ = 0;
+        std::array<float, 3> up_axis_ = {0.0f, 1.0f, 0.0f};
     };
 
 } // namespace lfs::training

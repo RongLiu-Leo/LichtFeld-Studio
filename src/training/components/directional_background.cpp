@@ -79,19 +79,49 @@ namespace lfs::training {
             return tensor.is_contiguous() ? tensor : tensor.contiguous();
         }
 
-        std::vector<float> make_lobe_dirs(const int lobe_count) {
+        std::array<float, 3> normalize_or(const std::array<float, 3>& v, const std::array<float, 3>& fallback) {
+            const float sq = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+            if (sq <= 1.0e-12f) {
+                return fallback;
+            }
+            const float inv = 1.0f / std::sqrt(sq);
+            return {v[0] * inv, v[1] * inv, v[2] * inv};
+        }
+
+        std::array<float, 3> resolve_up_axis(const std::array<float, 3>& requested) {
+            return normalize_or(requested, {0.0f, 1.0f, 0.0f});
+        }
+
+        std::vector<float> make_lobe_dirs(const int lobe_count, const std::array<float, 3>& up_axis) {
             std::vector<float> dirs(static_cast<size_t>(lobe_count) * 3UL);
             constexpr float min_y = -0.12f;
             constexpr float golden_angle = kPi * (3.0f - 2.2360679774997896964f);
+
+            const auto up = resolve_up_axis(up_axis);
+            const std::array<float, 3> reference =
+                (std::abs(up[1]) < 0.85f) ? std::array<float, 3>{0.0f, 1.0f, 0.0f}
+                                          : std::array<float, 3>{1.0f, 0.0f, 0.0f};
+            const std::array<float, 3> right_raw{
+                reference[1] * up[2] - reference[2] * up[1],
+                reference[2] * up[0] - reference[0] * up[2],
+                reference[0] * up[1] - reference[1] * up[0]};
+            const auto right = normalize_or(right_raw, {1.0f, 0.0f, 0.0f});
+            const std::array<float, 3> forward{
+                up[1] * right[2] - up[2] * right[1],
+                up[2] * right[0] - up[0] * right[2],
+                up[0] * right[1] - up[1] * right[0]};
+
             for (int i = 0; i < lobe_count; ++i) {
                 const float t = (static_cast<float>(i) + 0.5f) / static_cast<float>(lobe_count);
                 const float y = 1.0f - t * (1.0f - min_y);
                 const float radius = std::sqrt(std::max(0.0f, 1.0f - y * y));
                 const float theta = static_cast<float>(i) * golden_angle;
+                const float local_x = std::cos(theta) * radius;
+                const float local_z = std::sin(theta) * radius;
                 const size_t base = static_cast<size_t>(i) * 3UL;
-                dirs[base + 0] = std::cos(theta) * radius;
-                dirs[base + 1] = y;
-                dirs[base + 2] = std::sin(theta) * radius;
+                dirs[base + 0] = right[0] * local_x + up[0] * y + forward[0] * local_z;
+                dirs[base + 1] = right[1] * local_x + up[1] * y + forward[1] * local_z;
+                dirs[base + 2] = right[2] * local_x + up[2] * y + forward[2] * local_z;
             }
             return dirs;
         }
@@ -204,15 +234,21 @@ namespace lfs::training {
 
         lfs::core::Tensor make_initial_lobe_logits(
             const std::vector<float>& dirs,
-            const std::array<float, 3>& color) {
+            const std::array<float, 3>& color,
+            const std::array<float, 3>& up_axis) {
             const size_t lobe_count = dirs.size() / 3UL;
+            const auto up = resolve_up_axis(up_axis);
             auto logits_cpu = lfs::core::Tensor::empty(
                 {lobe_count, 3UL},
                 lfs::core::Device::CPU,
                 lfs::core::DataType::Float32);
             auto* logits = logits_cpu.ptr<float>();
             for (size_t i = 0; i < lobe_count; ++i) {
-                const auto sky_color = default_sky_color_for_dir(color, dirs[i * 3UL + 1]);
+                const float local_up =
+                    up[0] * dirs[i * 3UL + 0] +
+                    up[1] * dirs[i * 3UL + 1] +
+                    up[2] * dirs[i * 3UL + 2];
+                const auto sky_color = default_sky_color_for_dir(color, local_up);
                 logits[i * 3UL + 0] = logit_unit_color(sky_color[0]);
                 logits[i * 3UL + 1] = logit_unit_color(sky_color[1]);
                 logits[i * 3UL + 2] = logit_unit_color(sky_color[2]);
@@ -221,15 +257,16 @@ namespace lfs::training {
         }
     } // namespace
 
-    void DirectionalBackground::initialize(const std::array<float, 3>& color, const int degree) {
+    void DirectionalBackground::initialize(const std::array<float, 3>& color, const int degree, const std::array<float, 3>& up_axis) {
         degree_ = clamp_degree(degree);
         lobe_count_ = lobe_count_for_degree(degree_);
         snapshot_texture_width_ = snapshot_width_for_degree(degree_);
         snapshot_texture_height_ = snapshot_height_for_degree(degree_);
+        up_axis_ = resolve_up_axis(up_axis);
 
-        const auto dirs = make_lobe_dirs(lobe_count_);
+        const auto dirs = make_lobe_dirs(lobe_count_, up_axis_);
         lobe_dirs_ = make_lobe_dirs_tensor(dirs);
-        lobe_logits_ = make_initial_lobe_logits(dirs, color);
+        lobe_logits_ = make_initial_lobe_logits(dirs, color, up_axis_);
         grad_ = lfs::core::Tensor::zeros(lobe_logits_.shape(), lfs::core::Device::CUDA);
         exp_avg_ = lfs::core::Tensor::zeros(lobe_logits_.shape(), lfs::core::Device::CUDA);
         exp_avg_sq_ = lfs::core::Tensor::zeros(lobe_logits_.shape(), lfs::core::Device::CUDA);
@@ -238,19 +275,27 @@ namespace lfs::training {
         render_height_ = 0;
         step_ = 0;
 
-        LOG_INFO("Learned sky Gaussian lobes initialized: detail {}, {} lobes, preview {}x{}",
-                 degree_, lobe_count_, snapshot_texture_width_, snapshot_texture_height_);
+        LOG_INFO("Learned sky Gaussian lobes initialized: detail {}, {} lobes, preview {}x{}, up ({:.3f}, {:.3f}, {:.3f})",
+                 degree_, lobe_count_, snapshot_texture_width_, snapshot_texture_height_,
+                 up_axis_[0], up_axis_[1], up_axis_[2]);
     }
 
-    void DirectionalBackground::ensure_initialized(const std::array<float, 3>& color, const int degree) {
+    void DirectionalBackground::ensure_initialized(const std::array<float, 3>& color, const int degree, const std::array<float, 3>& up_axis) {
         const int target_degree = clamp_degree(degree);
+        const auto target_up = resolve_up_axis(up_axis);
+        const float up_dot =
+            target_up[0] * up_axis_[0] +
+            target_up[1] * up_axis_[1] +
+            target_up[2] * up_axis_[2];
+        const bool up_changed = up_dot < 0.99999f;
         if (!is_initialized() ||
             degree_ != target_degree ||
-            lobe_count_ != lobe_count_for_degree(target_degree)) {
-            initialize(color, target_degree);
+            lobe_count_ != lobe_count_for_degree(target_degree) ||
+            up_changed) {
+            initialize(color, target_degree, target_up);
         } else if (step_ == 0) {
-            const auto dirs = make_lobe_dirs(lobe_count_);
-            lobe_logits_ = make_initial_lobe_logits(dirs, color);
+            const auto dirs = make_lobe_dirs(lobe_count_, up_axis_);
+            lobe_logits_ = make_initial_lobe_logits(dirs, color, up_axis_);
             grad_ = lfs::core::Tensor::zeros(lobe_logits_.shape(), lfs::core::Device::CUDA);
             exp_avg_ = lfs::core::Tensor::zeros(lobe_logits_.shape(), lfs::core::Device::CUDA);
             exp_avg_sq_ = lfs::core::Tensor::zeros(lobe_logits_.shape(), lfs::core::Device::CUDA);
@@ -531,7 +576,7 @@ namespace lfs::training {
 
             lfs::core::Tensor texture_cpu = texture_logits.device() == lfs::core::Device::CPU ? texture_logits : texture_logits.cpu();
             texture_cpu = texture_cpu.is_contiguous() ? texture_cpu : texture_cpu.contiguous();
-            const auto dirs = make_lobe_dirs(lobe_count_);
+            const auto dirs = make_lobe_dirs(lobe_count_, {0.0f, 1.0f, 0.0f});
             auto logits_cpu = lfs::core::Tensor::empty(
                 {static_cast<size_t>(lobe_count_), 3UL},
                 lfs::core::Device::CPU,
@@ -565,7 +610,7 @@ namespace lfs::training {
                 version == 1 ? logit_unit_color(coeffs[2]) : coeffs[2],
             };
 
-            const auto dirs = make_lobe_dirs(lobe_count_);
+            const auto dirs = make_lobe_dirs(lobe_count_, {0.0f, 1.0f, 0.0f});
             auto logits_cpu = lfs::core::Tensor::empty(
                 {static_cast<size_t>(lobe_count_), 3UL},
                 lfs::core::Device::CPU,

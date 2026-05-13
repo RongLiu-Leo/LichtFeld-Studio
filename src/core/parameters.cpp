@@ -173,6 +173,7 @@ namespace lfs::core {
             opt_json["bg_auto_sky_gate"] = bg_auto_sky_gate;
             opt_json["bg_sky_gate_threshold"] = bg_sky_gate_threshold;
             opt_json["bg_sky_opacity_decay"] = bg_sky_opacity_decay;
+            opt_json["bg_sky_up"] = {bg_sky_up[0], bg_sky_up[1], bg_sky_up[2]};
 
             // Mask parameters
             static constexpr const char* MASK_MODE_NAMES[] = {"none", "segment", "ignore", "alpha_consistent"};
@@ -514,6 +515,9 @@ namespace lfs::core {
             }
             if (json.contains("bg_sky_opacity_decay")) {
                 params.bg_sky_opacity_decay = json["bg_sky_opacity_decay"];
+            }
+            if (json.contains("bg_sky_up") && json["bg_sky_up"].is_array() && json["bg_sky_up"].size() == 3) {
+                params.bg_sky_up = {json["bg_sky_up"][0], json["bg_sky_up"][1], json["bg_sky_up"][2]};
             }
 
             // Mask parameters

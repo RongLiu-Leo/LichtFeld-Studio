@@ -140,6 +140,7 @@ namespace lfs::core {
             bool bg_auto_sky_gate = true;                        // Restrict learned-sky updates to sky-like pixels
             float bg_sky_gate_threshold = 0.45f;                 // Confidence threshold for automatic sky gating
             float bg_sky_opacity_decay = 0.06f;                  // Extra opacity decay in gated sky regions
+            std::array<float, 3> bg_sky_up = {0.0f, 0.0f, 0.0f}; // World-space "up" for sky lobes; {0,0,0} = auto from cameras
 
             // Bilateral grid parameters
             bool use_bilateral_grid = false;

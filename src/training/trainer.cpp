@@ -584,6 +584,28 @@ namespace lfs::training {
             return up;
         }
 
+        [[nodiscard]] std::array<float, 3> resolve_sky_up_axis(
+            const std::array<float, 3>& requested,
+            const std::vector<std::shared_ptr<lfs::core::Camera>>& cameras) {
+            if (vec3_length(requested) > 1.0e-4f) {
+                // bg_sky_up is stored in the visualizer world frame the user
+                // sees in the viewport (+Y up, +Z back). The lobe / shell init
+                // operates in the data world frame (+Y down, +Z forward), so
+                // flip Y and Z here at the single boundary instead of mutating
+                // the stored value. See coordinate_conventions.hpp.
+                const std::array<float, 3> data_frame{
+                    requested[0],
+                    -requested[1],
+                    -requested[2]};
+                const auto normalized = vec3_normalize(data_frame, {0.0f, 1.0f, 0.0f});
+                LOG_INFO("Learned Sky: user sky-up viewer ({:.3f}, {:.3f}, {:.3f}) -> data ({:.3f}, {:.3f}, {:.3f})",
+                         requested[0], requested[1], requested[2],
+                         normalized[0], normalized[1], normalized[2]);
+                return normalized;
+            }
+            return estimate_sky_up_axis_from_cameras(cameras);
+        }
+
         [[nodiscard]] std::array<float, 3> tangent_axis_for_up(const std::array<float, 3>& up) {
             const std::array<float, 3> reference =
                 (std::abs(up[0]) < 0.75f) ? std::array<float, 3>{1.0f, 0.0f, 0.0f}
@@ -873,14 +895,13 @@ namespace lfs::training {
             }
 
             const float scene_scale = std::max(std::abs(splat.get_scene_scale()), 1e-4f);
-            const float radius = std::max({
-                4.0f,
-                bbox_radius * 2.5f,
-                camera_radius * 1.75f,
-                scene_scale * 220.0f});
+            const float radius = std::max({4.0f,
+                                           bbox_radius * 2.5f,
+                                           camera_radius * 1.75f,
+                                           scene_scale * 220.0f});
             const float shell_scale = std::max(scene_scale * 14.0f, radius * 0.04f);
             const float raw_scale = std::log(std::max(shell_scale, 1e-4f));
-            const auto shell_up_axis = estimate_sky_up_axis_from_cameras(cameras);
+            const auto shell_up_axis = resolve_sky_up_axis(params.bg_sky_up, cameras);
             const auto shell_right_axis = tangent_axis_for_up(shell_up_axis);
             const auto shell_forward_axis = vec3_normalize(vec3_cross(shell_up_axis, shell_right_axis));
             LOG_INFO("Learned Sky: shell frame up {:.3f}/{:.3f}/{:.3f}, right {:.3f}/{:.3f}/{:.3f}, forward {:.3f}/{:.3f}/{:.3f}",
@@ -1224,6 +1245,7 @@ namespace lfs::training {
         learned_sky_shell_scaling_ = {};
         learned_sky_shell_rotation_ = {};
         learned_sky_shell_sh0_prior_ = {};
+        sky_discriminator_.reset();
         setCameraLossHeatmap(nullptr);
 
         LOG_DEBUG("Trainer cleanup complete");
@@ -3553,6 +3575,42 @@ namespace lfs::training {
                 r_output.target_image = gt_image;
                 nvtxRangePop();
 
+                // Sky discriminator: once the foreground has had a chance to
+                // form (bootstrap_iters), a tiny per-pixel MLP takes over from
+                // the chroma-only auto-sky-gate using rendered alpha as the
+                // dominant signal. The chroma gate stays as one of the MLP
+                // inputs and is also used as a pseudo-label source.
+                if (sky_gate_active &&
+                    sky_gate_tile.is_valid() &&
+                    sky_gate_target.is_valid() &&
+                    sky_gate_target.ndim() == 3 &&
+                    output.alpha.is_valid() &&
+                    output.alpha.numel() >= sky_gate_tile.numel()) {
+                    if (!sky_discriminator_) {
+                        sky_discriminator_ = std::make_unique<SkyDiscriminator>();
+                        sky_discriminator_->initialize(params_.optimization.steps_scaler);
+                    }
+                    const bool target_chw_cached = sky_gate_target.shape()[0] == 3;
+                    auto chroma_prior_tile = sky_gate_tile.clone();
+                    sky_discriminator_->forward(
+                        sky_gate_target,
+                        target_chw_cached,
+                        output.alpha,
+                        chroma_prior_tile,
+                        tile_y_offset,
+                        full_height,
+                        sky_gate_tile,
+                        iter);
+                    sky_discriminator_->train_step(
+                        sky_gate_target,
+                        target_chw_cached,
+                        output.alpha,
+                        chroma_prior_tile,
+                        tile_y_offset,
+                        full_height,
+                        iter);
+                }
+
                 bool tile_context_cleaned = false;
                 auto cleanup_tile_context = [&]() {
                     if (tile_context_cleaned) {
@@ -4077,8 +4135,8 @@ namespace lfs::training {
                                 gaussian_raster_grad = gaussian_raster_grad.cuda();
                             }
                             gaussian_raster_grad = gaussian_raster_grad.is_contiguous()
-                                                     ? gaussian_raster_grad
-                                                     : gaussian_raster_grad.contiguous();
+                                                       ? gaussian_raster_grad
+                                                       : gaussian_raster_grad.contiguous();
                             lfs::training::kernels::launch_attenuate_sky_foreground_rgb_gradient(
                                 gaussian_raster_grad.ptr<float>(),
                                 grad_chw,

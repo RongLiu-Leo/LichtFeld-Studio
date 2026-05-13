@@ -115,6 +115,9 @@ LOCALE_KEYS = {
     "bg_auto_sky_gate": "training_params.bg_auto_sky_gate",
     "bg_sky_gate_threshold": "training_params.bg_sky_gate_threshold",
     "bg_sky_opacity_decay": "training_params.bg_sky_opacity_decay",
+    "bg_sky_up": "training_params.bg_sky_up",
+    "bg_sky_up_pick": "training_params.bg_sky_up_pick",
+    "bg_sky_up_reset": "training_params.bg_sky_up_reset",
     "dataset_path": "training.dataset.path",
     "dataset_images": "training.dataset.images",
     "resize_factor": "training.dataset.resize_factor",
@@ -1110,6 +1113,10 @@ class TrainingPanel(Panel):
                 else tr("training.value.none")
             ),
         )
+        model.bind_func(
+            "bg_sky_up_display",
+            self._bg_sky_up_display,
+        )
 
     def _bind_events(self, model):
         model.bind_event("toggle_section", self._on_toggle_section)
@@ -1847,6 +1854,10 @@ class TrainingPanel(Panel):
                 if self._handle:
                     self._sync_text_bufs()
                     self._handle.dirty_all()
+        elif action == "pick_sky_up":
+            self._action_pick_sky_up()
+        elif action == "reset_sky_up":
+            self._action_reset_sky_up()
         elif action == "clear_ppisp_sidecar":
             params = lf.optimization_params()
             if params and params.has_params():
@@ -1872,6 +1883,42 @@ class TrainingPanel(Panel):
                 if params.enable_eval:
                     self._sync_eval_steps_with_save_steps(params)
                 self._last_save_steps = None
+
+    def _bg_sky_up_display(self):
+        params = lf.optimization_params()
+        if not params or not params.has_params():
+            return tr("training.value.none")
+        ux, uy, uz = params.bg_sky_up
+        if ux == 0.0 and uy == 0.0 and uz == 0.0:
+            return tr("common.auto")
+        return f"({ux:+.3f}, {uy:+.3f}, {uz:+.3f})"
+
+    def _action_pick_sky_up(self):
+        params = lf.optimization_params()
+        if not params or not params.has_params():
+            return
+        camera = None
+        try:
+            camera = lf.get_camera()
+        except Exception as exc:
+            print(f"[training_panel] pick_sky_up failed: {exc}")
+            return
+        if camera is None:
+            print("[training_panel] pick_sky_up: no active viewport camera")
+            return
+        # Pass the viewport camera's up vector through unchanged (no axis flip).
+        vx, vy, vz = camera.up
+        params.bg_sky_up = (float(vx), float(vy), float(vz))
+        if self._handle:
+            self._handle.dirty_all()
+
+    def _action_reset_sky_up(self):
+        params = lf.optimization_params()
+        if not params or not params.has_params():
+            return
+        params.bg_sky_up = (0.0, 0.0, 0.0)
+        if self._handle:
+            self._handle.dirty_all()
 
     def _action_start(self):
         params = lf.optimization_params()
