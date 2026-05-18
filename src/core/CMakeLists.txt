@@ -55,6 +55,7 @@ set(CORE_SOURCES
         image_io.cpp
         parameters.cpp
         property_registry.cpp
+        projection_dome.cpp
         scene.cpp
         splat_simplify.cpp
         splat_data.cpp

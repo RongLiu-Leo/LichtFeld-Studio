@@ -317,6 +317,8 @@ namespace fast_lfs::rasterization::kernels::backward {
             return;
 
         const uint primitive_idx = static_cast<uint>(idx / param.n_attributes);
+        if (static_cast<int>(primitive_idx) < param.first_trainable_row)
+            return;
         if (primitive_n_touched_tiles[primitive_idx] != 0)
             return;
 

@@ -48,6 +48,7 @@
 #include "core/logger.hpp"
 #include "core/parameters.hpp"
 #include "core/path_utils.hpp"
+#include "core/projection_dome.hpp"
 #include "gui/rmlui/elements/loss_graph_element.hpp"
 #include "internal/resource_paths.hpp"
 #include "io/filesystem_utils.hpp"
@@ -59,6 +60,7 @@
 #include "core/checkpoint_format.hpp"
 #include "input/input_controller.hpp"
 #include "python/runner.hpp"
+#include "rendering/dirty_flags.hpp"
 #include "rendering/rendering_manager.hpp"
 #include "training/strategies/istrategy.hpp"
 #include "training/trainer.hpp"
@@ -1025,6 +1027,268 @@ NB_MODULE(lichtfeld, m) {
         nb::arg("name"), nb::arg("enabled"), "Enable or disable a camera for training by name");
 
     m.def(
+        "ensure_projection_dome",
+        [](float radius, int longitude_segments, int latitude_segments) -> std::string {
+            auto* sm = lfs::python::get_scene_manager();
+            if (!sm) {
+                throw std::runtime_error("No scene manager available");
+            }
+
+            auto& scene = sm->getScene();
+            auto placement = lfs::core::estimateProjectionDomePlacement(scene);
+            if (radius > 0.0f) {
+                placement.radius = radius;
+            }
+
+            lfs::core::ProjectionDomeMeshOptions mesh_options;
+            mesh_options.longitude_segments = longitude_segments;
+            mesh_options.latitude_segments = latitude_segments;
+
+            const auto result = lfs::core::ensureProjectionDome(scene, mesh_options, placement);
+            if (!result) {
+                throw std::runtime_error(result.error());
+            }
+
+            if (auto* rm = lfs::vis::services().renderingOrNull()) {
+                rm->markDirty(lfs::vis::DirtyFlag::MESH | lfs::vis::DirtyFlag::OVERLAY);
+            }
+
+            if (const auto* node = scene.getNodeById(*result)) {
+                return node->name;
+            }
+            return std::string(lfs::core::kProjectionDomeNodeName);
+        },
+        nb::arg("radius") = 0.0f,
+        nb::arg("longitude_segments") = 64,
+        nb::arg("latitude_segments") = 32,
+        "Ensure the transformable projection-dome mesh exists in the scene");
+
+    m.def(
+        "bake_projection_dome",
+        [](int width,
+           int height,
+           int max_image_width,
+           int resize_factor,
+           bool active_cameras_only,
+           bool reject_masked_pixels,
+           bool invert_masks,
+           float mask_threshold,
+           int hole_fill_iterations,
+           float edge_falloff) -> nb::dict {
+            auto* sm = lfs::python::get_scene_manager();
+            if (!sm) {
+                throw std::runtime_error("No scene manager available");
+            }
+
+            lfs::core::ProjectionDomeBakeOptions options;
+            options.texture_width = width;
+            options.texture_height = height;
+            options.max_image_width = max_image_width;
+            options.resize_factor = resize_factor;
+            options.active_cameras_only = active_cameras_only;
+            options.reject_masked_pixels = reject_masked_pixels;
+            options.invert_masks = invert_masks;
+            options.mask_threshold = mask_threshold;
+            options.hole_fill_iterations = hole_fill_iterations;
+            options.edge_falloff = edge_falloff;
+
+            auto& scene = sm->getScene();
+            const auto result = lfs::core::bakeProjectionDomeTexture(scene, options);
+            if (!result) {
+                throw std::runtime_error(result.error());
+            }
+
+            if (auto* rm = lfs::vis::services().renderingOrNull()) {
+                rm->markDirty(lfs::vis::DirtyFlag::MESH | lfs::vis::DirtyFlag::OVERLAY);
+            }
+
+            nb::dict output;
+            output["width"] = result->width;
+            output["height"] = result->height;
+            output["cameras_considered"] = result->cameras_considered;
+            output["cameras_used"] = result->cameras_used;
+            output["texels_projected"] = result->texels_projected;
+            output["texels_after_fill"] = result->texels_after_fill;
+            output["masked_pixels"] = result->masked_pixels;
+            output["samples_rejected_by_mask"] = result->samples_rejected_by_mask;
+            return output;
+        },
+        nb::arg("width") = 2048,
+        nb::arg("height") = 1024,
+        nb::arg("max_image_width") = 1600,
+        nb::arg("resize_factor") = -1,
+        nb::arg("active_cameras_only") = true,
+        nb::arg("reject_masked_pixels") = true,
+        nb::arg("invert_masks") = false,
+        nb::arg("mask_threshold") = 0.5f,
+        nb::arg("hole_fill_iterations") = 24,
+        nb::arg("edge_falloff") = 0.08f,
+        "Bake camera images into the projection dome texture");
+
+    m.def(
+        "prepare_projection_dome_sky_cubemap",
+        [](const std::string& output_dir,
+           int face_size,
+           bool overwrite_preview,
+           bool reset_mask) -> nb::dict {
+            auto* sm = lfs::python::get_scene_manager();
+            if (!sm) {
+                throw std::runtime_error("No scene manager available");
+            }
+
+            lfs::core::ProjectionDomeSkyCubemapOptions options;
+            options.output_dir = python_utf8_path(output_dir);
+            options.face_size = face_size;
+            options.overwrite_preview = overwrite_preview;
+            options.reset_mask = reset_mask;
+
+            auto& scene = sm->getScene();
+            const auto result = lfs::core::prepareProjectionDomeSkyCubemap(scene, options);
+            if (!result) {
+                throw std::runtime_error(result.error());
+            }
+
+            nb::list faces;
+            for (const auto& face : result->faces) {
+                nb::dict item;
+                item["id"] = face.id;
+                item["label"] = face.label;
+                item["preview_path"] = lfs::core::path_to_utf8(face.preview_path);
+                item["mask_path"] = lfs::core::path_to_utf8(face.mask_path);
+                item["overlay_path"] = lfs::core::path_to_utf8(face.overlay_path);
+                item["valid_pixels"] = face.valid_pixels;
+                item["marked_pixels"] = face.marked_pixels;
+                faces.append(std::move(item));
+            }
+
+            nb::dict output;
+            output["output_dir"] = lfs::core::path_to_utf8(result->output_dir);
+            output["face_size"] = result->face_size;
+            output["faces"] = std::move(faces);
+            return output;
+        },
+        nb::arg("output_dir"),
+        nb::arg("face_size") = 512,
+        nb::arg("overwrite_preview") = true,
+        nb::arg("reset_mask") = false,
+        "Export the projection dome texture into paintable sky cubemap faces");
+
+    m.def(
+        "paint_sky_cubemap_mask",
+        [](const std::string& mask_path,
+           const std::string& overlay_path,
+           int face_size,
+           int x,
+           int y,
+           int radius,
+           bool erase) -> nb::dict {
+            const auto result = lfs::core::paintProjectionDomeSkyMask(
+                python_utf8_path(mask_path),
+                python_utf8_path(overlay_path),
+                face_size,
+                x,
+                y,
+                radius,
+                erase);
+            if (!result) {
+                throw std::runtime_error(result.error());
+            }
+            nb::dict output;
+            output["marked_pixels"] = result->marked_pixels;
+            output["changed_pixels"] = result->changed_pixels;
+            return output;
+        },
+        nb::arg("mask_path"),
+        nb::arg("overlay_path"),
+        nb::arg("face_size"),
+        nb::arg("x"),
+        nb::arg("y"),
+        nb::arg("radius"),
+        nb::arg("erase") = false,
+        "Paint or erase a circular brush stroke in a sky cubemap mask face");
+
+    m.def(
+        "clear_sky_cubemap_mask",
+        [](const std::string& mask_path,
+           const std::string& overlay_path,
+           int face_size) -> nb::dict {
+            const auto result = lfs::core::clearProjectionDomeSkyMask(
+                python_utf8_path(mask_path),
+                python_utf8_path(overlay_path),
+                face_size);
+            if (!result) {
+                throw std::runtime_error(result.error());
+            }
+            nb::dict output;
+            output["marked_pixels"] = result->marked_pixels;
+            output["changed_pixels"] = result->changed_pixels;
+            return output;
+        },
+        nb::arg("mask_path"),
+        nb::arg("overlay_path"),
+        nb::arg("face_size"),
+        "Clear one sky cubemap mask face");
+
+    m.def(
+        "preview_projection_dome_sky_initialization",
+        [](const std::string& manifest_path, int max_gaussians) -> nb::dict {
+            auto* sm = lfs::python::get_scene_manager();
+            if (!sm) {
+                throw std::runtime_error("No scene manager available");
+            }
+
+            auto& scene = sm->getScene();
+            const std::string preview_name(lfs::core::kProjectionDomeSkyPreviewNodeName);
+
+            lfs::core::ProjectionDomeSkyPointCloudOptions options;
+            options.manifest_path = python_utf8_path(manifest_path);
+            options.max_gaussians = max_gaussians;
+            options.output_from_world = glm::mat4(1.0f);
+
+            const auto result = lfs::core::createProjectionDomeSkyPointCloud(scene, options);
+            if (!result) {
+                throw std::runtime_error(result.error());
+            }
+
+            if (scene.getNode(preview_name)) {
+                scene.removeNode(preview_name, false);
+            }
+
+            if (result->gaussian_count > 0) {
+                auto point_cloud = std::make_shared<lfs::core::PointCloud>(
+                    result->point_cloud.to(lfs::core::Device::CUDA));
+                scene.addPointCloud(preview_name, std::move(point_cloud), lfs::core::NULL_NODE);
+
+                lfs::core::events::state::PLYAdded{
+                    .name = preview_name,
+                    .node_gaussians = static_cast<size_t>(result->gaussian_count),
+                    .total_gaussians = scene.getTotalGaussianCount(),
+                    .is_visible = true,
+                    .parent_name = "",
+                    .is_group = false,
+                    .node_type = static_cast<int>(lfs::core::NodeType::POINTCLOUD)}
+                    .emit();
+                lfs::core::events::ui::PointCloudModeChanged{
+                    .enabled = true,
+                    .voxel_size = 0.01f}
+                    .emit();
+            }
+
+            if (auto* rm = lfs::vis::services().renderingOrNull()) {
+                rm->markDirty(lfs::vis::DirtyFlag::SPLATS | lfs::vis::DirtyFlag::OVERLAY);
+            }
+
+            nb::dict output;
+            output["node_name"] = preview_name;
+            output["marked_pixels"] = result->marked_pixels;
+            output["gaussian_count"] = result->gaussian_count;
+            return output;
+        },
+        nb::arg("manifest_path"),
+        nb::arg("max_gaussians") = 50000,
+        "Create/update the visible sky initialization preview from a saved sky mask manifest");
+
+    m.def(
         "remove_node", [](const std::string& name, bool keep_children) {
             lfs::core::events::cmd::RemovePLY{.name = name, .keep_children = keep_children}.emit();
         },
@@ -1952,6 +2216,12 @@ Mesh-to-Splat:
   lf.get_mesh2splat_progress()   - Get progress (0.0-1.0)
   lf.get_mesh2splat_stage()      - Get current stage text
   lf.get_mesh2splat_error()      - Get error message
+
+Projection Dome:
+  lf.ensure_projection_dome()     - Add the transformable half-sphere mesh if needed
+  lf.bake_projection_dome()       - Project camera images into the dome texture
+  lf.prepare_projection_dome_sky_cubemap(output_dir)
+                                  - Export the dome as paintable cubemap sky masks
 
 Splat Simplify:
   lf.simplify_splats("name", ratio=..., knn_k=..., merge_cap=..., opacity_prune_threshold=...)

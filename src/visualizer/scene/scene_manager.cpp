@@ -9,6 +9,7 @@
 #include "core/mesh_data.hpp"
 #include "core/parameter_manager.hpp"
 #include "core/path_utils.hpp"
+#include "core/projection_dome.hpp"
 #include "core/services.hpp"
 #include "core/splat_data_transform.hpp"
 #include "geometry/bounding_box.hpp"
@@ -144,6 +145,25 @@ namespace lfs::vis {
                 point_count += static_cast<size_t>(node->point_cloud->size());
             }
             return point_count;
+        }
+
+        void ensureProjectionDomeForInteractiveTraining(core::Scene& scene) {
+            if (scene.getAllCameras().empty()) {
+                return;
+            }
+
+            const auto placement = core::estimateProjectionDomePlacement(scene);
+            const auto result = core::ensureProjectionDome(scene, {}, placement);
+            if (!result) {
+                LOG_WARN("Projection dome setup skipped: {}", result.error());
+                return;
+            }
+
+            if (auto* rm = services().renderingOrNull()) {
+                rm->markDirty(DirtyFlag::MESH | DirtyFlag::OVERLAY);
+            }
+            LOG_INFO("Projection dome ready before training (node id {}, radius {:.3f})",
+                     *result, placement.radius);
         }
 
         [[nodiscard]] std::shared_ptr<core::PointCloud> buildMergedVisiblePointCloud(
@@ -1958,6 +1978,8 @@ namespace lfs::vis {
                 return std::unexpected(apply_result.error());
             }
 
+            ensureProjectionDomeForInteractiveTraining(scene_);
+
             if (scene_.hasTrainingData()) {
                 auto trainer = std::make_unique<lfs::training::Trainer>(scene_);
                 trainer->setParams(dataset_params);
@@ -2038,6 +2060,8 @@ namespace lfs::vis {
                     .emit();
                 return std::unexpected(load_result.error());
             }
+
+            ensureProjectionDomeForInteractiveTraining(scene_);
 
             // Create Trainer from Scene
             auto trainer = std::make_unique<lfs::training::Trainer>(scene_);

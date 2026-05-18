@@ -1,0 +1,106 @@
+<rml>
+<head>
+  <link type="text/template" href="floating_window.rml"/>
+  <link type="text/rcss" href="sky_marker_panel.rcss"/>
+</head>
+<body template="floating-window" data-model="sky_marker">
+
+  <div id="sky-marker">
+    <div id="toolbar">
+      <button class="tool-btn tool-btn-labeled toggle" data-class-active="paint_mode" data-event-click="action('paint')" data-tooltip="sky_marker.tooltip.paint">
+        <img src="../icon/brush.png"/>
+        <span>@tr:sky_marker.paint</span>
+      </button>
+      <button class="tool-btn tool-btn-labeled toggle" data-class-active="erase_mode" data-event-click="action('erase')" data-tooltip="sky_marker.tooltip.erase">
+        <img src="../icon/scene/x.png"/>
+        <span>@tr:sky_marker.erase</span>
+      </button>
+      <button class="tool-btn" data-event-click="action('brush_down')" data-tooltip="sky_marker.tooltip.brush_down">-</button>
+      <span id="brush-value">{{brush_radius_text}}</span>
+      <button class="tool-btn" data-event-click="action('brush_up')" data-tooltip="sky_marker.tooltip.brush_up">+</button>
+      <span class="toolbar-separator"></span>
+      <button class="tool-btn" data-event-click="action('zoom_out')" data-tooltip="sky_marker.tooltip.zoom_out">-</button>
+      <span id="zoom-value">{{zoom_text}}</span>
+      <button class="tool-btn" data-event-click="action('zoom_in')" data-tooltip="sky_marker.tooltip.zoom_in">+</button>
+      <button class="tool-btn text-small" data-event-click="action('zoom_reset')" data-tooltip="sky_marker.tooltip.zoom_reset">1:1</button>
+      <span class="toolbar-spacer"></span>
+      <button class="tool-btn" data-event-click="action('refresh')" data-tooltip="sky_marker.tooltip.refresh">
+        <img src="../icon/reset.png"/>
+      </button>
+      <button class="tool-btn" data-event-click="action('clear_face')" data-tooltip="sky_marker.tooltip.clear_face">
+        <img src="../icon/scene/trash.png"/>
+      </button>
+      <button class="tool-btn text" data-event-click="action('clear_all')" data-tooltip="sky_marker.tooltip.clear_all">@tr:sky_marker.clear_all</button>
+      <button class="tool-btn primary" data-event-click="action('save')" data-tooltip="sky_marker.tooltip.save">
+        <img src="../icon/check.png"/>
+      </button>
+    </div>
+
+    <div id="editor-layout">
+      <div id="active-pane">
+        <div id="active-header">
+          <span id="active-face-label">{{active_face_label}}</span>
+          <span id="active-face-count">{{active_count}}</span>
+        </div>
+        <div id="active-scroll">
+          <div id="active-face"
+               data-attr-data-face-id="active_face_id"
+               data-class-disabled="active_disabled"
+               data-style-width="active_face_size_style"
+               data-style-height="active_face_size_style">
+            <div id="active-preview" class="face-preview" data-style-decorator="active_preview"></div>
+            <div id="active-overlay" class="face-overlay" data-style-decorator="active_overlay"></div>
+          </div>
+        </div>
+      </div>
+
+      <div id="navigator-pane">
+        <div id="cubemap">
+          <div id="face-neg-y" class="cube-face face-top" data-face-id="neg_y" data-class-selected="selected_neg_y" data-class-disabled="disabled_neg_y">
+            <div class="face-preview" data-style-decorator="preview_neg_y"></div>
+            <div class="face-overlay" data-style-decorator="overlay_neg_y"></div>
+            <span class="face-label">-Y</span>
+            <span class="face-count">{{count_neg_y}}</span>
+          </div>
+          <div id="face-neg-x" class="cube-face face-left" data-face-id="neg_x" data-class-selected="selected_neg_x" data-class-disabled="disabled_neg_x">
+            <div class="face-preview" data-style-decorator="preview_neg_x"></div>
+            <div class="face-overlay" data-style-decorator="overlay_neg_x"></div>
+            <span class="face-label">-X</span>
+            <span class="face-count">{{count_neg_x}}</span>
+          </div>
+          <div id="face-pos-z" class="cube-face face-front" data-face-id="pos_z" data-class-selected="selected_pos_z" data-class-disabled="disabled_pos_z">
+            <div class="face-preview" data-style-decorator="preview_pos_z"></div>
+            <div class="face-overlay" data-style-decorator="overlay_pos_z"></div>
+            <span class="face-label">+Z</span>
+            <span class="face-count">{{count_pos_z}}</span>
+          </div>
+          <div id="face-pos-x" class="cube-face face-right" data-face-id="pos_x" data-class-selected="selected_pos_x" data-class-disabled="disabled_pos_x">
+            <div class="face-preview" data-style-decorator="preview_pos_x"></div>
+            <div class="face-overlay" data-style-decorator="overlay_pos_x"></div>
+            <span class="face-label">+X</span>
+            <span class="face-count">{{count_pos_x}}</span>
+          </div>
+          <div id="face-neg-z" class="cube-face face-back" data-face-id="neg_z" data-class-selected="selected_neg_z" data-class-disabled="disabled_neg_z">
+            <div class="face-preview" data-style-decorator="preview_neg_z"></div>
+            <div class="face-overlay" data-style-decorator="overlay_neg_z"></div>
+            <span class="face-label">-Z</span>
+            <span class="face-count">{{count_neg_z}}</span>
+          </div>
+          <div id="face-pos-y" class="cube-face face-bottom" data-face-id="pos_y" data-class-selected="selected_pos_y" data-class-disabled="disabled_pos_y">
+            <div class="face-preview" data-style-decorator="preview_pos_y"></div>
+            <div class="face-overlay" data-style-decorator="overlay_pos_y"></div>
+            <span class="face-label">+Y</span>
+            <span class="face-count">{{count_pos_y}}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="footer">
+      <span id="workspace">{{workspace_text}}</span>
+      <span id="status" data-class-status-error="status_error" data-class-status-success="status_success">{{status_text}}</span>
+    </div>
+  </div>
+
+</body>
+</rml>

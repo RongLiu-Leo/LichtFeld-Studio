@@ -1,0 +1,296 @@
+#content-wrap {
+    padding: 0;
+    overflow: hidden;
+    min-width: 0;
+    min-height: 0;
+}
+
+#content {
+    width: 100%;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    min-width: 0;
+    min-height: 0;
+}
+
+#sky-marker {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+}
+
+#toolbar {
+    display: flex;
+    align-items: center;
+    gap: 4dp;
+    padding: 6dp;
+    border-bottom-width: 1dp;
+    flex-shrink: 0;
+}
+
+.toolbar-spacer {
+    flex: 1;
+}
+
+.toolbar-separator {
+    width: 1dp;
+    height: 22dp;
+    margin: 0 4dp;
+    background-color: rgba(255, 255, 255, 45);
+}
+
+.tool-btn {
+    width: 28dp;
+    height: 24dp;
+    min-width: 28dp;
+    padding: 0;
+    text-align: center;
+    border-radius: 3dp;
+    border-width: 1dp;
+    cursor: pointer;
+}
+
+.tool-btn-labeled {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 78dp;
+    min-width: 78dp;
+    gap: 5dp;
+    font-size: 12dp;
+}
+
+.tool-btn.text {
+    width: 68dp;
+    min-width: 68dp;
+    font-size: 12dp;
+}
+
+.tool-btn.text-small {
+    width: 42dp;
+    min-width: 42dp;
+    font-size: 12dp;
+}
+
+.tool-btn.primary {
+    background-color: #2f7dd1;
+}
+
+.tool-btn.active {
+    background-color: #3a83d8;
+}
+
+.tool-btn img {
+    width: 14dp;
+    height: 14dp;
+    margin: auto;
+}
+
+#brush-value {
+    min-width: 28dp;
+    text-align: center;
+    font-size: 12dp;
+}
+
+#zoom-value {
+    min-width: 44dp;
+    text-align: center;
+    font-size: 12dp;
+}
+
+#editor-layout {
+    display: flex;
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
+}
+
+#active-pane {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+    border-right-width: 1dp;
+}
+
+#active-header {
+    display: flex;
+    align-items: center;
+    gap: 10dp;
+    height: 28dp;
+    min-height: 28dp;
+    padding: 0 10dp;
+    border-bottom-width: 1dp;
+    flex-shrink: 0;
+}
+
+#active-face-label {
+    font-size: 13dp;
+}
+
+#active-face-count {
+    font-size: 12dp;
+    color: #8fc7ff;
+}
+
+#active-scroll {
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    overflow: auto;
+    padding: 12dp;
+}
+
+#active-face {
+    position: relative;
+    width: 640dp;
+    height: 640dp;
+    min-width: 64dp;
+    min-height: 64dp;
+    margin: auto;
+    border-width: 2dp;
+    border-radius: 4dp;
+    overflow: hidden;
+    cursor: crosshair;
+    background-color: #14181d;
+}
+
+#active-face.disabled {
+    opacity: 0.45;
+    cursor: default;
+}
+
+#navigator-pane {
+    width: 430dp;
+    min-width: 430dp;
+    min-height: 0;
+    overflow: auto;
+    flex-shrink: 0;
+}
+
+#cubemap {
+    position: relative;
+    width: 414dp;
+    height: 312dp;
+    margin: 12dp auto 8dp auto;
+    flex-shrink: 0;
+}
+
+.cube-face {
+    position: absolute;
+    width: 96dp;
+    height: 96dp;
+    border-width: 2dp;
+    border-radius: 4dp;
+    overflow: hidden;
+    cursor: pointer;
+    background-color: #14181d;
+}
+
+.cube-face:hover {
+    border-color: #6aa8ec;
+}
+
+.cube-face.selected {
+    border-color: #55c7f5;
+}
+
+.cube-face.disabled {
+    opacity: 0.38;
+    cursor: default;
+}
+
+.face-top {
+    left: 108dp;
+    top: 0;
+}
+
+.face-left {
+    left: 6dp;
+    top: 102dp;
+}
+
+.face-front {
+    left: 108dp;
+    top: 102dp;
+}
+
+.face-right {
+    left: 210dp;
+    top: 102dp;
+}
+
+.face-back {
+    left: 312dp;
+    top: 102dp;
+}
+
+.face-bottom {
+    left: 108dp;
+    top: 204dp;
+}
+
+.face-preview,
+.face-overlay {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    decorator: none;
+}
+
+.face-label,
+.face-count {
+    position: absolute;
+    height: 18dp;
+    padding: 2dp 5dp;
+    font-size: 12dp;
+    background-color: rgba(10, 12, 15, 172);
+}
+
+.face-label {
+    left: 4dp;
+    top: 4dp;
+}
+
+.face-count {
+    right: 4dp;
+    bottom: 4dp;
+}
+
+#footer {
+    display: flex;
+    align-items: center;
+    gap: 8dp;
+    min-width: 0;
+    padding: 6dp;
+    border-top-width: 1dp;
+    flex-shrink: 0;
+}
+
+#workspace {
+    flex: 1;
+    min-width: 0;
+    font-size: 12dp;
+    text-overflow: ellipsis;
+}
+
+#status {
+    min-width: 0;
+    font-size: 12dp;
+}
+
+#status.status-success {
+    color: #72d66d;
+}
+
+#status.status-error {
+    color: #ff7b72;
+}

@@ -279,6 +279,7 @@ set(TEST_FILES
     test_undistort.cpp
     test_viewport_region_utils.cpp
     test_mesh_data.cpp
+    test_projection_dome.cpp
     test_openmesh_bridge.cpp
     test_mesh_loader.cpp
     test_colmap_image_layout.cpp

@@ -14,6 +14,10 @@
   <!-- ── Controls ──────────────────────────────────────── -->
   <div id="controls">
     <div data-if="show_ctrl_ready">
+      <button class="btn btn--primary btn--full" data-tooltip="training.tooltip.btn_bake_projection_dome" data-if="show_projection_dome_bake" data-event-click="action('bake_projection_dome')">{{label_bake_projection_dome}}</button>
+      <button class="btn btn--secondary btn--full" data-tooltip="training.tooltip.btn_mark_sky" data-if="show_projection_dome_bake" data-event-click="action('mark_sky')">{{label_mark_sky}}</button>
+      <span class="status-text status-success" data-if="show_projection_dome_bake_success">{{projection_dome_status}}</span>
+      <span class="status-text status-error" data-if="show_projection_dome_bake_error">{{projection_dome_status}}</span>
       <button class="btn btn--success btn--full" data-tooltip="training.tooltip.btn_start" data-event-click="action('start')">{{btn_start}}</button>
       <button class="btn btn--secondary btn--full" data-tooltip="training.tooltip.btn_reset" data-if="show_reset_ready" data-event-click="action('reset')">{{label_reset}}</button>
       <button class="btn btn--error btn--full" data-tooltip="training.tooltip.btn_clear" data-event-click="action('clear')">{{label_clear}}</button>

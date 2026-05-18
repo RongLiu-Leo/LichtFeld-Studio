@@ -59,6 +59,41 @@ namespace {
         EXPECT_NEAR(optimizer.get_lr(), 0.729f, 1e-5f);
     }
 
+    TEST(AdamOptimizerTest, FrozenMeansPrefixSkipsPositionUpdates) {
+        auto splat_data = create_test_splat_data(4);
+        splat_data.set_frozen_means_prefix(2);
+
+        AdamConfig config;
+        config.lr = 0.1f;
+        AdamOptimizer optimizer(splat_data, config);
+        optimizer.allocate_gradients();
+
+        auto before = splat_data.means().cpu();
+        optimizer.get_grad(ParamType::Means).fill_(1.0f);
+        optimizer.step(1);
+
+        auto after = splat_data.means().cpu();
+        auto before_acc = before.accessor<float, 2>();
+        auto after_acc = after.accessor<float, 2>();
+        for (size_t row = 0; row < 2; ++row) {
+            for (size_t col = 0; col < 3; ++col) {
+                EXPECT_FLOAT_EQ(after_acc(row, col), before_acc(row, col));
+            }
+        }
+        bool trainable_changed = false;
+        for (size_t row = 2; row < 4; ++row) {
+            for (size_t col = 0; col < 3; ++col) {
+                trainable_changed = trainable_changed ||
+                                    after_acc(row, col) != before_acc(row, col);
+            }
+        }
+        EXPECT_TRUE(trainable_changed);
+
+        const auto fused = optimizer.prepare_fastgs_fused_adam(2);
+        EXPECT_TRUE(fused.means.enabled);
+        EXPECT_EQ(fused.means.first_trainable_row, 2);
+    }
+
     TEST(LfsSchedulerTest, ExponentialLR_MultipleSteps) {
         auto splat_data = create_test_splat_data(10);
         AdamConfig config;

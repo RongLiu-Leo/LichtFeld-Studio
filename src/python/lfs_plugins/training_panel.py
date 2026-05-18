@@ -35,6 +35,11 @@ def tr(key):
     return result if result else key
 
 
+def tr_or(key, fallback):
+    result = tr(key)
+    return fallback if result == key else result
+
+
 class IterationRateTracker:
     WINDOW_SECONDS = 5.0
 
@@ -404,6 +409,10 @@ class TrainingPanel(Panel):
         self._step_repeat_last = 0.0
         self._text_bufs = {}
         self._last_checkpoint_saved_visible = False
+        self._projection_dome_status = ""
+        self._projection_dome_status_kind = ""
+        self._projection_dome_status_time = 0.0
+        self._last_projection_dome_status_visible = False
         self._last_loss_signature = None
         self._psnr_graph_el = None
         self._last_psnr_signature = None
@@ -480,6 +489,16 @@ class TrainingPanel(Panel):
         model.bind_func("label_status_error", lambda: tr("status.error"))
         model.bind_func("label_status_stopping", lambda: tr("status.stopping"))
         model.bind_func("label_ppisp_sidecar_clear", lambda: tr("training_panel.clear"))
+        model.bind_func(
+            "label_bake_projection_dome",
+            lambda: tr_or(
+                "training_panel.bake_projection_dome", "Bake Projection Dome"
+            ),
+        )
+        model.bind_func(
+            "label_mark_sky",
+            lambda: tr_or("training_panel.mark_sky", "Mark Sky"),
+        )
 
         def _btn_start():
             it = AppState.iteration.value
@@ -531,6 +550,20 @@ class TrainingPanel(Panel):
                 _state() in ("running", "paused")
                 and time.time() - self._checkpoint_saved_time < 2.0
             ),
+        )
+        model.bind_func(
+            "show_projection_dome_bake",
+            lambda: _state() == "ready" and _iteration() == 0,
+        )
+        model.bind_func(
+            "show_projection_dome_bake_success",
+            lambda: self._projection_dome_status_visible()
+            and self._projection_dome_status_kind == "success",
+        )
+        model.bind_func(
+            "show_projection_dome_bake_error",
+            lambda: self._projection_dome_status_visible()
+            and self._projection_dome_status_kind == "error",
         )
 
         model.bind_func(
@@ -1037,6 +1070,7 @@ class TrainingPanel(Panel):
         model.bind_func("psnr_tick_mid", lambda: self._psnr_tick_mid)
         model.bind_func("psnr_tick_min", lambda: self._psnr_tick_min)
         model.bind_func("error_message", _error_message)
+        model.bind_func("projection_dome_status", lambda: self._projection_dome_status)
 
         model.bind_func(
             "save_steps_display",
@@ -1181,6 +1215,13 @@ class TrainingPanel(Panel):
             if checkpoint_visible != self._last_checkpoint_saved_visible:
                 self._last_checkpoint_saved_visible = checkpoint_visible
                 self._handle.dirty("show_checkpoint_saved")
+                dirty = True
+
+            projection_status_visible = self._projection_dome_status_visible()
+            if projection_status_visible != self._last_projection_dome_status_visible:
+                self._last_projection_dome_status_visible = projection_status_visible
+                self._handle.dirty("show_projection_dome_bake_success")
+                self._handle.dirty("show_projection_dome_bake_error")
                 dirty = True
 
         if state == "ready" and AppState.iteration.value == 0:
@@ -1810,6 +1851,19 @@ class TrainingPanel(Panel):
         elif action == "save_checkpoint":
             lf.save_checkpoint()
             self._checkpoint_saved_time = time.time()
+        elif action == "bake_projection_dome":
+            self._action_bake_projection_dome()
+        elif action == "mark_sky":
+            from .sky_marker_panel import open_sky_marker_panel
+
+            if not open_sky_marker_panel(reset_mask=True):
+                self._set_projection_dome_status(
+                    "error",
+                    tr_or(
+                        "training_panel.sky_marker_open_failed",
+                        "Sky marker panel is not available.",
+                    ),
+                )
         elif action == "browse_bg":
             selected = lf.ui.open_image_file_dialog("")
             if selected:
@@ -1851,6 +1905,72 @@ class TrainingPanel(Panel):
                 if params.enable_eval:
                     self._sync_eval_steps_with_save_steps(params)
                 self._last_save_steps = None
+
+    def _projection_dome_status_visible(self):
+        return bool(self._projection_dome_status) and (
+            time.time() - self._projection_dome_status_time < 6.0
+        )
+
+    def _set_projection_dome_status(self, kind, message):
+        self._projection_dome_status_kind = kind
+        self._projection_dome_status = message
+        self._projection_dome_status_time = time.time()
+        self._last_projection_dome_status_visible = True
+        if self._handle:
+            self._handle.dirty("projection_dome_status")
+            self._handle.dirty("show_projection_dome_bake_success")
+            self._handle.dirty("show_projection_dome_bake_error")
+
+    def _action_bake_projection_dome(self):
+        if AppState.trainer_state.value != "ready" or AppState.iteration.value != 0:
+            self._set_projection_dome_status(
+                "error",
+                tr_or(
+                    "training_panel.projection_dome_bake_before_training",
+                    "Bake is available before training starts.",
+                ),
+            )
+            return
+
+        try:
+            lf.ensure_projection_dome()
+            dataset = lf.dataset_params()
+            opt = lf.optimization_params()
+            max_image_width = 1600
+            resize_factor = -1
+            invert_masks = False
+            mask_threshold = 0.5
+            if dataset and dataset.has_params():
+                max_image_width = int(dataset.max_width)
+                resize_factor = int(dataset.resize_factor)
+            if opt and opt.has_params():
+                invert_masks = bool(opt.invert_masks)
+                mask_threshold = float(getattr(opt, "mask_threshold", 0.5))
+            result = lf.bake_projection_dome(
+                max_image_width=max_image_width,
+                resize_factor=resize_factor,
+                active_cameras_only=False,
+                reject_masked_pixels=True,
+                invert_masks=invert_masks,
+                mask_threshold=mask_threshold,
+            )
+            template = tr_or(
+                "training_panel.projection_dome_bake_done",
+                "Projection dome baked: {cameras} cameras, {texels} texels.",
+            )
+            self._set_projection_dome_status(
+                "success",
+                template.format(
+                    cameras=int(result.get("cameras_used", 0)),
+                    texels=int(result.get("texels_after_fill", 0)),
+                ),
+            )
+        except Exception as exc:
+            template = tr_or(
+                "training_panel.projection_dome_bake_failed",
+                "Projection dome bake failed: {error}",
+            )
+            self._set_projection_dome_status("error", template.format(error=exc))
 
     def _action_start(self):
         params = lf.optimization_params()
@@ -2011,6 +2131,20 @@ class TrainingPanel(Panel):
 
     def _draw_controls(self, layout, state, iteration):
         if state == "ready":
+            if iteration == 0 and layout.button_styled(
+                tr_or("training_panel.bake_projection_dome", "Bake Projection Dome"),
+                "primary",
+                FULL_WIDTH,
+            ):
+                self._action_bake_projection_dome()
+            if iteration == 0 and layout.button_styled(
+                tr_or("training_panel.mark_sky", "Mark Sky"),
+                "secondary",
+                FULL_WIDTH,
+            ):
+                from .sky_marker_panel import open_sky_marker_panel
+
+                open_sky_marker_panel(reset_mask=True)
             label = (
                 tr("training_panel.resume_training")
                 if iteration > 0

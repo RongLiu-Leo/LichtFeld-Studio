@@ -263,11 +263,13 @@ namespace lfs::core {
           _rotation(std::move(other._rotation)),
           _opacity(std::move(other._opacity)),
           _densification_info(std::move(other._densification_info)),
-          _deleted(std::move(other._deleted)) {
+          _deleted(std::move(other._deleted)),
+          _frozen_means_prefix(other._frozen_means_prefix) {
         // Reset the moved-from object
         other._active_sh_degree = 0;
         other._max_sh_degree = 0;
         other._scene_scale = 0.0f;
+        other._frozen_means_prefix = 0;
     }
 
     SplatData& SplatData::operator=(SplatData&& other) noexcept {
@@ -286,6 +288,8 @@ namespace lfs::core {
             _opacity = std::move(other._opacity);
             _densification_info = std::move(other._densification_info);
             _deleted = std::move(other._deleted);
+            _frozen_means_prefix = other._frozen_means_prefix;
+            other._frozen_means_prefix = 0;
         }
         return *this;
     }
@@ -531,7 +535,7 @@ namespace lfs::core {
 
     namespace {
         constexpr uint32_t SPLAT_DATA_MAGIC = 0x4C465350; // "LFSP"
-        constexpr uint32_t SPLAT_DATA_VERSION = 3;
+        constexpr uint32_t SPLAT_DATA_VERSION = 4;
     } // namespace
 
     void SplatData::serialize(std::ostream& os) const {
@@ -560,6 +564,9 @@ namespace lfs::core {
         if (has_densification)
             os << _densification_info;
 
+        const auto frozen_prefix = static_cast<uint64_t>(std::min(_frozen_means_prefix, static_cast<size_t>(size())));
+        os.write(reinterpret_cast<const char*>(&frozen_prefix), sizeof(frozen_prefix));
+
         LOG_DEBUG("Serialized SplatData: {} Gaussians, SH {}/{}", size(), _active_sh_degree, _max_sh_degree);
     }
 
@@ -571,7 +578,7 @@ namespace lfs::core {
         if (magic != SPLAT_DATA_MAGIC) {
             throw std::runtime_error("Invalid SplatData: wrong magic");
         }
-        if (version != SPLAT_DATA_VERSION) {
+        if (version < 3 || version > SPLAT_DATA_VERSION) {
             throw std::runtime_error("Unsupported SplatData version: " + std::to_string(version));
         }
 
@@ -613,6 +620,13 @@ namespace lfs::core {
             Tensor densification;
             is >> densification;
             _densification_info = std::move(densification).cuda();
+        }
+
+        _frozen_means_prefix = 0;
+        if (version >= 4) {
+            uint64_t frozen_prefix = 0;
+            is.read(reinterpret_cast<char*>(&frozen_prefix), sizeof(frozen_prefix));
+            _frozen_means_prefix = std::min(static_cast<size_t>(frozen_prefix), static_cast<size_t>(size()));
         }
 
         LOG_DEBUG("Deserialized SplatData: {} Gaussians, SH {}/{}", size(), active_sh, max_sh);

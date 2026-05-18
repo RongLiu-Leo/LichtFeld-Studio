@@ -165,6 +165,9 @@ namespace lfs::core {
             if (!bg_image_path.empty()) {
                 opt_json["bg_image_path"] = path_to_utf8(bg_image_path);
             }
+            if (!sky_mask_path.empty()) {
+                opt_json["sky_mask_path"] = path_to_utf8(sky_mask_path);
+            }
 
             // Mask parameters
             static constexpr const char* MASK_MODE_NAMES[] = {"none", "segment", "ignore", "alpha_consistent"};
@@ -466,6 +469,9 @@ namespace lfs::core {
             }
             if (json.contains("bg_image_path")) {
                 params.bg_image_path = utf8_to_path(json["bg_image_path"].get<std::string>());
+            }
+            if (json.contains("sky_mask_path")) {
+                params.sky_mask_path = utf8_to_path(json["sky_mask_path"].get<std::string>());
             }
 
             // Mask parameters

@@ -8,12 +8,19 @@
 #include "core/mesh_data.hpp"
 #include "core/path_utils.hpp"
 #include "core/point_cloud.hpp"
+#include "core/projection_dome.hpp"
 #include "core/scene.hpp"
 #include "core/splat_data.hpp"
 #include "core/splat_data_transform.hpp"
 #include "dataset.hpp"
 #include "io/loader.hpp"
+#include <algorithm>
+#include <cmath>
 #include <format>
+#include <glm/geometric.hpp>
+#include <glm/gtc/matrix_inverse.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <vector>
 
 namespace lfs::training {
 
@@ -38,6 +45,105 @@ namespace lfs::training {
             if (splat.set_sh_degree(target_degree)) {
                 LOG_INFO("Adjusted training model SH degree: {} -> {}", before, splat.get_max_sh_degree());
             }
+        }
+
+        lfs::core::PointCloud selectPointCloudRows(const lfs::core::PointCloud& point_cloud,
+                                                   const size_t target_count) {
+            const size_t source_count = static_cast<size_t>(point_cloud.size());
+            if (target_count >= source_count) {
+                return lfs::core::PointCloud(point_cloud.means.cpu(), point_cloud.colors.cpu());
+            }
+            if (target_count == 0 || source_count == 0) {
+                return {};
+            }
+
+            std::vector<int> indices;
+            indices.reserve(target_count);
+            for (size_t i = 0; i < target_count; ++i) {
+                const size_t src = (target_count == 1)
+                                       ? 0
+                                       : std::min(source_count - 1,
+                                                  (i * (source_count - 1)) / (target_count - 1));
+                indices.push_back(static_cast<int>(src));
+            }
+
+            auto index_tensor = lfs::core::Tensor::from_vector(
+                                    indices, {target_count}, lfs::core::Device::CPU)
+                                    .to(lfs::core::DataType::Int64);
+            return lfs::core::PointCloud(
+                point_cloud.means.cpu().index_select(0, index_tensor).contiguous(),
+                point_cloud.colors.cpu().index_select(0, index_tensor).contiguous());
+        }
+
+        void prependPointCloud(lfs::core::PointCloud& target,
+                               const lfs::core::PointCloud& prefix) {
+            if (prefix.size() <= 0) {
+                return;
+            }
+            if (target.size() <= 0) {
+                target = lfs::core::PointCloud(prefix.means.cpu(), prefix.colors.cpu());
+                return;
+            }
+            target.means = lfs::core::Tensor::cat({prefix.means.cpu(), target.means.cpu()}, 0);
+            target.colors = lfs::core::Tensor::cat({prefix.colors.cpu(), target.colors.cpu()}, 0);
+        }
+
+        int skyGaussianCap(const int max_cap, const size_t regular_count) {
+            constexpr int kDefaultSkyCap = 50'000;
+            if (max_cap <= 0 || regular_count == 0) {
+                return kDefaultSkyCap;
+            }
+            return std::max(1, std::min(kDefaultSkyCap, max_cap / 5));
+        }
+
+        float pointCloudDiagonal(const lfs::core::PointCloud& point_cloud,
+                                 const bool percentile_bounds = true) {
+            glm::vec3 min_bounds{0.0f};
+            glm::vec3 max_bounds{0.0f};
+            if (!lfs::core::compute_bounds(point_cloud, min_bounds, max_bounds, 0.0f, percentile_bounds)) {
+                return 0.0f;
+            }
+            const float diagonal = glm::length(max_bounds - min_bounds);
+            return std::isfinite(diagonal) ? diagonal : 0.0f;
+        }
+
+        float skyInitialScale(const lfs::core::PointCloud& regular_point_cloud,
+                              const lfs::core::PointCloud& sky_point_cloud) {
+            constexpr float kMinScale = 1.0e-4f;
+            float scale = kMinScale;
+
+            const float regular_diag = pointCloudDiagonal(regular_point_cloud);
+            if (regular_diag > 0.0f) {
+                scale = std::max(scale, regular_diag * 0.03f);
+            }
+
+            const float sky_diag = pointCloudDiagonal(sky_point_cloud, false);
+            if (sky_diag > 0.0f) {
+                // Keep the initial dome visible without letting sparse sky splats cover the scene.
+                scale = std::max(scale, sky_diag * 0.0005f);
+            }
+
+            return std::max(kMinScale, scale);
+        }
+
+        void initializeSkyPrefixAppearance(lfs::core::SplatData& splat_data,
+                                           const size_t frozen_sky_prefix,
+                                           const float initial_scale) {
+            const size_t count = std::min(frozen_sky_prefix, static_cast<size_t>(splat_data.size()));
+            if (count == 0) {
+                return;
+            }
+
+            constexpr float kInitialOpacity = 0.02f;
+            const float safe_scale = std::max(initial_scale, 1.0e-4f);
+            const float log_scale = std::log(safe_scale);
+            const float raw_opacity = std::log(kInitialOpacity / (1.0f - kInitialOpacity));
+
+            splat_data.scaling_raw().slice(0, 0, count).fill_(log_scale);
+            splat_data.opacity_raw().slice(0, 0, count).fill_(raw_opacity);
+
+            LOG_INFO("Initialized sky gaussian appearance: {} fixed positions, scale {:.4f}, opacity {:.3f}",
+                     count, safe_scale, kInitialOpacity);
         }
     } // namespace
 
@@ -240,7 +346,9 @@ namespace lfs::training {
         glm::mat4 node_transform{1.0f};
 
         for (const auto* node : scene.getNodes()) {
-            if (node->type == lfs::core::NodeType::POINTCLOUD && node->point_cloud) {
+            if (node->type == lfs::core::NodeType::POINTCLOUD &&
+                node->point_cloud &&
+                node->name != lfs::core::kProjectionDomeSkyPreviewNodeName) {
                 point_cloud_node_id = node->id;
                 parent_id = node->parent_id;
                 node_transform = node->transform();
@@ -328,6 +436,73 @@ namespace lfs::training {
             point_cloud_to_use = *createRandomPointCloud();
         }
 
+        size_t frozen_sky_prefix = 0;
+        float frozen_sky_initial_scale = 0.0f;
+        if (!params.optimization.sky_mask_path.empty()) {
+            const size_t regular_point_count = static_cast<size_t>(point_cloud_to_use.size());
+            const int sky_cap = skyGaussianCap(max_cap, regular_point_count);
+            const glm::mat4 parent_world =
+                parent_id != lfs::core::NULL_NODE ? scene.getWorldTransform(parent_id) : glm::mat4(1.0f);
+            const glm::mat4 model_world = parent_world * node_transform;
+            const glm::mat4 output_from_world = glm::inverse(model_world);
+
+            auto sky_result = lfs::core::createProjectionDomeSkyPointCloud(
+                scene,
+                lfs::core::ProjectionDomeSkyPointCloudOptions{
+                    .manifest_path = params.optimization.sky_mask_path,
+                    .output_from_world = output_from_world,
+                    .max_gaussians = sky_cap,
+                });
+            if (!sky_result) {
+                return std::unexpected(std::format("Failed to initialize sky sphere from mask: {}",
+                                                   sky_result.error()));
+            }
+
+            if (sky_result->gaussian_count > 0) {
+                auto sky_point_cloud = std::move(sky_result->point_cloud);
+                frozen_sky_prefix = static_cast<size_t>(sky_point_cloud.size());
+                frozen_sky_initial_scale = skyInitialScale(point_cloud_to_use, sky_point_cloud);
+
+                if (max_cap > 0) {
+                    const size_t cap = static_cast<size_t>(max_cap);
+                    if (frozen_sky_prefix >= cap) {
+                        const size_t sky_keep =
+                            regular_point_count > 0 ? std::max<size_t>(1, cap / 5) : cap;
+                        sky_point_cloud = selectPointCloudRows(sky_point_cloud, std::min(frozen_sky_prefix, sky_keep));
+                        frozen_sky_prefix = static_cast<size_t>(sky_point_cloud.size());
+                        const size_t regular_cap = cap - frozen_sky_prefix;
+                        if (regular_cap > 0 && point_cloud_to_use.size() > 0) {
+                            point_cloud_to_use = selectPointCloudRows(point_cloud_to_use, regular_cap);
+                            prependPointCloud(point_cloud_to_use, sky_point_cloud);
+                        } else {
+                            point_cloud_to_use = std::move(sky_point_cloud);
+                        }
+                    } else {
+                        const size_t regular_cap = cap - frozen_sky_prefix;
+                        if (static_cast<size_t>(point_cloud_to_use.size()) > regular_cap) {
+                            LOG_WARN("Max cap ({}) leaves room for {} regular points after {} sky gaussians; downsampling regular point cloud",
+                                     max_cap, regular_cap, frozen_sky_prefix);
+                            point_cloud_to_use = selectPointCloudRows(point_cloud_to_use, regular_cap);
+                        } else {
+                            point_cloud_to_use.means = point_cloud_to_use.means.cpu();
+                            point_cloud_to_use.colors = point_cloud_to_use.colors.cpu();
+                        }
+                        prependPointCloud(point_cloud_to_use, sky_point_cloud);
+                    }
+                } else {
+                    prependPointCloud(point_cloud_to_use, sky_point_cloud);
+                }
+
+                LOG_INFO("Initialized {} fixed-position sky gaussians from {} marked sky pixels",
+                         frozen_sky_prefix, sky_result->marked_pixels);
+            } else if (sky_result->marked_pixels > 0) {
+                LOG_WARN("Sky mask has {} marked pixels, but no valid sky gaussians were generated",
+                         sky_result->marked_pixels);
+            } else {
+                LOG_INFO("Sky mask manifest has no marked pixels; skipping sky sphere initialization");
+            }
+        }
+
         lfs::core::Tensor scene_center = scene.getSceneCenter();
         if (!scene_center.is_valid() || scene_center.numel() == 0) {
             LOG_WARN("No scene center from loader, computing from point cloud");
@@ -349,7 +524,17 @@ namespace lfs::training {
             return std::unexpected(std::format("Failed to initialize model: {}", splat_result.error()));
         }
 
+        if (frozen_sky_prefix > 0) {
+            splat_result->set_frozen_means_prefix(frozen_sky_prefix);
+            initializeSkyPrefixAppearance(*splat_result, frozen_sky_prefix, frozen_sky_initial_scale);
+        }
+
         if (max_cap > 0 && max_cap < static_cast<int>(splat_result->size())) {
+            if (frozen_sky_prefix > 0) {
+                return std::unexpected(std::format(
+                    "Sky initialization produced {} gaussians, exceeding max cap {}",
+                    splat_result->size(), max_cap));
+            }
             LOG_WARN("Max cap ({}) is less than initial splat count ({}), randomly selecting {} splats",
                      max_cap, splat_result->size(), max_cap);
             lfs::core::random_choose(*splat_result, max_cap);

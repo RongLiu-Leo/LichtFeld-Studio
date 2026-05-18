@@ -546,6 +546,7 @@ namespace lfs::training {
             dst.n_attributes = src.n_attributes;
             dst.step_size = src.step_size;
             dst.bias_correction2_sqrt_rcp = src.bias_correction2_sqrt_rcp;
+            dst.first_trainable_row = src.first_trainable_row;
             dst.enabled = src.enabled;
             return dst;
         };

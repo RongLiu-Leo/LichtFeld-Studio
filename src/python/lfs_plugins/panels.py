@@ -95,6 +95,11 @@ def register_builtin_panels():
         lf.register_class(Mesh2SplatPanel)
         lf.ui.set_panel_enabled("native.mesh2splat", False)
 
+        from .sky_marker_panel import SkyMarkerPanel
+
+        lf.register_class(SkyMarkerPanel)
+        lf.ui.set_panel_enabled("lfs.sky_marker", False)
+
         lf.register_class(PluginMarketplacePanel)
         lf.ui.set_panel_enabled("lfs.plugin_marketplace", False)
 

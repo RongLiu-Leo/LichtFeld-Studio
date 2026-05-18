@@ -229,13 +229,20 @@ namespace lfs::training {
         }
 
         const size_t feature_dim = param.numel() / param_size;
-        const size_t num_elements = state.size * feature_dim;
+        const size_t frozen_rows = (type == ParamType::Means)
+                                       ? std::min(splat_data_.frozen_means_prefix(), param_size)
+                                       : 0;
+        const size_t offset = frozen_rows * feature_dim;
+        const size_t num_elements = (state.size - frozen_rows) * feature_dim;
+        if (num_elements == 0) {
+            return;
+        }
 
         fast_lfs::optimizer::adam_step_raw(
-            param.ptr<float>(),
-            state.exp_avg.ptr<float>(),
-            state.exp_avg_sq.ptr<float>(),
-            state.grad.ptr<float>(),
+            param.ptr<float>() + offset,
+            state.exp_avg.ptr<float>() + offset,
+            state.exp_avg_sq.ptr<float>() + offset,
+            state.grad.ptr<float>() + offset,
             static_cast<int>(num_elements),
             param_lr,
             config_.beta1,
@@ -287,6 +294,12 @@ namespace lfs::training {
             out.n_attributes = n_attributes;
             out.step_size = static_cast<float>(get_param_lr(type) * bias_correction1_rcp);
             out.bias_correction2_sqrt_rcp = static_cast<float>(bias_correction2_sqrt_rcp);
+            out.first_trainable_row = type == ParamType::Means
+                                          ? static_cast<int>(std::min(splat_data_.frozen_means_prefix(), param_size))
+                                          : 0;
+            if (out.first_trainable_row >= static_cast<int>(param_size)) {
+                return FastGSFusedAdamParam{};
+            }
             out.enabled = true;
             return out;
         };

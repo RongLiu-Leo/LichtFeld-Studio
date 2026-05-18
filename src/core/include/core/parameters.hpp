@@ -131,6 +131,7 @@ namespace lfs::core {
             BackgroundMode bg_mode = BackgroundMode::SolidColor; // Which background mode to use
             std::array<float, 3> bg_color = {0.0f, 0.0f, 0.0f};  // RGB background color [0-1]
             std::filesystem::path bg_image_path = {};            // Custom background image path
+            std::filesystem::path sky_mask_path = {};             // Cubemap sky mask manifest for dome/sphere initialization
 
             // Bilateral grid parameters
             bool use_bilateral_grid = false;

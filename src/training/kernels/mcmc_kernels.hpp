@@ -54,6 +54,7 @@ namespace lfs::training::mcmc {
      * @param means [N, 3] - Mean positions (modified in-place)
      * @param current_lr - Current learning rate for noise scaling
      * @param N - Number of Gaussians
+     * @param first_trainable_idx - Gaussian rows below this index are left untouched
      * @param stream - CUDA stream for async execution
      */
     void launch_add_noise_kernel(
@@ -64,6 +65,7 @@ namespace lfs::training::mcmc {
         float* means,
         float current_lr,
         size_t N,
+        size_t first_trainable_idx = 0,
         void* stream = nullptr);
 
     /**

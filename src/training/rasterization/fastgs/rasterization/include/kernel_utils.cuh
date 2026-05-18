@@ -56,7 +56,9 @@ namespace fast_lfs::rasterization::kernels {
         const float beta2,
         const float eps) {
         const uint element_idx = primitive_idx * static_cast<uint>(param.n_attributes) + offset;
-        if (!param.enabled || element_idx >= static_cast<uint>(param.n_elements))
+        if (!param.enabled ||
+            static_cast<int>(primitive_idx) < param.first_trainable_row ||
+            element_idx >= static_cast<uint>(param.n_elements))
             return;
 
         const float moment1_prev = param.exp_avg[element_idx];

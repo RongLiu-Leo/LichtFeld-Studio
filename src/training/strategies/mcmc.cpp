@@ -595,7 +595,8 @@ namespace lfs::training {
                 _noise_buffer.ptr<float>(),
                 _splat_data->means().ptr<float>(),
                 current_lr,
-                _splat_data->size());
+                _splat_data->size(),
+                _splat_data->frozen_means_prefix());
         }
     }
 

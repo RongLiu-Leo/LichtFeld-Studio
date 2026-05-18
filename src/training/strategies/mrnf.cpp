@@ -135,6 +135,37 @@ namespace lfs::training {
             make_fresh();
         }
 
+        [[nodiscard]] lfs::core::Tensor prefix_indices(const size_t count,
+                                                       const lfs::core::Device device) {
+            if (count == 0) {
+                return {};
+            }
+            std::vector<int> indices(count);
+            std::iota(indices.begin(), indices.end(), 0);
+            return lfs::core::Tensor::from_vector(
+                       indices, lfs::core::TensorShape({count}), device)
+                .to(lfs::core::DataType::Int64);
+        }
+
+        void clear_frozen_prefix(lfs::core::Tensor& mask_or_weights,
+                                 const size_t frozen_prefix) {
+            if (!mask_or_weights.is_valid() || mask_or_weights.numel() == 0 || frozen_prefix == 0) {
+                return;
+            }
+            const size_t count = std::min(frozen_prefix, static_cast<size_t>(mask_or_weights.numel()));
+            if (count == 0) {
+                return;
+            }
+            const auto indices = prefix_indices(count, mask_or_weights.device());
+            if (mask_or_weights.dtype() == lfs::core::DataType::Bool) {
+                const auto false_values = lfs::core::Tensor::zeros_bool({count}, mask_or_weights.device());
+                mask_or_weights.index_put_(indices, false_values);
+            } else {
+                const auto zero_values = lfs::core::Tensor::zeros({count}, mask_or_weights.device(), mask_or_weights.dtype());
+                mask_or_weights.index_put_(indices, zero_values);
+            }
+        }
+
         [[nodiscard]] bool has_zero_dimension(const lfs::core::TensorShape& shape) {
             for (size_t i = 0; i < shape.rank(); ++i) {
                 if (shape[i] == 0) {
@@ -634,6 +665,7 @@ namespace lfs::training {
             auto active_mask = _free_mask.slice(0, 0, n).logical_not();
             prune_mask = prune_mask.logical_and(active_mask);
         }
+        clear_frozen_prefix(prune_mask, _splat_data->frozen_means_prefix());
 
         const int pruned_count = static_cast<int>(prune_mask.sum().item());
 
@@ -692,6 +724,12 @@ namespace lfs::training {
         lfs::core::Tensor active_mask;
         if (_free_mask.is_valid() && n > 0) {
             active_mask = _free_mask.slice(0, 0, n).logical_not();
+        }
+        if (_splat_data->frozen_means_prefix() > 0 && n > 0) {
+            if (!active_mask.is_valid()) {
+                active_mask = Tensor::ones_bool({n}, _splat_data->means().device());
+            }
+            clear_frozen_prefix(active_mask, _splat_data->frozen_means_prefix());
         }
 
         auto seed = static_cast<uint64_t>(
@@ -990,6 +1028,44 @@ namespace lfs::training {
         auto seed = static_cast<uint64_t>(
             std::chrono::high_resolution_clock::now().time_since_epoch().count());
 
+        const size_t frozen_prefix = std::min(_splat_data->frozen_means_prefix(), n);
+        if (frozen_prefix > 0) {
+            const size_t frozen_keep = std::min(frozen_prefix, cap);
+            auto keep_mask = Tensor::zeros_bool({n}, opacities.device());
+
+            const auto frozen_indices = prefix_indices(frozen_keep, opacities.device());
+            const auto frozen_true_vals = Tensor::ones_bool({frozen_keep}, opacities.device());
+            keep_mask.index_put_(frozen_indices, frozen_true_vals);
+
+            const size_t trainable_keep = cap - frozen_keep;
+            if (trainable_keep > 0 && frozen_prefix < n) {
+                const size_t trainable_count = n - frozen_prefix;
+                auto trainable_opacities = opacities.slice(0, frozen_prefix, n).contiguous();
+                auto relative_keep = Tensor::empty({trainable_keep}, Device::CUDA, DataType::Int64);
+                mrnf_strategy::launch_gumbel_topk(
+                    trainable_opacities.ptr<float>(), trainable_count, trainable_keep, seed,
+                    relative_keep.ptr<int64_t>());
+
+                auto relative_keep_cpu = relative_keep.cpu();
+                const auto* relative_ptr = relative_keep_cpu.ptr<int64_t>();
+                std::vector<int> absolute_indices(trainable_keep);
+                for (size_t i = 0; i < trainable_keep; ++i) {
+                    absolute_indices[i] = static_cast<int>(relative_ptr[i] + static_cast<int64_t>(frozen_prefix));
+                }
+
+                const auto trainable_indices =
+                    Tensor::from_vector(absolute_indices, TensorShape({trainable_keep}), opacities.device())
+                        .to(DataType::Int64);
+                const auto trainable_true_vals = Tensor::ones_bool({trainable_keep}, opacities.device());
+                keep_mask.index_put_(trainable_indices, trainable_true_vals);
+            }
+
+            compact_splats(keep_mask);
+            _splat_data->set_frozen_means_prefix(frozen_keep);
+            assert(_splat_data->size() <= cap);
+            return;
+        }
+
         auto keep_indices = Tensor::empty({cap}, Device::CUDA, DataType::Int64);
         mrnf_strategy::launch_gumbel_topk(
             opacities.ptr<float>(), n, cap, seed,
@@ -1112,18 +1188,32 @@ namespace lfs::training {
     }
 
     void MRNF::compute_bounds() {
-        const size_t n = active_count();
-        if (n == 0) {
+        if (active_count() == 0) {
             _bounds_valid = false;
             return;
         }
 
         lfs::core::Tensor active_means = _splat_data->means();
-        if (_free_mask.is_valid() && free_count() > 0) {
-            auto active_indices = get_active_indices();
+        auto active_indices = get_active_indices();
+        const size_t frozen_prefix = _splat_data->frozen_means_prefix();
+        if (frozen_prefix > 0 && active_indices.is_valid() && active_indices.numel() > 0) {
+            auto trainable_mask = active_indices >= static_cast<int64_t>(frozen_prefix);
+            auto trainable_indices = active_indices.index_select(0, trainable_mask).contiguous();
+            if (trainable_indices.numel() > 0) {
+                active_indices = std::move(trainable_indices);
+            }
+        }
+        if (active_indices.is_valid() &&
+            active_indices.numel() > 0 &&
+            static_cast<size_t>(active_indices.numel()) < static_cast<size_t>(_splat_data->size())) {
             active_means = _splat_data->means().index_select(0, active_indices).contiguous();
         }
 
+        const size_t n = static_cast<size_t>(active_means.size(0));
+        if (n == 0) {
+            _bounds_valid = false;
+            return;
+        }
         mrnf_strategy::launch_percentile_bounds(
             active_means.ptr<float>(),
             n,

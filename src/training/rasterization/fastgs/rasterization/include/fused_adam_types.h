@@ -14,6 +14,7 @@ namespace fast_lfs::rasterization {
         int n_attributes = 0;
         float step_size = 0.0f;
         float bias_correction2_sqrt_rcp = 1.0f;
+        int first_trainable_row = 0;
         bool enabled = false;
     };
 

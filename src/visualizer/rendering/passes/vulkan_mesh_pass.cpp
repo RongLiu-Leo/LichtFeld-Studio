@@ -92,8 +92,10 @@ namespace lfs::vis {
         VkDescriptorSetLayout light_layout = VK_NULL_HANDLE;
         VkDescriptorSetLayout material_layout = VK_NULL_HANDLE;
         VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
-        VkPipeline pipeline_cull = VK_NULL_HANDLE;    // backface culling (default)
-        VkPipeline pipeline_no_cull = VK_NULL_HANDLE; // double-sided / culling off
+        VkPipeline pipeline_cull = VK_NULL_HANDLE;                 // backface culling (default)
+        VkPipeline pipeline_no_cull = VK_NULL_HANDLE;              // double-sided / culling off
+        VkPipeline pipeline_transparent_cull = VK_NULL_HANDLE;     // alpha blend, depth test, no depth write
+        VkPipeline pipeline_transparent_no_cull = VK_NULL_HANDLE;  // alpha blend, depth test, no depth write
 
         VkPipelineLayout shadow_pipeline_layout = VK_NULL_HANDLE;
         VkPipeline shadow_pipeline = VK_NULL_HANDLE;
@@ -130,6 +132,7 @@ namespace lfs::vis {
             GpuTexture albedo{};
             GpuTexture normal{};
             GpuTexture metallic_roughness{};
+            float alpha = 1.0f;
         };
 
         struct GpuSubmesh {
@@ -273,7 +276,12 @@ namespace lfs::vis {
                 descriptor_pool = VK_NULL_HANDLE;
                 light_descriptor = VK_NULL_HANDLE;
             }
-            for (VkPipeline* p : {&pipeline_cull, &pipeline_no_cull, &shadow_pipeline, &wireframe_pipeline}) {
+            for (VkPipeline* p : {&pipeline_cull,
+                                  &pipeline_no_cull,
+                                  &pipeline_transparent_cull,
+                                  &pipeline_transparent_no_cull,
+                                  &shadow_pipeline,
+                                  &wireframe_pipeline}) {
                 if (*p != VK_NULL_HANDLE) {
                     vkDestroyPipeline(device, *p, nullptr);
                     *p = VK_NULL_HANDLE;
@@ -786,13 +794,30 @@ namespace lfs::vis {
             // Mesh vertices use the same GL-convention projection matrices as FastGS,
             // then receive a clip-space Y correction before Vulkan's positive-height
             // viewport. That preserves normal CCW winding for back-face culling.
-            const auto build = [&](VkCullModeFlags cull, VkPipeline& out) -> bool {
+            const auto build = [&](VkCullModeFlags cull, const bool transparent, VkPipeline& out) -> bool {
                 VkPipelineRasterizationStateCreateInfo raster{};
                 raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
                 raster.polygonMode = VK_POLYGON_MODE_FILL;
                 raster.cullMode = cull;
                 raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
                 raster.lineWidth = 1.0f;
+
+                VkPipelineDepthStencilStateCreateInfo depth_state = depth;
+                depth_state.depthWriteEnable = transparent ? VK_FALSE : VK_TRUE;
+
+                VkPipelineColorBlendAttachmentState blend_attachment_state = blend_attachment;
+                if (transparent) {
+                    blend_attachment_state.blendEnable = VK_TRUE;
+                    blend_attachment_state.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+                    blend_attachment_state.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+                    blend_attachment_state.colorBlendOp = VK_BLEND_OP_ADD;
+                    blend_attachment_state.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+                    blend_attachment_state.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+                    blend_attachment_state.alphaBlendOp = VK_BLEND_OP_ADD;
+                }
+
+                VkPipelineColorBlendStateCreateInfo blend_state = blend;
+                blend_state.pAttachments = &blend_attachment_state;
 
                 VkGraphicsPipelineCreateInfo pipeline_info{};
                 pipeline_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -804,16 +829,18 @@ namespace lfs::vis {
                 pipeline_info.pViewportState = &viewport_state;
                 pipeline_info.pRasterizationState = &raster;
                 pipeline_info.pMultisampleState = &multisample;
-                pipeline_info.pDepthStencilState = &depth;
-                pipeline_info.pColorBlendState = &blend;
+                pipeline_info.pDepthStencilState = &depth_state;
+                pipeline_info.pColorBlendState = &blend_state;
                 pipeline_info.pDynamicState = &dynamic;
                 pipeline_info.layout = pipeline_layout;
                 return vkCreateGraphicsPipelines(device, pipeline_cache, 1,
                                                  &pipeline_info, nullptr, &out) == VK_SUCCESS;
             };
 
-            const bool ok = build(VK_CULL_MODE_BACK_BIT, pipeline_cull) &&
-                            build(VK_CULL_MODE_NONE, pipeline_no_cull);
+            const bool ok = build(VK_CULL_MODE_BACK_BIT, false, pipeline_cull) &&
+                            build(VK_CULL_MODE_NONE, false, pipeline_no_cull) &&
+                            build(VK_CULL_MODE_BACK_BIT, true, pipeline_transparent_cull) &&
+                            build(VK_CULL_MODE_NONE, true, pipeline_transparent_no_cull);
             vkDestroyShaderModule(device, vert, nullptr);
             vkDestroyShaderModule(device, frag, nullptr);
             if (!ok) {
@@ -1120,6 +1147,7 @@ namespace lfs::vis {
             const bool has_normal = uploadTextureFromMesh(mesh, mat.normal_tex, out.normal);
             const bool has_mr = uploadTextureFromMesh(mesh, mat.metallic_roughness_tex, out.metallic_roughness);
             const bool has_vc = mesh.has_colors();
+            out.alpha = std::clamp(mat.base_color.a, 0.0f, 1.0f);
 
             MaterialUbo ubo{};
             ubo.base_color[0] = mat.base_color.r;
@@ -1399,6 +1427,23 @@ namespace lfs::vis {
             vmaUnmapMemory(allocator, mat.ubo_alloc);
         }
 
+        static bool materialIsTransparent(const GpuMaterial& mat) {
+            return mat.alpha < 0.999f;
+        }
+
+        static bool meshHasOpaqueSubmesh(const GpuMesh& gpu) {
+            if (gpu.materials.empty()) {
+                return true;
+            }
+            for (const auto& sm : gpu.submeshes) {
+                const std::size_t mat_idx = std::min(sm.material_index, gpu.materials.size() - 1);
+                if (!materialIsTransparent(gpu.materials[mat_idx])) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         glm::mat4 computeLightVp(const GpuMesh& gpu, const glm::mat4& model,
                                  const glm::vec3& light_dir) const {
             const std::array<glm::vec3, 8> corners{
@@ -1560,6 +1605,9 @@ namespace lfs::vis {
                     continue;
                 }
                 auto& gpu = it->second;
+                if (!meshHasOpaqueSubmesh(gpu)) {
+                    continue;
+                }
                 if (!ensureShadowTarget(gpu, item.shadow_map_resolution)) {
                     continue;
                 }
@@ -1602,73 +1650,87 @@ namespace lfs::vis {
             clip_y_flip[1][1] = -1.0f;
             const glm::mat4 view_projection = clip_y_flip * params.view_projection;
 
-            for (const auto& item : params.items) {
-                if (!item.mesh)
-                    continue;
-                auto it = mesh_cache.find(item.mesh);
-                if (it == mesh_cache.end() || it->second.vertex_buffer == VK_NULL_HANDLE) {
-                    continue;
-                }
-                auto& gpu = it->second;
-
-                const bool shadow_active = item.shadow_enabled &&
-                                           gpu.shadow.image != VK_NULL_HANDLE &&
-                                           gpu.cached_light_vp_valid;
-                writeLightUbo(params, item,
-                              shadow_active ? gpu.cached_light_vp : glm::mat4(1.0f),
-                              shadow_active);
-                bindShadowMap(shadow_active ? gpu.shadow : shadow_dummy);
-
-                // Patch per-frame emphasis state into the material UBOs for this mesh.
-                for (auto& mat : gpu.materials) {
-                    if (mat.ubo_alloc != VK_NULL_HANDLE) {
-                        updateMaterialEmphasis(mat, item);
-                    }
-                }
-
-                VkPipeline main_pipeline = item.backface_culling ? pipeline_cull : pipeline_no_cull;
-                vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, main_pipeline);
-                vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
-                                        0, 1, &light_descriptor, 0, nullptr);
-
-                MeshPushConstants pc{};
-                const glm::mat4 mvp = view_projection * item.model;
-                std::memcpy(pc.mvp, &mvp[0][0], sizeof(pc.mvp));
-                std::memcpy(pc.model, &item.model[0][0], sizeof(pc.model));
-                vkCmdPushConstants(cb, pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
-                                   0, sizeof(pc), &pc);
-
-                VkBuffer vbuf = gpu.vertex_buffer;
-                VkDeviceSize voff = 0;
-                vkCmdBindVertexBuffers(cb, 0, 1, &vbuf, &voff);
-                vkCmdBindIndexBuffer(cb, gpu.index_buffer, 0, VK_INDEX_TYPE_UINT32);
-
-                for (const auto& sm : gpu.submeshes) {
-                    if (sm.index_count == 0)
+            for (const bool transparent_pass : {false, true}) {
+                for (const auto& item : params.items) {
+                    if (!item.mesh)
                         continue;
-                    const std::size_t mat_idx = std::min(sm.material_index, gpu.materials.size() - 1);
-                    const auto& mat = gpu.materials[mat_idx];
-                    if (mat.descriptor != VK_NULL_HANDLE) {
-                        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
-                                                1, 1, &mat.descriptor, 0, nullptr);
+                    auto it = mesh_cache.find(item.mesh);
+                    if (it == mesh_cache.end() || it->second.vertex_buffer == VK_NULL_HANDLE) {
+                        continue;
                     }
-                    vkCmdDrawIndexed(cb, sm.index_count, 1, sm.start_index, 0, 0);
-                }
+                    auto& gpu = it->second;
 
-                // Wireframe overlay drawn on top of the shaded mesh.
-                if (item.wireframe_overlay && wireframe_pipeline != VK_NULL_HANDLE) {
-                    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, wireframe_pipeline);
-                    vkCmdSetLineWidth(cb, std::max(item.wireframe_width, 1.0f));
-                    WireframePush wpush{};
-                    std::memcpy(wpush.mvp, &mvp[0][0], sizeof(wpush.mvp));
-                    wpush.color[0] = item.wireframe_color.r;
-                    wpush.color[1] = item.wireframe_color.g;
-                    wpush.color[2] = item.wireframe_color.b;
-                    wpush.color[3] = 1.0f;
-                    vkCmdPushConstants(cb, wireframe_pipeline_layout,
-                                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                                       0, sizeof(wpush), &wpush);
-                    vkCmdDrawIndexed(cb, gpu.total_index_count, 1, 0, 0, 0);
+                    const bool shadow_active = item.shadow_enabled &&
+                                               !transparent_pass &&
+                                               gpu.shadow.image != VK_NULL_HANDLE &&
+                                               gpu.cached_light_vp_valid;
+                    writeLightUbo(params, item,
+                                  shadow_active ? gpu.cached_light_vp : glm::mat4(1.0f),
+                                  shadow_active);
+                    bindShadowMap(shadow_active ? gpu.shadow : shadow_dummy);
+
+                    for (auto& mat : gpu.materials) {
+                        if (mat.ubo_alloc != VK_NULL_HANDLE) {
+                            updateMaterialEmphasis(mat, item);
+                        }
+                    }
+
+                    const glm::mat4 mvp = view_projection * item.model;
+                    MeshPushConstants pc{};
+                    std::memcpy(pc.mvp, &mvp[0][0], sizeof(pc.mvp));
+                    std::memcpy(pc.model, &item.model[0][0], sizeof(pc.model));
+
+                    VkBuffer vbuf = gpu.vertex_buffer;
+                    VkDeviceSize voff = 0;
+                    bool pipeline_bound = false;
+                    for (const auto& sm : gpu.submeshes) {
+                        if (sm.index_count == 0)
+                            continue;
+                        const std::size_t mat_idx = std::min(sm.material_index, gpu.materials.size() - 1);
+                        const auto& mat = gpu.materials[mat_idx];
+                        if (materialIsTransparent(mat) != transparent_pass) {
+                            continue;
+                        }
+
+                        if (!pipeline_bound) {
+                            const VkPipeline main_pipeline = transparent_pass
+                                                                  ? (item.backface_culling ? pipeline_transparent_cull
+                                                                                           : pipeline_transparent_no_cull)
+                                                                  : (item.backface_culling ? pipeline_cull
+                                                                                           : pipeline_no_cull);
+                            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, main_pipeline);
+                            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
+                                                    0, 1, &light_descriptor, 0, nullptr);
+                            vkCmdPushConstants(cb, pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
+                                               0, sizeof(pc), &pc);
+                            vkCmdBindVertexBuffers(cb, 0, 1, &vbuf, &voff);
+                            vkCmdBindIndexBuffer(cb, gpu.index_buffer, 0, VK_INDEX_TYPE_UINT32);
+                            pipeline_bound = true;
+                        }
+                        if (mat.descriptor != VK_NULL_HANDLE) {
+                            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
+                                                    1, 1, &mat.descriptor, 0, nullptr);
+                        }
+                        vkCmdDrawIndexed(cb, sm.index_count, 1, sm.start_index, 0, 0);
+                    }
+
+                    // Wireframe overlay drawn once on top of the shaded mesh.
+                    if (transparent_pass && item.wireframe_overlay && wireframe_pipeline != VK_NULL_HANDLE) {
+                        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, wireframe_pipeline);
+                        vkCmdSetLineWidth(cb, std::max(item.wireframe_width, 1.0f));
+                        WireframePush wpush{};
+                        std::memcpy(wpush.mvp, &mvp[0][0], sizeof(wpush.mvp));
+                        wpush.color[0] = item.wireframe_color.r;
+                        wpush.color[1] = item.wireframe_color.g;
+                        wpush.color[2] = item.wireframe_color.b;
+                        wpush.color[3] = 1.0f;
+                        vkCmdPushConstants(cb, wireframe_pipeline_layout,
+                                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                                           0, sizeof(wpush), &wpush);
+                        vkCmdBindVertexBuffers(cb, 0, 1, &vbuf, &voff);
+                        vkCmdBindIndexBuffer(cb, gpu.index_buffer, 0, VK_INDEX_TYPE_UINT32);
+                        vkCmdDrawIndexed(cb, gpu.total_index_count, 1, 0, 0, 0);
+                    }
                 }
             }
         }

@@ -1217,6 +1217,13 @@ namespace lfs::python {
                 },
                 "Path to background image")
             .def_prop_rw(
+                "sky_mask_path",
+                [](PyOptimizationParams& self) { return lfs::core::path_to_utf8(self.params().sky_mask_path); },
+                [](PyOptimizationParams&, const std::string& v) {
+                    modify_params([&v](auto& p) { p.sky_mask_path = lfs::core::utf8_to_path(v); });
+                },
+                "Path to projection dome sky cubemap mask manifest")
+            .def_prop_rw(
                 "random",
                 [](PyOptimizationParams& self) { return self.params().random; },
                 [](PyOptimizationParams&, bool v) { modify_params([v](auto& p) { p.random = v; }); },

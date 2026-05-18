@@ -152,10 +152,11 @@ namespace lfs::training::mcmc {
         const float* noise,
         float* means,
         float current_lr,
-        size_t N) {
+        size_t N,
+        size_t first_trainable_idx) {
 
         size_t idx = threadIdx.x + blockIdx.x * blockDim.x;
-        if (idx >= N)
+        if (idx >= N || idx < first_trainable_idx)
             return;
 
         size_t idx_3d = 3 * idx;
@@ -195,6 +196,7 @@ namespace lfs::training::mcmc {
         float* means,
         float current_lr,
         size_t N,
+        size_t first_trainable_idx,
         void* stream) {
 
         if (N == 0) {
@@ -213,7 +215,8 @@ namespace lfs::training::mcmc {
             noise,
             means,
             current_lr,
-            N);
+            N,
+            first_trainable_idx);
     }
 
     // Fused gather kernel - collects all parameters at once

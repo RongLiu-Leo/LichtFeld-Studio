@@ -317,6 +317,26 @@ def set_node_visibility(name: str, visible: bool) -> None:
 def set_camera_training_enabled(name: str, enabled: bool) -> None:
     """Enable or disable a camera for training by name"""
 
+def ensure_projection_dome(radius: float = 0.0, longitude_segments: int = 64, latitude_segments: int = 32) -> str:
+    """Ensure the transformable projection-dome mesh exists in the scene"""
+
+def bake_projection_dome(width: int = 2048, height: int = 1024, max_image_width: int = 1600, resize_factor: int = -1, active_cameras_only: bool = True, reject_masked_pixels: bool = True, invert_masks: bool = False, mask_threshold: float = 0.5, hole_fill_iterations: int = 24, edge_falloff: float = 0.07999999821186066) -> dict:
+    """Bake camera images into the projection dome texture"""
+
+def prepare_projection_dome_sky_cubemap(output_dir: str, face_size: int = 512, overwrite_preview: bool = True, reset_mask: bool = False) -> dict:
+    """Export the projection dome texture into paintable sky cubemap faces"""
+
+def paint_sky_cubemap_mask(mask_path: str, overlay_path: str, face_size: int, x: int, y: int, radius: int, erase: bool = False) -> dict:
+    """Paint or erase a circular brush stroke in a sky cubemap mask face"""
+
+def clear_sky_cubemap_mask(mask_path: str, overlay_path: str, face_size: int) -> dict:
+    """Clear one sky cubemap mask face"""
+
+def preview_projection_dome_sky_initialization(manifest_path: str, max_gaussians: int = 50000) -> dict:
+    """
+    Create/update the visible sky initialization preview from a saved sky mask manifest
+    """
+
 def remove_node(name: str, keep_children: bool = False) -> None:
     """Remove a scene node by name"""
 
@@ -1943,6 +1963,13 @@ class OptimizationParams:
 
     @bg_image_path.setter
     def bg_image_path(self, arg: str, /) -> None: ...
+
+    @property
+    def sky_mask_path(self) -> str:
+        """Path to projection dome sky cubemap mask manifest"""
+
+    @sky_mask_path.setter
+    def sky_mask_path(self, arg: str, /) -> None: ...
 
     @property
     def random(self) -> bool:

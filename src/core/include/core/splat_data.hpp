@@ -8,6 +8,7 @@
 #include "core/point_cloud.hpp"
 #include "core/tensor.hpp"
 
+#include <algorithm>
 #include <expected>
 #include <filesystem>
 #include <glm/fwd.hpp>
@@ -71,6 +72,10 @@ namespace lfs::core {
         int get_max_sh_degree() const { return _max_sh_degree; }
         float get_scene_scale() const { return _scene_scale; }
         unsigned long size() const { return static_cast<unsigned long>(_means.shape()[0]); }
+        size_t frozen_means_prefix() const { return _frozen_means_prefix; }
+        void set_frozen_means_prefix(size_t count) {
+            _frozen_means_prefix = std::min(count, static_cast<size_t>(size()));
+        }
 
         // ========== Raw tensor access (for optimization) ==========
         inline Tensor& means() { return _means; }
@@ -140,6 +145,9 @@ namespace lfs::core {
 
         // Soft deletion mask: bool tensor [N], true = hidden from rendering
         Tensor _deleted;
+
+        // Initial rows whose mean positions are fixed during training.
+        size_t _frozen_means_prefix = 0;
 
         // Allow free functions in splat_data_transform.cpp to access private members
         friend LFS_CORE_API SplatData& transform(SplatData&, const glm::mat4&);
