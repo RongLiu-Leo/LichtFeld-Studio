@@ -1164,6 +1164,9 @@ NB_MODULE(lichtfeld, m) {
             nb::dict output;
             output["output_dir"] = lfs::core::path_to_utf8(result->output_dir);
             output["face_size"] = result->face_size;
+            output["dome_world"] = std::vector<float>(
+                &result->dome_world[0][0],
+                &result->dome_world[0][0] + 16);
             output["faces"] = std::move(faces);
             return output;
         },

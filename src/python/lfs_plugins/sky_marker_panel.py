@@ -73,6 +73,7 @@ class SkyMarkerPanel(Panel):
         self._handle = None
         self._workspace = None
         self._manifest_path = None
+        self._dome_world = None
         self._face_size = 512
         self._brush_radius = 24
         self._zoom = 1.25
@@ -168,6 +169,11 @@ class SkyMarkerPanel(Panel):
                 overwrite_preview=True,
                 reset_mask=reset_mask,
             )
+            dome_world = result.get("dome_world")
+            if isinstance(dome_world, (list, tuple)) and len(dome_world) == 16:
+                self._dome_world = [float(value) for value in dome_world]
+            else:
+                self._dome_world = None
             self._states = {}
             for face in result.get("faces", []):
                 face_id = str(face.get("id", ""))
@@ -514,6 +520,8 @@ class SkyMarkerPanel(Panel):
             "face_size": self._face_size,
             "faces": faces,
         }
+        if self._dome_world:
+            data["dome_world"] = self._dome_world
         self._manifest_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
         params = lf.optimization_params()

@@ -82,6 +82,7 @@ namespace lfs::core {
     struct ProjectionDomeSkyCubemapResult {
         std::filesystem::path output_dir;
         int face_size = 0;
+        glm::mat4 dome_world{1.0f};
         std::vector<ProjectionDomeSkyCubemapFace> faces;
     };
 

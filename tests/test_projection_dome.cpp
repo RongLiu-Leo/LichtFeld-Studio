@@ -4,13 +4,34 @@
 #include "core/projection_dome.hpp"
 #include <gtest/gtest.h>
 #include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 
 using namespace lfs::core;
+
+namespace {
+    std::shared_ptr<Camera> makeTestCamera(const glm::vec3& center, const int uid) {
+        auto R = Tensor::from_vector(std::vector<float>{
+                                         1.0f, 0.0f, 0.0f,
+                                         0.0f, 1.0f, 0.0f,
+                                         0.0f, 0.0f, 1.0f},
+                                     {3, 3}, Device::CPU);
+        auto T = Tensor::from_vector(std::vector<float>{-center.x, -center.y, -center.z},
+                                     {3}, Device::CPU);
+        return std::make_shared<Camera>(
+            R, T,
+            100.0f, 100.0f, 50.0f, 50.0f,
+            Tensor{}, Tensor{},
+            CameraModelType::PINHOLE,
+            "test.png", std::filesystem::path{}, std::filesystem::path{},
+            100, 100, uid);
+    }
+}
 
 TEST(ProjectionDomeTest, CreateMeshHasTextureUvAndMaterial) {
     ProjectionDomeMeshOptions options;
@@ -86,6 +107,28 @@ TEST(ProjectionDomeTest, EnsureAddsTransformableMeshNode) {
     const auto second = ensureProjectionDome(scene, {}, placement);
     ASSERT_TRUE(second.has_value()) << second.error();
     EXPECT_EQ(*second, *result);
+}
+
+TEST(ProjectionDomeTest, PlacementUsesCameraNavigationRadiusInsteadOfPointOutliers) {
+    Scene scene;
+    const NodeId dataset_id = scene.addDataset("Dataset");
+
+    const auto means = Tensor::from_vector(std::vector<float>{
+                                               0.0f, 0.0f, 0.0f,
+                                               100000.0f, 0.0f, 0.0f},
+                                           {2, 3}, Device::CPU);
+    const auto colors = Tensor::zeros({2, 3}, Device::CPU, DataType::UInt8);
+    scene.addPointCloud("PointCloud", std::make_shared<PointCloud>(means, colors), dataset_id);
+
+    const NodeId camera_group_id = scene.addCameraGroup("Training", dataset_id, 2);
+    scene.addCamera("cam_a.png", camera_group_id, makeTestCamera(glm::vec3(-1.0f, 0.0f, 0.0f), 0));
+    scene.addCamera("cam_b.png", camera_group_id, makeTestCamera(glm::vec3(1.0f, 0.0f, 0.0f), 1));
+
+    const auto placement = estimateProjectionDomePlacement(scene);
+    EXPECT_NEAR(placement.center.x, 0.0f, 1e-5f);
+    EXPECT_NEAR(placement.center.y, 0.0f, 1e-5f);
+    EXPECT_NEAR(placement.center.z, 0.0f, 1e-5f);
+    EXPECT_NEAR(placement.radius, 20.0f, 1e-5f);
 }
 
 TEST(ProjectionDomeTest, BakeFailsClearlyWithoutUsableImages) {
@@ -179,6 +222,11 @@ TEST(ProjectionDomeTest, SkyMaskCreatesPointCloudOnDome) {
     nlohmann::json manifest;
     manifest["type"] = "projection_dome_sky_cubemap_mask";
     manifest["face_size"] = result->face_size;
+    manifest["dome_world"] = nlohmann::json::array();
+    const float* dome_world = &result->dome_world[0][0];
+    for (size_t i = 0; i < 16; ++i) {
+        manifest["dome_world"].push_back(dome_world[i]);
+    }
     manifest["faces"] = nlohmann::json::object();
     for (const auto& face : result->faces) {
         manifest["faces"][face.id] = {
@@ -192,6 +240,11 @@ TEST(ProjectionDomeTest, SkyMaskCreatesPointCloudOnDome) {
         std::ofstream file(manifest_path);
         file << manifest.dump(2);
     }
+
+    scene.setNodeTransform(
+        std::string(kProjectionDomeNodeName),
+        glm::translate(glm::mat4(1.0f), glm::vec3(100.0f, 100.0f, 100.0f)) *
+            glm::scale(glm::mat4(1.0f), glm::vec3(2.0f)));
 
     auto sky = createProjectionDomeSkyPointCloud(scene, ProjectionDomeSkyPointCloudOptions{
                                                            .manifest_path = manifest_path,

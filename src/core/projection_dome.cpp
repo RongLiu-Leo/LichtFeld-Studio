@@ -503,6 +503,28 @@ namespace lfs::core {
             return path;
         }
 
+        [[nodiscard]] std::optional<glm::mat4> readManifestMat4(const nlohmann::json& manifest,
+                                                                const std::string_view key) {
+            const std::string key_string(key);
+            if (!manifest.contains(key_string) || !manifest[key_string].is_array() ||
+                manifest[key_string].size() != 16) {
+                return std::nullopt;
+            }
+
+            glm::mat4 result(1.0f);
+            float* values = &result[0][0];
+            for (size_t i = 0; i < 16; ++i) {
+                if (!manifest[key_string][i].is_number()) {
+                    return std::nullopt;
+                }
+                values[i] = manifest[key_string][i].get<float>();
+                if (!std::isfinite(values[i])) {
+                    return std::nullopt;
+                }
+            }
+            return result;
+        }
+
         [[nodiscard]] glm::vec3 samplePreviewColor(const std::optional<LoadedImage>& preview,
                                                    const TextureImage& dome_texture,
                                                    const std::string_view face_id,
@@ -748,6 +770,47 @@ namespace lfs::core {
             }
         }
 
+        std::vector<glm::vec3> camera_points;
+        for (const auto* node : scene.getNodes()) {
+            if (!node || node->type != NodeType::CAMERA || !node->camera) {
+                continue;
+            }
+            if (const auto pose = readCameraPose(*node->camera)) {
+                camera_points.push_back(toParentLocal(scene, placement.parent_id,
+                                                      cameraWorldPosition(scene, *node, *pose)));
+            }
+        }
+
+        if (!camera_points.empty()) {
+            glm::vec3 camera_center(0.0f);
+            for (const glm::vec3& point : camera_points) {
+                camera_center += point;
+            }
+            camera_center /= static_cast<float>(camera_points.size());
+            placement.center = camera_center;
+
+            float camera_radius = 0.0f;
+            for (const glm::vec3& point : camera_points) {
+                camera_radius = std::max(camera_radius, glm::length(point - placement.center));
+            }
+
+            float camera_diameter = camera_radius * 2.0f;
+            if (camera_points.size() <= 2048u) {
+                for (size_t i = 0; i < camera_points.size(); ++i) {
+                    for (size_t j = i + 1u; j < camera_points.size(); ++j) {
+                        camera_diameter = std::max(camera_diameter,
+                                                   glm::length(camera_points[i] - camera_points[j]));
+                    }
+                }
+            }
+
+            // Use the camera navigation volume for sky placement. Sparse COLMAP point clouds
+            // often include sky/foreground outliers, and those should not push the dome to
+            // scene-bound distances.
+            placement.radius = std::max(camera_diameter * 10.0f, 1.0f);
+            return placement;
+        }
+
         float radius = 0.0f;
         const auto include_point = [&](const glm::vec3& point) {
             if (std::isfinite(point.x) && std::isfinite(point.y) && std::isfinite(point.z)) {
@@ -765,15 +828,6 @@ namespace lfs::core {
                             iz ? bounds_max.z : bounds_min.z));
                     }
                 }
-            }
-        }
-
-        for (const auto* node : scene.getNodes()) {
-            if (!node || node->type != NodeType::CAMERA || !node->camera) {
-                continue;
-            }
-            if (const auto pose = readCameraPose(*node->camera)) {
-                include_point(toParentLocal(scene, placement.parent_id, cameraWorldPosition(scene, *node, *pose)));
             }
         }
 
@@ -1027,6 +1081,7 @@ namespace lfs::core {
         ProjectionDomeSkyCubemapResult result;
         result.output_dir = options.output_dir;
         result.face_size = options.face_size;
+        result.dome_world = scene.getWorldTransform(node->id);
         result.faces.reserve(kCubemapFaces.size());
 
         for (const auto& face : kCubemapFaces) {
@@ -1296,7 +1351,8 @@ namespace lfs::core {
                 static_cast<double>(total_marked) /
                 static_cast<double>(std::max(1, options.max_gaussians))))));
 
-        const glm::mat4 dome_world = scene.getWorldTransform(node->id);
+        const glm::mat4 dome_world = readManifestMat4(manifest, "dome_world")
+                                         .value_or(scene.getWorldTransform(node->id));
         const TextureImage& dome_texture = node->mesh->texture_images.front();
 
         std::vector<float> positions;
