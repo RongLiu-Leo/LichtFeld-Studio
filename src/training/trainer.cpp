@@ -18,6 +18,7 @@
 #include "core/path_utils.hpp"
 #include "core/scene.hpp"
 #include "core/splat_data_transform.hpp"
+#include "core/tensor/internal/cuda_stream_context.hpp"
 #include "core/tensor/internal/gpu_slab_allocator.hpp"
 #include "core/tensor/internal/size_bucketed_pool.hpp"
 #include "io/cache_image_loader.hpp"
@@ -33,6 +34,7 @@
 #include "strategies/mcmc.hpp"
 #include "strategies/strategy_factory.hpp"
 #include "training/kernels/camera_loss_heatmap.cuh"
+#include "training/kernels/directional_background.hpp"
 #include "training/kernels/grad_alpha.hpp"
 #include "training/kernels/mrnf_kernels.hpp"
 
@@ -40,6 +42,7 @@
 #include <fstream>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
@@ -77,6 +80,90 @@ namespace lfs::training {
             return value != "0" && value != "false" && value != "FALSE" &&
                    value != "off" && value != "OFF" &&
                    value != "no" && value != "NO";
+        }
+
+        [[nodiscard]] float sky_color_confidence_cpu(const float r, const float g, const float b) {
+            const float rr = std::clamp(r, 0.0f, 1.0f);
+            const float gg = std::clamp(g, 0.0f, 1.0f);
+            const float bb = std::clamp(b, 0.0f, 1.0f);
+            const float maxc = std::max(rr, std::max(gg, bb));
+            const float minc = std::min(rr, std::min(gg, bb));
+            const float sat = maxc - minc;
+            const float luma = 0.2126f * rr + 0.7152f * gg + 0.0722f * bb;
+            if (luma < 0.08f || maxc < 0.12f) {
+                return 0.0f;
+            }
+
+            const auto smoothstep = [](const float edge0, const float edge1, const float x) {
+                const float t = std::clamp((x - edge0) / std::max(edge1 - edge0, 1.0e-6f), 0.0f, 1.0f);
+                return t * t * (3.0f - 2.0f * t);
+            };
+            const float warm_bias = std::max(rr - bb, gg - bb);
+            const float cool_or_neutral = 1.0f - smoothstep(0.04f, 0.18f, warm_bias);
+            const float bright_neutral =
+                smoothstep(0.40f, 0.70f, luma) *
+                (1.0f - smoothstep(0.12f, 0.36f, sat)) *
+                cool_or_neutral;
+            const float blue =
+                smoothstep(0.02f, 0.18f, bb - rr) *
+                smoothstep(0.02f, 0.16f, bb - gg) *
+                smoothstep(0.34f, 0.62f, bb);
+            const float green_reject =
+                smoothstep(0.02f, 0.18f, gg - std::max(rr, bb)) *
+                smoothstep(0.20f, 0.45f, gg);
+            const float dark_reject = 1.0f - smoothstep(0.10f, 0.28f, luma);
+            return std::clamp(std::max(bright_neutral, blue) * (1.0f - green_reject) * (1.0f - dark_reject),
+                              0.0f,
+                              1.0f);
+        }
+
+        [[nodiscard]] std::array<float, 3> sanitize_fallback_sky_color(std::array<float, 3> color) {
+            if (sky_color_confidence_cpu(color[0], color[1], color[2]) <= 0.08f) {
+                return {0.82f, 0.88f, 0.96f};
+            }
+            for (float& c : color) {
+                c = std::clamp(c, 0.02f, 0.98f);
+            }
+            return color;
+        }
+
+        [[nodiscard]] std::array<float, 3> estimate_sky_prefix_color(
+            const lfs::core::SplatData& model,
+            const std::array<float, 3>& fallback) {
+            const size_t prefix_count = std::min(model.frozen_means_prefix(), static_cast<size_t>(model.size()));
+            if (prefix_count == 0 || !model.sh0_raw().is_valid()) {
+                return sanitize_fallback_sky_color(fallback);
+            }
+
+            constexpr float kSHC0 = 0.28209479177387814f;
+            auto sh0_cpu = model.sh0_raw().slice(0, 0, static_cast<int64_t>(prefix_count)).cpu().contiguous();
+            const float* sh0 = sh0_cpu.ptr<float>();
+            std::array<double, 3> sum{0.0, 0.0, 0.0};
+            double weight_sum = 0.0;
+            for (size_t i = 0; i < prefix_count; ++i) {
+                const float r = std::clamp(sh0[i * 3 + 0] * kSHC0 + 0.5f, 0.0f, 1.0f);
+                const float g = std::clamp(sh0[i * 3 + 1] * kSHC0 + 0.5f, 0.0f, 1.0f);
+                const float b = std::clamp(sh0[i * 3 + 2] * kSHC0 + 0.5f, 0.0f, 1.0f);
+                const float confidence = sky_color_confidence_cpu(r, g, b);
+                if (confidence <= 0.08f) {
+                    continue;
+                }
+                const double weight = static_cast<double>(confidence * confidence);
+                sum[0] += weight * static_cast<double>(r);
+                sum[1] += weight * static_cast<double>(g);
+                sum[2] += weight * static_cast<double>(b);
+                weight_sum += weight;
+            }
+
+            if (weight_sum <= 1.0e-8) {
+                return sanitize_fallback_sky_color(fallback);
+            }
+
+            return sanitize_fallback_sky_color({
+                static_cast<float>(sum[0] / weight_sum),
+                static_cast<float>(sum[1] / weight_sum),
+                static_cast<float>(sum[2] / weight_sum),
+            });
         }
 
         [[nodiscard]] double bytes_to_mib(const size_t bytes) {
@@ -662,6 +749,9 @@ namespace lfs::training {
         bilateral_grid_.reset();
         ppisp_.reset();
         ppisp_controller_pool_.reset();
+        sky_lobe_prior_.reset();
+        sky_lobe_center_ = {};
+        sky_lobe_gate_buffer_ = {};
         sparsity_optimizer_.reset();
         evaluator_.reset();
 
@@ -1099,6 +1189,111 @@ namespace lfs::training {
             return {};
         } catch (const std::exception& e) {
             return std::unexpected(std::format("Failed to init PPISP controller pool: {}", e.what()));
+        }
+    }
+
+    bool Trainer::sky_lobe_prior_enabled() const {
+        return params_.optimization.sky_lobe_prior &&
+               strategy_ &&
+               strategy_->get_model().frozen_means_prefix() > 0 &&
+               (!params_.optimization.sky_mask_path.empty() ||
+                (sky_lobe_prior_ && sky_lobe_prior_->is_initialized()));
+    }
+
+    std::expected<void, std::string> Trainer::initialize_sky_lobe_prior() {
+        if (!sky_lobe_prior_enabled()) {
+            sky_lobe_prior_.reset();
+            sky_lobe_center_ = {};
+            sky_lobe_gate_buffer_ = {};
+            return {};
+        }
+
+        try {
+            if (!sky_lobe_prior_) {
+                sky_lobe_prior_ = std::make_unique<DirectionalBackground>();
+            }
+            const auto sky_base_color =
+                estimate_sky_prefix_color(strategy_->get_model(), params_.optimization.bg_color);
+            sky_lobe_prior_->ensure_initialized(
+                sky_base_color,
+                params_.optimization.sky_lobe_degree,
+                {0.0f, -1.0f, 0.0f});
+
+            lfs::core::Tensor center;
+            if (scene_) {
+                center = scene_->getSceneCenter();
+            }
+            if (!center.is_valid() || center.numel() < 3) {
+                auto& model = strategy_->get_model();
+                center = model.size() > 0
+                             ? model.means().mean({0}, false)
+                             : lfs::core::Tensor::zeros({3}, lfs::core::Device::CUDA);
+            }
+            if (center.device() != lfs::core::Device::CUDA) {
+                center = center.cuda();
+            }
+            sky_lobe_center_ = center.is_contiguous() ? center : center.contiguous();
+
+            LOG_INFO("Sky lobe prior enabled for {} frozen sky splats (degree={}, base_rgb=({:.2f}, {:.2f}, {:.2f}), lr={:.2e}, prefix_mix={:.3f} until iter {}, propagation={} until iter {})",
+                     strategy_->get_model().frozen_means_prefix(),
+                     params_.optimization.sky_lobe_degree,
+                     sky_base_color[0],
+                     sky_base_color[1],
+                     sky_base_color[2],
+                     params_.optimization.sky_lobe_lr,
+                     params_.optimization.sky_lobe_prefix_strength,
+                     params_.optimization.sky_lobe_prior_until,
+                     params_.optimization.sky_prefix_propagation ? "on" : "off",
+                     params_.optimization.sky_prefix_propagation_until);
+            return {};
+        } catch (const std::exception& e) {
+            return std::unexpected(std::format("Failed to init sky lobe prior: {}", e.what()));
+        }
+    }
+
+    void Trainer::maybe_apply_sky_lobe_prior(const int iter, lfs::core::SplatData& model) {
+        if (!sky_lobe_prior_ || !sky_lobe_prior_->is_initialized() ||
+            !sky_lobe_prior_enabled()) {
+            return;
+        }
+
+        const int prefix_count = static_cast<int>(std::min<size_t>(
+            model.frozen_means_prefix(),
+            model.size()));
+        if (prefix_count <= 0) {
+            return;
+        }
+
+        if (params_.optimization.sky_lobe_prior_until > 0 &&
+            iter <= params_.optimization.sky_lobe_prior_until &&
+            params_.optimization.sky_lobe_prefix_strength > 0.0f) {
+            const float phase = std::clamp(
+                static_cast<float>(iter) / static_cast<float>(std::max(1, params_.optimization.sky_lobe_prior_until)),
+                0.0f,
+                1.0f);
+            const float strength = params_.optimization.sky_lobe_prefix_strength * (1.0f - phase);
+            sky_lobe_prior_->apply_sky_prefix_prior(model, sky_lobe_center_, 0, prefix_count, strength);
+        }
+
+        if (params_.optimization.sky_prefix_propagation &&
+            params_.optimization.sky_prefix_propagation_until > 0 &&
+            iter <= params_.optimization.sky_prefix_propagation_until) {
+            const float phase = std::clamp(
+                static_cast<float>(iter) / static_cast<float>(std::max(1, params_.optimization.sky_prefix_propagation_until)),
+                0.0f,
+                1.0f);
+            const float bootstrap = iter <= 500 ? 1.5f : 1.0f;
+            const float decay = (1.0f - phase) * bootstrap;
+            sky_lobe_prior_->propagate_sky_prefix(
+                model,
+                sky_lobe_center_,
+                0,
+                prefix_count,
+                params_.optimization.sky_prefix_color_strength * decay,
+                params_.optimization.sky_prefix_opacity_strength * decay,
+                params_.optimization.sky_prefix_scale_strength * decay,
+                params_.optimization.sky_prefix_min_opacity,
+                std::max(1.0e-6f, model.get_scene_scale() * params_.optimization.sky_prefix_max_scale_factor));
         }
     }
 
@@ -1931,6 +2126,10 @@ namespace lfs::training {
                         params_.optimization.bg_mode = lfs::core::param::BackgroundMode::SolidColor;
                     }
                 }
+            }
+
+            if (auto result = initialize_sky_lobe_prior(); !result) {
+                return std::unexpected(result.error());
             }
 
             // Print configuration
@@ -2934,6 +3133,7 @@ namespace lfs::training {
                     lfs::core::Tensor tile_grad_alpha;
                     lfs::core::Tensor tile_error_map;
                     lfs::core::Tensor mask_tile;
+                    lfs::core::Tensor sky_gate_tile;
 
                     // 1) Compute photometric loss (populates ssim_map in workspace)
                     const bool use_mask = params_.optimization.mask_mode != lfs::core::param::MaskMode::None &&
@@ -2983,6 +3183,97 @@ namespace lfs::training {
                         tile_loss = result->loss;
                         tile_grad = result->grad_corrected;
                         tile_grad_raw = result->grad_raw;
+                    }
+
+                    const bool sky_prior_available =
+                        sky_lobe_prior_ &&
+                        sky_lobe_prior_->is_initialized() &&
+                        sky_lobe_prior_enabled() &&
+                        !in_sparsification;
+                    const int sky_guidance_until = std::max(
+                        params_.optimization.sky_lobe_prior_until,
+                        params_.optimization.sky_prefix_propagation_until);
+                    const bool sky_lobe_learning_active =
+                        sky_prior_available &&
+                        params_.optimization.sky_lobe_lr > 0.0f &&
+                        params_.optimization.sky_lobe_prior_until > 0 &&
+                        iter <= params_.optimization.sky_lobe_prior_until;
+                    const bool sky_foreground_guard_active =
+                        sky_prior_available &&
+                        sky_guidance_until > 0 &&
+                        iter <= sky_guidance_until;
+                    if (sky_lobe_learning_active || sky_foreground_guard_active) {
+                        try {
+                            lfs::core::Tensor gate_image = gt_tile;
+                            const bool was_uint8 = gate_image.dtype() == lfs::core::DataType::UInt8;
+                            if (gate_image.dtype() != lfs::core::DataType::Float32) {
+                                gate_image = gate_image.to(lfs::core::DataType::Float32);
+                            }
+                            if (was_uint8) {
+                                gate_image = gate_image.div(255.0f);
+                            }
+                            if (gate_image.device() != lfs::core::Device::CUDA) {
+                                gate_image = gate_image.cuda();
+                            }
+                            gate_image = gate_image.is_contiguous() ? gate_image : gate_image.contiguous();
+                            const cudaStream_t sky_stream = sky_lobe_prior_->lobe_logits().stream();
+                            gate_image.set_stream(sky_stream);
+
+                            const bool gate_is_chw = gate_image.ndim() == 3 && gate_image.shape()[0] == 3;
+                            const int gate_height = gate_is_chw
+                                                        ? static_cast<int>(gate_image.shape()[1])
+                                                        : static_cast<int>(gate_image.shape()[0]);
+                            const int gate_width = gate_is_chw
+                                                       ? static_cast<int>(gate_image.shape()[2])
+                                                       : static_cast<int>(gate_image.shape()[1]);
+                            const lfs::core::TensorShape gate_shape{
+                                static_cast<size_t>(gate_height),
+                                static_cast<size_t>(gate_width)};
+                            if (!sky_lobe_gate_buffer_.is_valid() || sky_lobe_gate_buffer_.shape() != gate_shape) {
+                                sky_lobe_gate_buffer_ = lfs::core::Tensor::empty(
+                                    gate_shape,
+                                    lfs::core::Device::CUDA,
+                                    lfs::core::DataType::Float32);
+                            }
+                            sky_lobe_gate_buffer_.set_stream(sky_stream);
+
+                            const auto [fx, fy, cx, cy] = cam->get_intrinsics();
+                            lfs::training::kernels::launch_compute_auto_sky_gate(
+                                gate_image.ptr<float>(),
+                                gate_is_chw,
+                                sky_lobe_gate_buffer_.ptr<float>(),
+                                gate_height,
+                                gate_width,
+                                full_height,
+                                full_width,
+                                tile_x_offset,
+                                tile_y_offset,
+                                fx,
+                                fy,
+                                cx,
+                                cy,
+                                cam->world_view_transform_ptr(),
+                                static_cast<int>(cam->camera_model_type()),
+                                params_.optimization.sky_lobe_gate_threshold,
+                                sky_stream);
+
+                            sky_gate_tile = sky_lobe_gate_buffer_;
+                            if (sky_lobe_learning_active) {
+                                sky_lobe_prior_->accumulate_target_gradient(
+                                    *cam,
+                                    gt_tile,
+                                    sky_lobe_gate_buffer_,
+                                    tile_x_offset,
+                                    tile_y_offset,
+                                    full_width,
+                                    full_height,
+                                    1.0f);
+                            }
+                        } catch (const std::exception& e) {
+                            nvtxRangePop();
+                            nvtxRangePop();
+                            return std::unexpected(std::format("Sky lobe prior failed: {}", e.what()));
+                        }
                     }
 
                     // 2) Extract error map from workspace's ssim_map
@@ -3055,6 +3346,28 @@ namespace lfs::training {
                                     ? mask_tile.to(lfs::core::DataType::Float32)
                                     : mask_tile;
                             tile_error_map.mul_(mask_for_error);
+                        }
+
+                        if (sky_gate_tile.is_valid() && sky_gate_tile.numel() > 0 &&
+                            tile_error_map.is_valid() && tile_error_map.ndim() == 2) {
+                            constexpr float kSkyForegroundErrorAttenuation = 0.85f;
+                            if (!tile_error_map.is_contiguous()) {
+                                tile_error_map = tile_error_map.contiguous();
+                            }
+                            const int error_height = static_cast<int>(tile_error_map.shape()[0]);
+                            const int error_width = static_cast<int>(tile_error_map.shape()[1]);
+                            if (sky_gate_tile.ndim() == 2 &&
+                                sky_gate_tile.shape()[0] == tile_error_map.shape()[0] &&
+                                sky_gate_tile.shape()[1] == tile_error_map.shape()[1]) {
+                                lfs::core::waitForCUDAStream(tile_error_map.stream(), sky_gate_tile.stream());
+                                lfs::training::kernels::launch_attenuate_sky_foreground_error_map(
+                                    tile_error_map.ptr<float>(),
+                                    sky_gate_tile.ptr<float>(),
+                                    error_height,
+                                    error_width,
+                                    kSkyForegroundErrorAttenuation,
+                                    tile_error_map.stream());
+                            }
                         }
                     }
 
@@ -3166,6 +3479,34 @@ namespace lfs::training {
                         raster_grad = raster_grad + tile_grad_raw;
                     }
 
+                    if (sky_gate_tile.is_valid() && sky_gate_tile.numel() > 0 &&
+                        raster_grad.is_valid() && raster_grad.ndim() == 3) {
+                        constexpr float kSkyForegroundGradientAttenuation = 0.70f;
+                        if (!raster_grad.is_contiguous()) {
+                            raster_grad = raster_grad.contiguous();
+                        }
+                        const bool grad_is_chw = raster_grad.shape()[0] == 3;
+                        const int grad_height = grad_is_chw
+                                                    ? static_cast<int>(raster_grad.shape()[1])
+                                                    : static_cast<int>(raster_grad.shape()[0]);
+                        const int grad_width = grad_is_chw
+                                                   ? static_cast<int>(raster_grad.shape()[2])
+                                                   : static_cast<int>(raster_grad.shape()[1]);
+                        if (sky_gate_tile.ndim() == 2 &&
+                            sky_gate_tile.shape()[0] == static_cast<size_t>(grad_height) &&
+                            sky_gate_tile.shape()[1] == static_cast<size_t>(grad_width)) {
+                            lfs::core::waitForCUDAStream(raster_grad.stream(), sky_gate_tile.stream());
+                            lfs::training::kernels::launch_attenuate_sky_foreground_rgb_gradient(
+                                raster_grad.ptr<float>(),
+                                grad_is_chw,
+                                sky_gate_tile.ptr<float>(),
+                                grad_height,
+                                grad_width,
+                                kSkyForegroundGradientAttenuation,
+                                raster_grad.stream());
+                        }
+                    }
+
                     nvtxRangePush("rasterize_backward");
                     if (gsplat_ctx) {
                         auto grad_alpha = tile_grad_alpha.is_valid()
@@ -3267,6 +3608,19 @@ namespace lfs::training {
                     ppisp_->zero_grad();
                     ppisp_->scheduler_step();
 
+                    nvtxRangePop();
+                }
+
+                if (sky_lobe_prior_ &&
+                    sky_lobe_prior_->is_initialized() &&
+                    sky_lobe_prior_enabled() &&
+                    params_.optimization.sky_lobe_lr > 0.0f &&
+                    params_.optimization.sky_lobe_prior_until > 0 &&
+                    iter <= params_.optimization.sky_lobe_prior_until &&
+                    !in_sparsification) {
+                    nvtxRangePush("sky_lobe_prior_step");
+                    sky_lobe_prior_->add_l2_gradient(params_.optimization.sky_lobe_smoothness);
+                    sky_lobe_prior_->optimizer_step(params_.optimization.sky_lobe_lr);
                     nvtxRangePop();
                 }
             }
@@ -3375,6 +3729,8 @@ namespace lfs::training {
                     if (!freeze_gaussians) {
                         strategy_->step(iter);
                     }
+
+                    maybe_apply_sky_lobe_prior(iter, model);
 
                     if (sparsity_optimizer_ &&
                         sparsity_optimizer_->is_initialized() &&
@@ -3828,7 +4184,8 @@ namespace lfs::training {
 
         if (save_checkpoint_file) {
             auto ckpt_result = lfs::training::save_checkpoint(save_path, iter_num, *strategy_, params_,
-                                                              bilateral_grid_.get(), ppisp_.get(), controller_to_save);
+                                                              bilateral_grid_.get(), ppisp_.get(), controller_to_save,
+                                                              sky_lobe_prior_.get());
             if (!ckpt_result) {
                 LOG_WARN("Failed to save checkpoint: {}", ckpt_result.error());
             }
@@ -3861,7 +4218,8 @@ namespace lfs::training {
         PPISPControllerPool* controller_to_save = controller_pool_for_save(iteration);
 
         return lfs::training::save_checkpoint(params_.dataset.output_path, iteration, *strategy_, params_,
-                                              bilateral_grid_.get(), ppisp_.get(), controller_to_save);
+                                              bilateral_grid_.get(), ppisp_.get(), controller_to_save,
+                                              sky_lobe_prior_.get());
     }
 
     std::expected<void, std::string> Trainer::save_checkpoint_to(const std::filesystem::path& output_path,
@@ -3873,7 +4231,8 @@ namespace lfs::training {
         PPISPControllerPool* controller_to_save = controller_pool_for_save(iteration);
 
         return lfs::training::save_checkpoint(output_path, iteration, *strategy_, params_,
-                                              bilateral_grid_.get(), ppisp_.get(), controller_to_save);
+                                              bilateral_grid_.get(), ppisp_.get(), controller_to_save,
+                                              sky_lobe_prior_.get());
     }
 
     lfs::core::Tensor Trainer::applyPPISPForViewport(const lfs::core::Tensor& rgb, const int camera_uid,
@@ -3944,6 +4303,13 @@ namespace lfs::training {
             return std::unexpected("Cannot load checkpoint: no strategy initialized");
         }
 
+        const auto checkpoint_header = lfs::core::load_checkpoint_header(checkpoint_path);
+        if (checkpoint_header &&
+            lfs::core::has_flag(checkpoint_header->flags, lfs::core::CheckpointFlags::HAS_DIRECTIONAL_BACKGROUND) &&
+            !sky_lobe_prior_) {
+            sky_lobe_prior_ = std::make_unique<DirectionalBackground>();
+        }
+
         // Create bilateral grid before loading if needed (checkpoint may contain grid state)
         if (params_.optimization.use_bilateral_grid && !bilateral_grid_) {
             if (auto init_result = initialize_bilateral_grid(); !init_result) {
@@ -3984,7 +4350,7 @@ namespace lfs::training {
 
         auto result = lfs::training::load_checkpoint(
             checkpoint_path, *strategy_, params_, bilateral_grid_.get(), ppisp_.get(),
-            ppisp_controller_pool_.get());
+            ppisp_controller_pool_.get(), sky_lobe_prior_.get());
         if (!result) {
             return result;
         }
@@ -3998,6 +4364,10 @@ namespace lfs::training {
             }
         }
         sync_strategy_optimization_params();
+
+        if (auto init_result = initialize_sky_lobe_prior(); !init_result) {
+            LOG_WARN("Failed to initialize sky lobe prior after checkpoint load: {}", init_result.error());
+        }
 
         current_iteration_ = *result;
 

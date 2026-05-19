@@ -1288,7 +1288,7 @@ NB_MODULE(lichtfeld, m) {
             return output;
         },
         nb::arg("manifest_path"),
-        nb::arg("max_gaussians") = 50000,
+        nb::arg("max_gaussians") = 250000,
         "Create/update the visible sky initialization preview from a saved sky mask manifest");
 
     m.def(

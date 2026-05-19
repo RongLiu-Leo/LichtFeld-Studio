@@ -89,11 +89,11 @@ namespace lfs::training {
         }
 
         int skyGaussianCap(const int max_cap, const size_t regular_count) {
-            constexpr int kDefaultSkyCap = 50'000;
+            constexpr int kDefaultSkyCap = 250'000;
             if (max_cap <= 0 || regular_count == 0) {
                 return kDefaultSkyCap;
             }
-            return std::max(1, std::min(kDefaultSkyCap, max_cap / 5));
+            return std::max(1, std::min(kDefaultSkyCap, max_cap / 10));
         }
 
         float pointCloudDiagonal(const lfs::core::PointCloud& point_cloud,
@@ -134,7 +134,7 @@ namespace lfs::training {
                 return;
             }
 
-            constexpr float kInitialOpacity = 0.02f;
+            constexpr float kInitialOpacity = 0.06f;
             const float safe_scale = std::max(initial_scale, 1.0e-4f);
             const float log_scale = std::log(safe_scale);
             const float raw_opacity = std::log(kInitialOpacity / (1.0f - kInitialOpacity));

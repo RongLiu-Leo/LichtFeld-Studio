@@ -95,7 +95,7 @@ namespace lfs::core {
         std::string node_name{std::string(kProjectionDomeNodeName)};
         std::filesystem::path manifest_path;
         glm::mat4 output_from_world{1.0f};
-        int max_gaussians = 50000;
+        int max_gaussians = 250000;
     };
 
     struct ProjectionDomeSkyPointCloudResult {

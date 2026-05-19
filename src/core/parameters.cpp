@@ -168,6 +168,20 @@ namespace lfs::core {
             if (!sky_mask_path.empty()) {
                 opt_json["sky_mask_path"] = path_to_utf8(sky_mask_path);
             }
+            opt_json["sky_lobe_prior"] = sky_lobe_prior;
+            opt_json["sky_lobe_degree"] = sky_lobe_degree;
+            opt_json["sky_lobe_lr"] = sky_lobe_lr;
+            opt_json["sky_lobe_smoothness"] = sky_lobe_smoothness;
+            opt_json["sky_lobe_prefix_strength"] = sky_lobe_prefix_strength;
+            opt_json["sky_lobe_prior_until"] = sky_lobe_prior_until;
+            opt_json["sky_lobe_gate_threshold"] = sky_lobe_gate_threshold;
+            opt_json["sky_prefix_propagation"] = sky_prefix_propagation;
+            opt_json["sky_prefix_color_strength"] = sky_prefix_color_strength;
+            opt_json["sky_prefix_opacity_strength"] = sky_prefix_opacity_strength;
+            opt_json["sky_prefix_scale_strength"] = sky_prefix_scale_strength;
+            opt_json["sky_prefix_min_opacity"] = sky_prefix_min_opacity;
+            opt_json["sky_prefix_max_scale_factor"] = sky_prefix_max_scale_factor;
+            opt_json["sky_prefix_propagation_until"] = sky_prefix_propagation_until;
 
             // Mask parameters
             static constexpr const char* MASK_MODE_NAMES[] = {"none", "segment", "ignore", "alpha_consistent"};
@@ -197,6 +211,30 @@ namespace lfs::core {
                 return "GUT and igs+ strategy cannot be used together";
             if (ppisp_freeze_from_sidecar && !use_ppisp)
                 return "PPISP sidecar freeze requires PPISP enabled";
+            if (sky_lobe_degree < 0 || sky_lobe_degree > 2)
+                return "sky_lobe_degree must be between 0 and 2";
+            if (sky_lobe_lr < 0.0f)
+                return "sky_lobe_lr must be non-negative";
+            if (sky_lobe_smoothness < 0.0f)
+                return "sky_lobe_smoothness must be non-negative";
+            if (sky_lobe_prefix_strength < 0.0f || sky_lobe_prefix_strength > 1.0f)
+                return "sky_lobe_prefix_strength must be in [0, 1]";
+            if (sky_lobe_prior_until < 0)
+                return "sky_lobe_prior_until must be non-negative";
+            if (sky_lobe_gate_threshold < 0.0f || sky_lobe_gate_threshold > 1.0f)
+                return "sky_lobe_gate_threshold must be in [0, 1]";
+            if (sky_prefix_color_strength < 0.0f || sky_prefix_color_strength > 1.0f)
+                return "sky_prefix_color_strength must be in [0, 1]";
+            if (sky_prefix_opacity_strength < 0.0f || sky_prefix_opacity_strength > 1.0f)
+                return "sky_prefix_opacity_strength must be in [0, 1]";
+            if (sky_prefix_scale_strength < 0.0f || sky_prefix_scale_strength > 1.0f)
+                return "sky_prefix_scale_strength must be in [0, 1]";
+            if (sky_prefix_min_opacity < 0.0f || sky_prefix_min_opacity >= 1.0f)
+                return "sky_prefix_min_opacity must be in [0, 1)";
+            if (sky_prefix_max_scale_factor <= 0.0f)
+                return "sky_prefix_max_scale_factor must be positive";
+            if (sky_prefix_propagation_until < 0)
+                return "sky_prefix_propagation_until must be non-negative";
             return {};
         }
 
@@ -472,6 +510,48 @@ namespace lfs::core {
             }
             if (json.contains("sky_mask_path")) {
                 params.sky_mask_path = utf8_to_path(json["sky_mask_path"].get<std::string>());
+            }
+            if (json.contains("sky_lobe_prior")) {
+                params.sky_lobe_prior = json["sky_lobe_prior"];
+            }
+            if (json.contains("sky_lobe_degree")) {
+                params.sky_lobe_degree = json["sky_lobe_degree"];
+            }
+            if (json.contains("sky_lobe_lr")) {
+                params.sky_lobe_lr = json["sky_lobe_lr"];
+            }
+            if (json.contains("sky_lobe_smoothness")) {
+                params.sky_lobe_smoothness = json["sky_lobe_smoothness"];
+            }
+            if (json.contains("sky_lobe_prefix_strength")) {
+                params.sky_lobe_prefix_strength = json["sky_lobe_prefix_strength"];
+            }
+            if (json.contains("sky_lobe_prior_until")) {
+                params.sky_lobe_prior_until = json["sky_lobe_prior_until"];
+            }
+            if (json.contains("sky_lobe_gate_threshold")) {
+                params.sky_lobe_gate_threshold = json["sky_lobe_gate_threshold"];
+            }
+            if (json.contains("sky_prefix_propagation")) {
+                params.sky_prefix_propagation = json["sky_prefix_propagation"];
+            }
+            if (json.contains("sky_prefix_color_strength")) {
+                params.sky_prefix_color_strength = json["sky_prefix_color_strength"];
+            }
+            if (json.contains("sky_prefix_opacity_strength")) {
+                params.sky_prefix_opacity_strength = json["sky_prefix_opacity_strength"];
+            }
+            if (json.contains("sky_prefix_scale_strength")) {
+                params.sky_prefix_scale_strength = json["sky_prefix_scale_strength"];
+            }
+            if (json.contains("sky_prefix_min_opacity")) {
+                params.sky_prefix_min_opacity = json["sky_prefix_min_opacity"];
+            }
+            if (json.contains("sky_prefix_max_scale_factor")) {
+                params.sky_prefix_max_scale_factor = json["sky_prefix_max_scale_factor"];
+            }
+            if (json.contains("sky_prefix_propagation_until")) {
+                params.sky_prefix_propagation_until = json["sky_prefix_propagation_until"];
             }
 
             // Mask parameters

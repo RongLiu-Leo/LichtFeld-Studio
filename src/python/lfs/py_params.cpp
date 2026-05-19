@@ -240,6 +240,48 @@ namespace lfs::python {
             .bool_prop(&OptimizationParameters::bg_modulation,
                        "bg_modulation", "BG Modulation", false,
                        "Enable sinusoidal background modulation")
+            .bool_prop(&OptimizationParameters::sky_lobe_prior,
+                       "sky_lobe_prior", "Sky Lobe Prior", true,
+                       "Learn a low-frequency sky color prior for frozen sky splats")
+            .int_prop(&OptimizationParameters::sky_lobe_degree,
+                      "sky_lobe_degree", "Sky Lobes", 2, 0, 2,
+                      "Sky lobe detail level")
+            .float_prop(&OptimizationParameters::sky_lobe_lr,
+                        "sky_lobe_lr", "Sky Lobe LR", 5e-3f, 0.0f, 1e-1f,
+                        "Learning rate for sky lobes")
+            .float_prop(&OptimizationParameters::sky_lobe_smoothness,
+                        "sky_lobe_smoothness", "Sky Smoothness", 1e-4f, 0.0f, 1e-2f,
+                        "Smoothness regularization for sky lobes")
+            .float_prop(&OptimizationParameters::sky_lobe_prefix_strength,
+                        "sky_lobe_prefix_strength", "Sky Prefix Mix", 0.01f, 0.0f, 0.1f,
+                        "Per-step blend strength applied to frozen sky prefix colors")
+            .int_prop(&OptimizationParameters::sky_lobe_prior_until,
+                      "sky_lobe_prior_until", "Sky Prior Until", 3000, 0, 30000,
+                      "Last iteration for frozen sky prefix color blending")
+            .float_prop(&OptimizationParameters::sky_lobe_gate_threshold,
+                        "sky_lobe_gate_threshold", "Sky Gate", 0.45f, 0.0f, 1.0f,
+                        "Auto sky-pixel confidence threshold")
+            .bool_prop(&OptimizationParameters::sky_prefix_propagation,
+                       "sky_prefix_propagation", "Sky Prefix Propagation", true,
+                       "Propagate healthy frozen sky splats into uncovered sky directions")
+            .float_prop(&OptimizationParameters::sky_prefix_color_strength,
+                        "sky_prefix_color_strength", "Sky Prop Color", 0.12f, 0.0f, 1.0f,
+                        "Per-step color blend for sky-prefix propagation")
+            .float_prop(&OptimizationParameters::sky_prefix_opacity_strength,
+                        "sky_prefix_opacity_strength", "Sky Prop Opacity", 0.08f, 0.0f, 1.0f,
+                        "Per-step opacity blend for sky-prefix propagation")
+            .float_prop(&OptimizationParameters::sky_prefix_scale_strength,
+                        "sky_prefix_scale_strength", "Sky Prop Scale", 0.04f, 0.0f, 1.0f,
+                        "Per-step scale blend for sky-prefix propagation")
+            .float_prop(&OptimizationParameters::sky_prefix_min_opacity,
+                        "sky_prefix_min_opacity", "Sky Min Opacity", 0.06f, 0.0f, 0.5f,
+                        "Minimum propagated sky-prefix opacity")
+            .float_prop(&OptimizationParameters::sky_prefix_max_scale_factor,
+                        "sky_prefix_max_scale_factor", "Sky Max Scale", 0.06f, 1e-4f, 0.5f,
+                        "Maximum sky-prefix scale as a fraction of scene scale")
+            .int_prop(&OptimizationParameters::sky_prefix_propagation_until,
+                      "sky_prefix_propagation_until", "Sky Prop Until", 8000, 0, 30000,
+                      "Last iteration for sky-prefix propagation")
             .bool_prop(&OptimizationParameters::headless,
                        "headless", "Headless", false,
                        "Run without visualization")
@@ -1223,6 +1265,76 @@ namespace lfs::python {
                     modify_params([&v](auto& p) { p.sky_mask_path = lfs::core::utf8_to_path(v); });
                 },
                 "Path to projection dome sky cubemap mask manifest")
+            .def_prop_rw(
+                "sky_lobe_prior",
+                [](PyOptimizationParams& self) { return self.params().sky_lobe_prior; },
+                [](PyOptimizationParams&, bool v) { modify_params([v](auto& p) { p.sky_lobe_prior = v; }); },
+                "Learn a low-frequency sky color prior for frozen sky splats")
+            .def_prop_rw(
+                "sky_lobe_degree",
+                [](PyOptimizationParams& self) { return self.params().sky_lobe_degree; },
+                [](PyOptimizationParams&, int v) { modify_params([v](auto& p) { p.sky_lobe_degree = v; }); },
+                "Sky lobe detail level")
+            .def_prop_rw(
+                "sky_lobe_lr",
+                [](PyOptimizationParams& self) { return self.params().sky_lobe_lr; },
+                [](PyOptimizationParams&, float v) { modify_params([v](auto& p) { p.sky_lobe_lr = v; }); },
+                "Learning rate for sky lobes")
+            .def_prop_rw(
+                "sky_lobe_smoothness",
+                [](PyOptimizationParams& self) { return self.params().sky_lobe_smoothness; },
+                [](PyOptimizationParams&, float v) { modify_params([v](auto& p) { p.sky_lobe_smoothness = v; }); },
+                "Smoothness regularization for sky lobes")
+            .def_prop_rw(
+                "sky_lobe_prefix_strength",
+                [](PyOptimizationParams& self) { return self.params().sky_lobe_prefix_strength; },
+                [](PyOptimizationParams&, float v) { modify_params([v](auto& p) { p.sky_lobe_prefix_strength = v; }); },
+                "Per-step blend strength applied to frozen sky prefix colors")
+            .def_prop_rw(
+                "sky_lobe_prior_until",
+                [](PyOptimizationParams& self) { return self.params().sky_lobe_prior_until; },
+                [](PyOptimizationParams&, int v) { modify_params([v](auto& p) { p.sky_lobe_prior_until = v; }); },
+                "Last iteration for frozen sky prefix color blending")
+            .def_prop_rw(
+                "sky_lobe_gate_threshold",
+                [](PyOptimizationParams& self) { return self.params().sky_lobe_gate_threshold; },
+                [](PyOptimizationParams&, float v) { modify_params([v](auto& p) { p.sky_lobe_gate_threshold = v; }); },
+                "Auto sky-pixel confidence threshold")
+            .def_prop_rw(
+                "sky_prefix_propagation",
+                [](PyOptimizationParams& self) { return self.params().sky_prefix_propagation; },
+                [](PyOptimizationParams&, bool v) { modify_params([v](auto& p) { p.sky_prefix_propagation = v; }); },
+                "Propagate healthy frozen sky splats into uncovered sky directions")
+            .def_prop_rw(
+                "sky_prefix_color_strength",
+                [](PyOptimizationParams& self) { return self.params().sky_prefix_color_strength; },
+                [](PyOptimizationParams&, float v) { modify_params([v](auto& p) { p.sky_prefix_color_strength = v; }); },
+                "Per-step color blend for sky-prefix propagation")
+            .def_prop_rw(
+                "sky_prefix_opacity_strength",
+                [](PyOptimizationParams& self) { return self.params().sky_prefix_opacity_strength; },
+                [](PyOptimizationParams&, float v) { modify_params([v](auto& p) { p.sky_prefix_opacity_strength = v; }); },
+                "Per-step opacity blend for sky-prefix propagation")
+            .def_prop_rw(
+                "sky_prefix_scale_strength",
+                [](PyOptimizationParams& self) { return self.params().sky_prefix_scale_strength; },
+                [](PyOptimizationParams&, float v) { modify_params([v](auto& p) { p.sky_prefix_scale_strength = v; }); },
+                "Per-step scale blend for sky-prefix propagation")
+            .def_prop_rw(
+                "sky_prefix_min_opacity",
+                [](PyOptimizationParams& self) { return self.params().sky_prefix_min_opacity; },
+                [](PyOptimizationParams&, float v) { modify_params([v](auto& p) { p.sky_prefix_min_opacity = v; }); },
+                "Minimum propagated sky-prefix opacity")
+            .def_prop_rw(
+                "sky_prefix_max_scale_factor",
+                [](PyOptimizationParams& self) { return self.params().sky_prefix_max_scale_factor; },
+                [](PyOptimizationParams&, float v) { modify_params([v](auto& p) { p.sky_prefix_max_scale_factor = v; }); },
+                "Maximum sky-prefix scale as a fraction of scene scale")
+            .def_prop_rw(
+                "sky_prefix_propagation_until",
+                [](PyOptimizationParams& self) { return self.params().sky_prefix_propagation_until; },
+                [](PyOptimizationParams&, int v) { modify_params([v](auto& p) { p.sky_prefix_propagation_until = v; }); },
+                "Last iteration for sky-prefix propagation")
             .def_prop_rw(
                 "random",
                 [](PyOptimizationParams& self) { return self.params().random; },

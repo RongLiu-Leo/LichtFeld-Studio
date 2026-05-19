@@ -8,18 +8,18 @@
 #include "core/image_io.hpp"
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
-#include <nlohmann/json.hpp>
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <fstream>
 #include <filesystem>
+#include <fstream>
 #include <glm/gtc/matrix_transform.hpp>
 #include <limits>
 #include <memory>
+#include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
 #include <tuple>
@@ -57,6 +57,32 @@ namespace lfs::core {
 
         [[nodiscard]] uint8_t toByte(const float value) {
             return static_cast<uint8_t>(std::clamp(value, 0.0f, 1.0f) * 255.0f + 0.5f);
+        }
+
+        [[nodiscard]] float smoothstep01(const float edge0, const float edge1, const float value) {
+            if (edge1 <= edge0) {
+                return value >= edge1 ? 1.0f : 0.0f;
+            }
+            const float t = std::clamp((value - edge0) / (edge1 - edge0), 0.0f, 1.0f);
+            return t * t * (3.0f - 2.0f * t);
+        }
+
+        [[nodiscard]] uint32_t hashSkyCell(const std::string_view face_id,
+                                           const int cell_x,
+                                           const int cell_y) {
+            uint32_t h = 2166136261u;
+            for (const char c : face_id) {
+                h ^= static_cast<uint8_t>(c);
+                h *= 16777619u;
+            }
+            h ^= static_cast<uint32_t>(cell_x) + 0x9e3779b9u + (h << 6u) + (h >> 2u);
+            h ^= static_cast<uint32_t>(cell_y) + 0x85ebca6bu + (h << 6u) + (h >> 2u);
+            h ^= h >> 16u;
+            h *= 0x7feb352du;
+            h ^= h >> 15u;
+            h *= 0x846ca68bu;
+            h ^= h >> 16u;
+            return h;
         }
 
         [[nodiscard]] std::vector<uint8_t> makePlaceholderTexture(int width, int height) {
@@ -525,13 +551,10 @@ namespace lfs::core {
             return result;
         }
 
-        [[nodiscard]] glm::vec3 samplePreviewColor(const std::optional<LoadedImage>& preview,
-                                                   const TextureImage& dome_texture,
-                                                   const std::string_view face_id,
-                                                   const int face_size,
-                                                   const int x,
-                                                   const int y,
-                                                   const glm::vec3& dir) {
+        [[nodiscard]] std::optional<glm::vec3> samplePreviewFaceColor(const std::optional<LoadedImage>& preview,
+                                                                      const int face_size,
+                                                                      const int x,
+                                                                      const int y) {
             if (preview && preview->width == face_size && preview->height == face_size &&
                 preview->channels >= 3 && !preview->pixels.empty()) {
                 const size_t idx = (static_cast<size_t>(y) * static_cast<size_t>(face_size) +
@@ -543,11 +566,77 @@ namespace lfs::core {
                     static_cast<float>(preview->pixels[idx + 2]) / 255.0f);
             }
 
-            (void)face_id;
-            if (dome_texture.width > 1 && dome_texture.height > 1 && !dome_texture.pixels.empty()) {
-                return sampleDomeTexture(dome_texture, dir);
+            return std::nullopt;
+        }
+
+        [[nodiscard]] std::optional<glm::vec3> sampleDomeSkyColor(const TextureImage& dome_texture,
+                                                                  const glm::vec3& dir) {
+            if (dome_texture.width <= 1 || dome_texture.height <= 1 || dome_texture.pixels.empty()) {
+                return std::nullopt;
             }
-            return glm::vec3(0.72f, 0.82f, 0.95f);
+            return sampleDomeTexture(dome_texture, dir);
+        }
+
+        [[nodiscard]] float skyColorConfidence(const glm::vec3& color) {
+            if (!std::isfinite(color.r) || !std::isfinite(color.g) || !std::isfinite(color.b)) {
+                return 0.0f;
+            }
+            const float r = std::clamp(color.r, 0.0f, 1.0f);
+            const float g = std::clamp(color.g, 0.0f, 1.0f);
+            const float b = std::clamp(color.b, 0.0f, 1.0f);
+            const float max_channel = std::max(r, std::max(g, b));
+            const float min_channel = std::min(r, std::min(g, b));
+            const float saturation = max_channel - min_channel;
+            const float luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+            if (luma < 0.08f || max_channel < 0.12f) {
+                return 0.0f;
+            }
+
+            const float warm_bias = std::max(r - b, g - b);
+            const float cool_or_neutral = 1.0f - smoothstep01(0.04f, 0.18f, warm_bias);
+            const float bright_neutral = smoothstep01(0.40f, 0.70f, luma) *
+                                         (1.0f - smoothstep01(0.12f, 0.36f, saturation)) *
+                                         cool_or_neutral;
+            const float blue = smoothstep01(0.02f, 0.18f, b - r) *
+                               smoothstep01(0.02f, 0.16f, b - g) *
+                               smoothstep01(0.34f, 0.62f, b);
+            const float green_reject = smoothstep01(0.02f, 0.18f, g - std::max(r, b)) *
+                                       smoothstep01(0.20f, 0.45f, g);
+            const float dark_reject = 1.0f - smoothstep01(0.10f, 0.28f, luma);
+            return std::clamp(std::max(bright_neutral, blue) * (1.0f - green_reject) * (1.0f - dark_reject),
+                              0.0f,
+                              1.0f);
+        }
+
+        [[nodiscard]] bool isUsableSkyColor(const glm::vec3& color) {
+            if (!std::isfinite(color.r) || !std::isfinite(color.g) || !std::isfinite(color.b)) {
+                return false;
+            }
+            const float luma = 0.2126f * color.r + 0.7152f * color.g + 0.0722f * color.b;
+            const float max_channel = std::max(color.r, std::max(color.g, color.b));
+            return luma > 0.08f && max_channel > 0.12f && skyColorConfidence(color) > 0.12f;
+        }
+
+        [[nodiscard]] glm::vec3 clampColor(const glm::vec3& color) {
+            return glm::vec3(std::clamp(color.r, 0.0f, 1.0f),
+                             std::clamp(color.g, 0.0f, 1.0f),
+                             std::clamp(color.b, 0.0f, 1.0f));
+        }
+
+        [[nodiscard]] glm::vec3 fallbackSkyGradient(const glm::vec3& dir) {
+            const float t = std::pow(std::clamp(skyElevation01(dir), 0.0f, 1.0f), 0.55f);
+            const glm::vec3 horizon(0.82f, 0.88f, 0.96f);
+            const glm::vec3 zenith(0.45f, 0.62f, 0.90f);
+            return glm::mix(horizon, zenith, t);
+        }
+
+        [[nodiscard]] glm::vec3 fallbackSkyColor(const glm::vec3& dir,
+                                                 const std::optional<glm::vec3>& dominant_color = std::nullopt) {
+            const glm::vec3 gradient = fallbackSkyGradient(dir);
+            if (!dominant_color) {
+                return gradient;
+            }
+            return glm::mix(gradient, clampColor(*dominant_color), 0.72f);
         }
 
         [[nodiscard]] std::optional<LoadedMask> loadCameraMask(const Camera& camera,
@@ -613,7 +702,8 @@ namespace lfs::core {
                                  std::vector<uint8_t>& filled,
                                  const int width,
                                  const int height,
-                                 const int iterations) {
+                                 const int iterations,
+                                 const std::vector<uint8_t>* domain = nullptr) {
             const auto index = [width](const int x, const int y) {
                 return static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x);
             };
@@ -627,6 +717,9 @@ namespace lfs::core {
                     for (int x = 0; x < width; ++x) {
                         const size_t dst = index(x, y);
                         if (filled[dst]) {
+                            continue;
+                        }
+                        if (domain && (dst >= domain->size() || (*domain)[dst] == 0)) {
                             continue;
                         }
 
@@ -651,6 +744,9 @@ namespace lfs::core {
                                 if (!filled[src]) {
                                     continue;
                                 }
+                                if (domain && (src >= domain->size() || (*domain)[src] == 0)) {
+                                    continue;
+                                }
                                 sum += color[src];
                                 ++count;
                             }
@@ -670,6 +766,206 @@ namespace lfs::core {
                     break;
                 }
             }
+        }
+
+        [[nodiscard]] float maskNeighborhoodCoverage(const std::vector<uint8_t>& domain,
+                                                     const int width,
+                                                     const int height,
+                                                     const int x,
+                                                     const int y,
+                                                     const int radius) {
+            int covered = 0;
+            int total = 0;
+            const auto index = [width](const int sx, const int sy) {
+                return static_cast<size_t>(sy) * static_cast<size_t>(width) + static_cast<size_t>(sx);
+            };
+
+            for (int dy = -radius; dy <= radius; ++dy) {
+                const int sy = y + dy;
+                if (sy < 0 || sy >= height) {
+                    total += radius * 2 + 1;
+                    continue;
+                }
+                for (int dx = -radius; dx <= radius; ++dx) {
+                    int sx = x + dx;
+                    if (sx < 0) {
+                        sx += width;
+                    } else if (sx >= width) {
+                        sx -= width;
+                    }
+                    ++total;
+                    const size_t idx = index(sx, sy);
+                    if (idx < domain.size() && domain[idx] != 0) {
+                        ++covered;
+                    }
+                }
+            }
+
+            return total > 0 ? static_cast<float>(covered) / static_cast<float>(total) : 0.0f;
+        }
+
+        struct SkyFaceColorMap {
+            std::vector<glm::vec3> color;
+            std::vector<uint8_t> filled;
+            int seeded_pixels = 0;
+            int rejected_pixels = 0;
+            int fallback_pixels = 0;
+        };
+
+        struct SkyColorStats {
+            glm::vec3 weighted_sum{0.0f};
+            float weight_sum = 0.0f;
+            int accepted_samples = 0;
+            int rejected_samples = 0;
+        };
+
+        void addSkyColorSample(SkyColorStats& stats, const glm::vec3& color) {
+            const float confidence = skyColorConfidence(color);
+            if (confidence <= 0.12f || !isUsableSkyColor(color)) {
+                ++stats.rejected_samples;
+                return;
+            }
+            const float weight = confidence * confidence;
+            stats.weighted_sum += clampColor(color) * weight;
+            stats.weight_sum += weight;
+            ++stats.accepted_samples;
+        }
+
+        void accumulateMaskedSkyColorSamples(SkyColorStats& stats,
+                                             const std::optional<LoadedImage>& preview,
+                                             const TextureImage& dome_texture,
+                                             const std::string_view face_id,
+                                             const std::vector<uint8_t>& mask,
+                                             const int face_size) {
+            for (int y = 0; y < face_size; ++y) {
+                const float b = 1.0f - 2.0f * (static_cast<float>(y) + 0.5f) / static_cast<float>(face_size);
+                for (int x = 0; x < face_size; ++x) {
+                    const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(face_size) + static_cast<size_t>(x);
+                    if (idx >= mask.size() || mask[idx] < 128) {
+                        continue;
+                    }
+                    const float a = 2.0f * (static_cast<float>(x) + 0.5f) / static_cast<float>(face_size) - 1.0f;
+                    const glm::vec3 dir = cubemapDirection(face_id, a, b);
+                    if (!isSkyDirection(dir)) {
+                        continue;
+                    }
+
+                    if (const auto preview_color = samplePreviewFaceColor(preview, face_size, x, y)) {
+                        addSkyColorSample(stats, *preview_color);
+                    }
+                    if (const auto dome_color = sampleDomeSkyColor(dome_texture, dir)) {
+                        addSkyColorSample(stats, *dome_color);
+                    }
+                }
+            }
+        }
+
+        [[nodiscard]] std::optional<glm::vec3> dominantSkyColor(const SkyColorStats& stats) {
+            if (stats.weight_sum <= 1.0e-6f || stats.accepted_samples <= 0) {
+                return std::nullopt;
+            }
+            const glm::vec3 color = clampColor(stats.weighted_sum / stats.weight_sum);
+            if (!isUsableSkyColor(color)) {
+                return std::nullopt;
+            }
+            return color;
+        }
+
+        [[nodiscard]] SkyFaceColorMap buildSkyFaceColorMap(
+            const std::optional<LoadedImage>& preview,
+            const TextureImage& dome_texture,
+            const std::string_view face_id,
+            const std::vector<uint8_t>& mask,
+            const int face_size,
+            const std::optional<glm::vec3>& dominant_sky_color) {
+            const size_t pixel_count = static_cast<size_t>(face_size) * static_cast<size_t>(face_size);
+            SkyFaceColorMap map;
+            map.color.assign(pixel_count, glm::vec3(0.0f));
+            map.filled.assign(pixel_count, 0);
+
+            std::vector<uint8_t> domain(pixel_count, 0);
+            for (int y = 0; y < face_size; ++y) {
+                const float b = 1.0f - 2.0f * (static_cast<float>(y) + 0.5f) / static_cast<float>(face_size);
+                for (int x = 0; x < face_size; ++x) {
+                    const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(face_size) + static_cast<size_t>(x);
+                    if (idx >= mask.size() || mask[idx] < 128) {
+                        continue;
+                    }
+                    const float a = 2.0f * (static_cast<float>(x) + 0.5f) / static_cast<float>(face_size) - 1.0f;
+                    const glm::vec3 dir = cubemapDirection(face_id, a, b);
+                    if (!isSkyDirection(dir)) {
+                        continue;
+                    }
+
+                    domain[idx] = 1;
+                }
+            }
+
+            for (int y = 0; y < face_size; ++y) {
+                const float b = 1.0f - 2.0f * (static_cast<float>(y) + 0.5f) / static_cast<float>(face_size);
+                for (int x = 0; x < face_size; ++x) {
+                    const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(face_size) + static_cast<size_t>(x);
+                    if (idx >= domain.size() || domain[idx] == 0) {
+                        continue;
+                    }
+                    const float a = 2.0f * (static_cast<float>(x) + 0.5f) / static_cast<float>(face_size) - 1.0f;
+                    const glm::vec3 dir = cubemapDirection(face_id, a, b);
+
+                    float best_confidence = 0.0f;
+                    glm::vec3 best_color(0.0f);
+                    bool has_candidate = false;
+
+                    if (const auto preview_color = samplePreviewFaceColor(preview, face_size, x, y)) {
+                        const float confidence = skyColorConfidence(*preview_color);
+                        if (confidence > best_confidence) {
+                            best_confidence = confidence;
+                            best_color = *preview_color;
+                            has_candidate = true;
+                        }
+                    }
+                    if (const auto dome_color = sampleDomeSkyColor(dome_texture, dir)) {
+                        const float confidence = skyColorConfidence(*dome_color);
+                        if (confidence > best_confidence) {
+                            best_confidence = confidence;
+                            best_color = *dome_color;
+                            has_candidate = true;
+                        }
+                    }
+
+                    const float interior = maskNeighborhoodCoverage(domain, face_size, face_size, x, y, 2);
+                    const float min_confidence = interior >= 0.82f ? 0.18f : 0.55f;
+                    if (!has_candidate || best_confidence < min_confidence || !isUsableSkyColor(best_color)) {
+                        ++map.rejected_pixels;
+                        continue;
+                    }
+
+                    const float sample_weight = smoothstep01(min_confidence, 0.78f, best_confidence);
+                    const glm::vec3 color = glm::mix(fallbackSkyColor(dir, dominant_sky_color), best_color, sample_weight);
+
+                    map.color[idx] = color;
+                    map.filled[idx] = 1;
+                    ++map.seeded_pixels;
+                }
+            }
+
+            fillProjectionHoles(map.color, map.filled, face_size, face_size, std::max(16, face_size / 2), &domain);
+
+            for (int y = 0; y < face_size; ++y) {
+                const float b = 1.0f - 2.0f * (static_cast<float>(y) + 0.5f) / static_cast<float>(face_size);
+                for (int x = 0; x < face_size; ++x) {
+                    const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(face_size) + static_cast<size_t>(x);
+                    if (idx >= domain.size() || domain[idx] == 0 || map.filled[idx]) {
+                        continue;
+                    }
+                    const float a = 2.0f * (static_cast<float>(x) + 0.5f) / static_cast<float>(face_size) - 1.0f;
+                    const glm::vec3 dir = cubemapDirection(face_id, a, b);
+                    map.color[idx] = fallbackSkyColor(dir, dominant_sky_color);
+                    map.filled[idx] = 1;
+                    ++map.fallback_pixels;
+                }
+            }
+
+            return map;
         }
 
     } // namespace
@@ -1094,12 +1390,12 @@ namespace lfs::core {
 
             if (options.overwrite_preview || !std::filesystem::exists(face_result.preview_path)) {
                 std::vector<uint8_t> preview(static_cast<size_t>(options.face_size) *
-                                             static_cast<size_t>(options.face_size) * 4u,
+                                                 static_cast<size_t>(options.face_size) * 4u,
                                              0);
 
                 for (int y = 0; y < options.face_size; ++y) {
                     const float b = 1.0f - 2.0f * (static_cast<float>(y) + 0.5f) /
-                                             static_cast<float>(options.face_size);
+                                               static_cast<float>(options.face_size);
                     for (int x = 0; x < options.face_size; ++x) {
                         const float a = 2.0f * (static_cast<float>(x) + 0.5f) /
                                             static_cast<float>(options.face_size) -
@@ -1134,7 +1430,7 @@ namespace lfs::core {
                 // it is cheap and independent of the saved preview.
                 for (int y = 0; y < options.face_size; ++y) {
                     const float b = 1.0f - 2.0f * (static_cast<float>(y) + 0.5f) /
-                                             static_cast<float>(options.face_size);
+                                               static_cast<float>(options.face_size);
                     for (int x = 0; x < options.face_size; ++x) {
                         const float a = 2.0f * (static_cast<float>(x) + 0.5f) /
                                             static_cast<float>(options.face_size) -
@@ -1297,16 +1593,22 @@ namespace lfs::core {
             return std::unexpected("Sky mask manifest is missing cubemap face data");
         }
 
+        const glm::mat4 dome_world = readManifestMat4(manifest, "dome_world")
+                                         .value_or(scene.getWorldTransform(node->id));
+        const TextureImage& dome_texture = node->mesh->texture_images.front();
+
         struct FaceInput {
             std::string id;
             std::filesystem::path mask_path;
             std::filesystem::path preview_path;
             std::vector<uint8_t> mask;
             std::optional<LoadedImage> preview;
+            SkyFaceColorMap color_map;
             int marked_pixels = 0;
         };
 
         std::vector<FaceInput> faces;
+        SkyColorStats masked_sky_stats;
         int total_marked = 0;
         const auto& faces_json = manifest["faces"];
         for (const auto& face_def : kCubemapFaces) {
@@ -1334,6 +1636,12 @@ namespace lfs::core {
             total_marked += face.marked_pixels;
             if (face.marked_pixels > 0) {
                 face.preview = loadRawImage(face.preview_path);
+                accumulateMaskedSkyColorSamples(masked_sky_stats,
+                                                face.preview,
+                                                dome_texture,
+                                                face.id,
+                                                face.mask,
+                                                face_size);
             }
             faces.push_back(std::move(face));
         }
@@ -1345,68 +1653,112 @@ namespace lfs::core {
             };
         }
 
+        const std::optional<glm::vec3> dominant_sky_color = dominantSkyColor(masked_sky_stats);
+        if (dominant_sky_color) {
+            LOG_INFO("Sky initialization dominant masked sky color rgb=({:.2f}, {:.2f}, {:.2f}) from {} confident samples ({} rejected)",
+                     dominant_sky_color->r,
+                     dominant_sky_color->g,
+                     dominant_sky_color->b,
+                     masked_sky_stats.accepted_samples,
+                     masked_sky_stats.rejected_samples);
+        } else {
+            LOG_INFO("Sky initialization found no confident masked sky color samples ({} rejected); using directional fallback",
+                     masked_sky_stats.rejected_samples);
+        }
+
+        for (FaceInput& face : faces) {
+            if (face.marked_pixels <= 0) {
+                continue;
+            }
+            face.color_map = buildSkyFaceColorMap(
+                face.preview,
+                dome_texture,
+                face.id,
+                face.mask,
+                face_size,
+                dominant_sky_color);
+            if (face.color_map.rejected_pixels > 0 || face.color_map.fallback_pixels > 0) {
+                LOG_INFO("Sky initialization propagated face {}: {} valid seeds, {} rejected samples, {} fallback pixels",
+                         face.id,
+                         face.color_map.seeded_pixels,
+                         face.color_map.rejected_pixels,
+                         face.color_map.fallback_pixels);
+            }
+        }
+
+        const double marked_to_target =
+            static_cast<double>(total_marked) /
+            static_cast<double>(std::max(1, options.max_gaussians));
         const int stride = std::max(
             1,
-            static_cast<int>(std::ceil(std::sqrt(
-                static_cast<double>(total_marked) /
-                static_cast<double>(std::max(1, options.max_gaussians))))));
-
-        const glm::mat4 dome_world = readManifestMat4(manifest, "dome_world")
-                                         .value_or(scene.getWorldTransform(node->id));
-        const TextureImage& dome_texture = node->mesh->texture_images.front();
+            static_cast<int>(std::floor(std::sqrt(std::max(1.0, marked_to_target)))));
+        LOG_INFO("Sky initialization sampling {} marked pixels toward {} gaussians with jittered stride {}",
+                 total_marked,
+                 options.max_gaussians,
+                 stride);
 
         std::vector<float> positions;
         std::vector<uint8_t> colors;
-        positions.reserve(static_cast<size_t>(std::min(total_marked, options.max_gaussians)) * 3u);
-        colors.reserve(static_cast<size_t>(std::min(total_marked, options.max_gaussians)) * 3u);
+        const size_t reserve_count = std::min(
+            static_cast<size_t>(total_marked),
+            static_cast<size_t>(std::max(1, options.max_gaussians)) * 2u);
+        positions.reserve(reserve_count * 3u);
+        colors.reserve(reserve_count * 3u);
 
         for (const FaceInput& face : faces) {
             if (face.marked_pixels <= 0) {
                 continue;
             }
 
-            for (int y = 0; y < face_size; ++y) {
-                if ((y % stride) != 0) {
-                    continue;
-                }
-                const float b = 1.0f - 2.0f * (static_cast<float>(y) + 0.5f) /
-                                         static_cast<float>(face_size);
-                for (int x = 0; x < face_size; ++x) {
-                    if ((x % stride) != 0) {
-                        continue;
-                    }
-                    const size_t mask_idx = static_cast<size_t>(y) *
-                                                static_cast<size_t>(face_size) +
-                                            static_cast<size_t>(x);
-                    if (face.mask[mask_idx] < 128) {
-                        continue;
-                    }
+            for (int y0 = 0; y0 < face_size; y0 += stride) {
+                const int y_span = std::min(stride, face_size - y0);
+                for (int x0 = 0; x0 < face_size; x0 += stride) {
+                    const int x_span = std::min(stride, face_size - x0);
+                    const int block_pixels = std::max(1, x_span * y_span);
+                    const uint32_t seed = hashSkyCell(face.id, x0 / stride, y0 / stride);
+                    const int start = static_cast<int>(seed % static_cast<uint32_t>(block_pixels));
 
-                    const float a = 2.0f * (static_cast<float>(x) + 0.5f) /
-                                        static_cast<float>(face_size) -
-                                    1.0f;
-                    const glm::vec3 dir = cubemapDirection(face.id, a, b);
-                    if (!isSkyDirection(dir)) {
-                        continue;
-                    }
+                    bool emitted = false;
+                    for (int attempt = 0; attempt < block_pixels && !emitted; ++attempt) {
+                        const int local = (start + attempt) % block_pixels;
+                        const int x = x0 + (local % x_span);
+                        const int y = y0 + (local / x_span);
+                        const size_t mask_idx = static_cast<size_t>(y) *
+                                                    static_cast<size_t>(face_size) +
+                                                static_cast<size_t>(x);
+                        if (face.mask[mask_idx] < 128) {
+                            continue;
+                        }
 
-                    const glm::vec3 world_point =
-                        glm::vec3(dome_world * glm::vec4(dir, 1.0f));
-                    const glm::vec3 output_point =
-                        glm::vec3(options.output_from_world * glm::vec4(world_point, 1.0f));
-                    if (!std::isfinite(output_point.x) ||
-                        !std::isfinite(output_point.y) ||
-                        !std::isfinite(output_point.z)) {
-                        continue;
-                    }
+                        const float a = 2.0f * (static_cast<float>(x) + 0.5f) /
+                                            static_cast<float>(face_size) -
+                                        1.0f;
+                        const float b = 1.0f - 2.0f * (static_cast<float>(y) + 0.5f) /
+                                               static_cast<float>(face_size);
+                        const glm::vec3 dir = cubemapDirection(face.id, a, b);
+                        if (!isSkyDirection(dir)) {
+                            continue;
+                        }
 
-                    const glm::vec3 color =
-                        samplePreviewColor(face.preview, dome_texture, face.id,
-                                           face_size, x, y, dir);
-                    positions.insert(positions.end(), {output_point.x, output_point.y, output_point.z});
-                    colors.push_back(toByte(color.r));
-                    colors.push_back(toByte(color.g));
-                    colors.push_back(toByte(color.b));
+                        const glm::vec3 world_point =
+                            glm::vec3(dome_world * glm::vec4(dir, 1.0f));
+                        const glm::vec3 output_point =
+                            glm::vec3(options.output_from_world * glm::vec4(world_point, 1.0f));
+                        if (!std::isfinite(output_point.x) ||
+                            !std::isfinite(output_point.y) ||
+                            !std::isfinite(output_point.z)) {
+                            continue;
+                        }
+
+                        const glm::vec3 color = (mask_idx < face.color_map.color.size() && face.color_map.filled[mask_idx])
+                                                    ? face.color_map.color[mask_idx]
+                                                    : fallbackSkyColor(dir, dominant_sky_color);
+                        positions.insert(positions.end(), {output_point.x, output_point.y, output_point.z});
+                        colors.push_back(toByte(color.r));
+                        colors.push_back(toByte(color.g));
+                        colors.push_back(toByte(color.b));
+                        emitted = true;
+                    }
                 }
             }
         }

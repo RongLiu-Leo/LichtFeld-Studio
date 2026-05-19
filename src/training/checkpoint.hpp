@@ -37,6 +37,7 @@ namespace lfs::training {
     class BilateralGrid;
     class PPISP;
     class PPISPControllerPool;
+    class DirectionalBackground;
 
     /// Save complete training checkpoint
     std::expected<void, std::string> save_checkpoint(
@@ -46,7 +47,8 @@ namespace lfs::training {
         const lfs::core::param::TrainingParameters& params,
         const BilateralGrid* bilateral_grid = nullptr,
         const PPISP* ppisp = nullptr,
-        const PPISPControllerPool* ppisp_controller_pool = nullptr);
+        const PPISPControllerPool* ppisp_controller_pool = nullptr,
+        const DirectionalBackground* directional_background = nullptr);
 
     /// Load complete training checkpoint (strategy + optional appearance components)
     std::expected<int, std::string> load_checkpoint(
@@ -55,6 +57,7 @@ namespace lfs::training {
         lfs::core::param::TrainingParameters& params,
         BilateralGrid* bilateral_grid = nullptr,
         PPISP* ppisp = nullptr,
-        PPISPControllerPool* ppisp_controller_pool = nullptr);
+        PPISPControllerPool* ppisp_controller_pool = nullptr,
+        DirectionalBackground* directional_background = nullptr);
 
 } // namespace lfs::training

@@ -21,6 +21,7 @@ namespace lfs::core {
         HAS_BILATERAL_GRID = 1 << 0,
         HAS_PPISP = 1 << 1,
         HAS_PPISP_CONTROLLER = 1 << 2,
+        HAS_DIRECTIONAL_BACKGROUND = 1 << 3,
     };
 
     constexpr CheckpointFlags operator|(const CheckpointFlags a, const CheckpointFlags b) {

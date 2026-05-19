@@ -131,7 +131,21 @@ namespace lfs::core {
             BackgroundMode bg_mode = BackgroundMode::SolidColor; // Which background mode to use
             std::array<float, 3> bg_color = {0.0f, 0.0f, 0.0f};  // RGB background color [0-1]
             std::filesystem::path bg_image_path = {};            // Custom background image path
-            std::filesystem::path sky_mask_path = {};             // Cubemap sky mask manifest for dome/sphere initialization
+            std::filesystem::path sky_mask_path = {};            // Cubemap sky mask manifest for dome/sphere initialization
+            bool sky_lobe_prior = true;                          // Learn a low-frequency sky color prior for frozen dome/sphere splats
+            int sky_lobe_degree = 2;                             // Lobe detail: 0=48, 1=96, 2=192 lobes
+            float sky_lobe_lr = 5e-3f;                           // Adam learning rate for sky lobes
+            float sky_lobe_smoothness = 1e-4f;                   // Neighbor smoothness regularizer for sky lobes
+            float sky_lobe_prefix_strength = 0.01f;              // Per-step SH0 blend for the frozen sky prefix
+            int sky_lobe_prior_until = 3000;                     // Stop prefix blending after this iteration
+            float sky_lobe_gate_threshold = 0.45f;               // Auto sky-pixel confidence threshold
+            bool sky_prefix_propagation = true;                  // Propagate healthy sky-prefix splats into uncovered directions
+            float sky_prefix_color_strength = 0.12f;             // Per-step SH0 blend for sky-prefix neighbor propagation
+            float sky_prefix_opacity_strength = 0.08f;           // Per-step opacity blend for sky-prefix neighbor propagation
+            float sky_prefix_scale_strength = 0.04f;             // Per-step scale blend for sky-prefix neighbor propagation
+            float sky_prefix_min_opacity = 0.06f;                // Minimum propagated sky-prefix opacity
+            float sky_prefix_max_scale_factor = 0.06f;           // Maximum sky-prefix scale as a fraction of scene scale
+            int sky_prefix_propagation_until = 8000;             // Stop sky-prefix propagation after this iteration
 
             // Bilateral grid parameters
             bool use_bilateral_grid = false;

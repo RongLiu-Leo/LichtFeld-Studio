@@ -3,6 +3,7 @@
 
 #include "checkpoint.hpp"
 #include "components/bilateral_grid.hpp"
+#include "components/directional_background.hpp"
 #include "components/ppisp.hpp"
 #include "components/ppisp_controller_pool.hpp"
 #include "core/events.hpp"
@@ -58,7 +59,8 @@ namespace lfs::training {
         const lfs::core::param::TrainingParameters& params,
         const BilateralGrid* bilateral_grid,
         const PPISP* ppisp,
-        const PPISPControllerPool* ppisp_controller_pool) {
+        const PPISPControllerPool* ppisp_controller_pool,
+        const DirectionalBackground* directional_background) {
 
         try {
             // Validate input path
@@ -116,6 +118,12 @@ namespace lfs::training {
                 const size_t crf_size = ppisp->num_cameras() * 3 * 4 * sizeof(float) * 3;
                 ppisp_bytes = exp_size + vig_size + color_size + crf_size;
             }
+            size_t directional_background_bytes = 0;
+            if (directional_background && directional_background->is_initialized()) {
+                directional_background_bytes =
+                    directional_background->lobe_dirs().bytes() +
+                    directional_background->lobe_logits().bytes() * 3;
+            }
 
             constexpr size_t OVERHEAD_BYTES = 64 * 1024;
 
@@ -124,6 +132,7 @@ namespace lfs::training {
                                           optimizer_bytes +
                                           bilateral_grid_bytes +
                                           ppisp_bytes +
+                                          directional_background_bytes +
                                           OVERHEAD_BYTES;
 
             if (auto space_check = lfs::io::check_disk_space(checkpoint_path, estimated_size, 1.1f);
@@ -160,6 +169,8 @@ namespace lfs::training {
                 header.flags = header.flags | CheckpointFlags::HAS_PPISP;
             if (ppisp_controller_pool)
                 header.flags = header.flags | CheckpointFlags::HAS_PPISP_CONTROLLER;
+            if (directional_background && directional_background->is_initialized())
+                header.flags = header.flags | CheckpointFlags::HAS_DIRECTIONAL_BACKGROUND;
 
             const auto header_pos = file.tellp();
             file.write(reinterpret_cast<const char*>(&header), sizeof(header));
@@ -192,6 +203,13 @@ namespace lfs::training {
             if (ppisp_controller_pool) {
                 ppisp_controller_pool->serialize(file);
                 LOG_DEBUG("PPISP controller pool saved: {} cameras", ppisp_controller_pool->num_cameras());
+            }
+
+            // Directional sky lobes (if present)
+            if (directional_background && directional_background->is_initialized()) {
+                directional_background->serialize(file);
+                LOG_DEBUG("Directional sky lobes saved: {} lobes, step {}",
+                          directional_background->lobe_count(), directional_background->step());
             }
 
             // Training parameters as JSON
@@ -227,6 +245,8 @@ namespace lfs::training {
                 extras += ", +ppisp";
             if (ppisp_controller_pool)
                 extras += ", +ppisp_ctrl(" + std::to_string(ppisp_controller_pool->num_cameras()) + ")";
+            if (directional_background && directional_background->is_initialized())
+                extras += ", +sky_lobes(" + std::to_string(directional_background->lobe_count()) + ")";
             LOG_INFO("Checkpoint saved: {} ({} Gaussians, iter {}{})",
                      lfs::core::path_to_utf8(checkpoint_path), header.num_gaussians, iteration,
                      extras);
@@ -247,7 +267,8 @@ namespace lfs::training {
         lfs::core::param::TrainingParameters& params,
         BilateralGrid* bilateral_grid,
         PPISP* ppisp,
-        PPISPControllerPool* ppisp_controller_pool) {
+        PPISPControllerPool* ppisp_controller_pool,
+        DirectionalBackground* directional_background) {
 
         try {
             std::ifstream file;
@@ -368,6 +389,21 @@ namespace lfs::training {
                 }
             } else if (ppisp_controller_pool) {
                 LOG_WARN("PPISP controller pool requested but not in checkpoint - using fresh state");
+            }
+
+            // Directional sky lobes (if present in checkpoint)
+            if (has_flag(header.flags, CheckpointFlags::HAS_DIRECTIONAL_BACKGROUND)) {
+                if (directional_background) {
+                    directional_background->deserialize(file);
+                    LOG_INFO("Directional sky lobes restored: {} lobes, step {}",
+                             directional_background->lobe_count(), directional_background->step());
+                } else {
+                    LOG_WARN("Checkpoint has directional sky lobes but none provided - skipping data");
+                    DirectionalBackground temp;
+                    temp.deserialize(file);
+                }
+            } else if (directional_background) {
+                LOG_WARN("Directional sky lobes requested but not in checkpoint - using fresh state");
             }
 
             // Reserve capacity for densification after the checkpoint params are resolved.

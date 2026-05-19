@@ -6,6 +6,7 @@
 
 #include "checkpoint.hpp"
 #include "components/bilateral_grid.hpp"
+#include "components/directional_background.hpp"
 #include "components/ppisp.hpp"
 #include "components/ppisp_controller_pool.hpp"
 #include "components/sparsity_optimizer.hpp"
@@ -314,6 +315,9 @@ namespace lfs::training {
         std::expected<void, std::string> initialize_bilateral_grid();
         std::expected<void, std::string> initialize_ppisp();
         std::expected<void, std::string> initialize_ppisp_controller();
+        std::expected<void, std::string> initialize_sky_lobe_prior();
+        void maybe_apply_sky_lobe_prior(int iter, lfs::core::SplatData& model);
+        [[nodiscard]] bool sky_lobe_prior_enabled() const;
         std::expected<void, std::string> apply_ppisp_sidecar_if_configured();
         std::expected<PPISPFileMetadata, std::string> build_ppisp_sidecar_metadata() const;
         struct PPISPSidecarMappings {
@@ -415,6 +419,11 @@ namespace lfs::training {
         // PPISP controller pool for novel view synthesis (Phase 2 distillation)
         // Shared CNN and per-camera FC weights for memory efficiency
         std::unique_ptr<PPISPControllerPool> ppisp_controller_pool_;
+
+        // Low-frequency learned sky color prior for frozen projection dome/sphere splats.
+        std::unique_ptr<DirectionalBackground> sky_lobe_prior_;
+        lfs::core::Tensor sky_lobe_center_;
+        lfs::core::Tensor sky_lobe_gate_buffer_;
 
         std::unique_ptr<ISparsityOptimizer> sparsity_optimizer_;
 

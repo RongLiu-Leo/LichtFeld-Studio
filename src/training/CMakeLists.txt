@@ -28,6 +28,7 @@ set(LFS_TRAINING_KERNEL_SOURCES
     kernels/densification_kernels.cu
     kernels/grad_alpha.cu
     kernels/image_kernels.cu
+    kernels/directional_background.cu
     components/sparsity_optimizer_kernels.cu
 )
 
@@ -84,6 +85,7 @@ set(TRAINING_NEW_SOURCES
     rasterization/gsplat_rasterizer.cpp
     rasterization/edge_rasterizer.cpp
     components/bilateral_grid.cpp
+    components/directional_background.cpp
     components/ppisp.cpp
     components/ppisp_controller.cu
     components/ppisp_controller_pool.cu
