@@ -6,9 +6,9 @@ import json
 import shutil
 import time
 from pathlib import Path
-from urllib.parse import quote
 
 import lichtfeld as lf
+from .rml_paths import rml_image_source
 from . import rml_widgets as w
 from .types import Panel
 
@@ -16,7 +16,6 @@ __lfs_panel_classes__ = ["SkyMarkerPanel"]
 __lfs_panel_ids__ = ["lfs.sky_marker"]
 
 _instance = None
-_RML_PATH_SAFE_CHARS = "/:._-~"
 ZOOM_MIN = 0.5
 ZOOM_MAX = 8.0
 
@@ -29,20 +28,6 @@ FACE_LABELS = {
     "pos_z": "+Z",
     "neg_z": "-Z",
 }
-
-
-def _encode_rml_path(path: Path | str, drive_source: Path | str | None = None) -> str:
-    text = str(path).replace("\\", "/")
-    if (
-        text.startswith("/")
-        and not text.startswith("//")
-        and not (len(text) >= 3 and text[0].isalpha() and text[1] == ":")
-        and drive_source is not None
-    ):
-        drive_text = str(drive_source).replace("\\", "/")
-        if len(drive_text) >= 3 and drive_text[0].isalpha() and drive_text[1] == ":":
-            text = drive_text[:2] + text
-    return quote(text, safe=_RML_PATH_SAFE_CHARS)
 
 
 def _absolute_path(path: Path | str, base: Path | None = None) -> Path:
@@ -232,7 +217,7 @@ class SkyMarkerPanel(Panel):
         path = Path(path)
         if not path.exists():
             return "none"
-        return f"image({_encode_rml_path(path, self._workspace)})"
+        return f"image({rml_image_source(path, self._workspace)})"
 
     def _active_face_size_style(self) -> str:
         size = max(1, int(round(self._face_size * self._zoom)))

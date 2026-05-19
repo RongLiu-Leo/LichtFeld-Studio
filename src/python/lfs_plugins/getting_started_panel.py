@@ -4,21 +4,17 @@
 
 import os
 import threading
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, urlparse
 
 import lichtfeld as lf
 from .http import urlopen
+from .rml_paths import rml_image_source
 from .types import Panel
 
 __lfs_panel_classes__ = ["GettingStartedPanel"]
 __lfs_panel_ids__ = ["lfs.getting_started"]
 
 _CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "lichtfeld-studio", "thumbnails")
-_RML_PATH_SAFE_CHARS = "/:._-~"
-
-
-def _encode_rml_path(path):
-    return quote(str(path), safe=_RML_PATH_SAFE_CHARS)
 
 
 def _extract_video_id(url):
@@ -124,4 +120,4 @@ class GettingStartedPanel(Panel):
                 continue
             body = card.query_selector(".card-body")
             if body:
-                body.set_property("decorator", f"image({_encode_rml_path(path)})")
+                body.set_property("decorator", f"image({rml_image_source(path)})")

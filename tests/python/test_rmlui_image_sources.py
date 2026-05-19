@@ -6,13 +6,9 @@ from importlib import import_module
 from pathlib import Path
 from threading import Lock
 from types import ModuleType, SimpleNamespace
-from urllib.parse import quote
 import sys
 
 import pytest
-
-
-_RML_PATH_SAFE_CHARS = "/:._-~"
 
 
 def _install_lf_stub(monkeypatch):
@@ -40,6 +36,7 @@ def panel_modules(monkeypatch):
         sys.path.insert(0, str(source_python))
 
     for module_name in [
+        "lfs_plugins.rml_paths",
         "lfs_plugins.sky_marker_panel",
         "lfs_plugins.image_preview_panel",
         "lfs_plugins.getting_started_panel",
@@ -51,18 +48,19 @@ def panel_modules(monkeypatch):
 
     image_preview = import_module("lfs_plugins.image_preview_panel")
     getting_started = import_module("lfs_plugins.getting_started_panel")
-    return image_preview, getting_started
+    rml_paths = import_module("lfs_plugins.rml_paths")
+    return image_preview, getting_started, rml_paths
 
 
 def test_preview_url_percent_encodes_image_paths(panel_modules, tmp_path):
-    image_preview, _ = panel_modules
+    image_preview, _, rml_paths = panel_modules
     panel = image_preview.ImagePreviewPanel()
     panel._last_training_params = (2, 3840, True)
 
     image_path = tmp_path / "Photogrammetry Sekal pipes" / "frame & sample(1).jpg"
     preview_url = panel._make_preview_url(image_path, cam_uid=9, thumb=256)
 
-    expected_path = quote(str(image_path), safe=_RML_PATH_SAFE_CHARS)
+    expected_path = rml_paths.encode_rml_query_path(image_path)
     assert preview_url.endswith(f"&path={expected_path}")
     assert str(image_path) not in preview_url
     assert "%20" in preview_url
@@ -107,7 +105,7 @@ class _DocumentStub:
 
 
 def test_image_preview_mask_decorator_escapes_paths(panel_modules, tmp_path):
-    image_preview, _ = panel_modules
+    image_preview, _, rml_paths = panel_modules
     panel = image_preview.ImagePreviewPanel()
 
     image_path = tmp_path / "images" / "scene image.jpg"
@@ -133,13 +131,13 @@ def test_image_preview_mask_decorator_escapes_paths(panel_modules, tmp_path):
 
     panel._update_main_image(panel._doc, has_images=True)
 
-    expected_mask = quote(str(mask_path), safe=_RML_PATH_SAFE_CHARS)
+    expected_mask = rml_paths.rml_image_source(mask_path)
     mask_img = panel._doc.get_element_by_id("mask-overlay")
     assert mask_img.properties["decorator"] == f"image({expected_mask})"
 
 
 def test_getting_started_panel_escapes_thumbnail_paths(panel_modules, tmp_path):
-    _, getting_started = panel_modules
+    _, getting_started, rml_paths = panel_modules
     panel = getting_started.GettingStartedPanel()
     thumb_path = tmp_path / "thumb cache" / "video & thumb(1).jpg"
 
@@ -154,34 +152,43 @@ def test_getting_started_panel_escapes_thumbnail_paths(panel_modules, tmp_path):
     doc = _DocumentStub({"card-intro": card})
     panel.on_update(doc)
 
-    expected_thumb = quote(str(thumb_path), safe=_RML_PATH_SAFE_CHARS)
+    expected_thumb = rml_paths.rml_image_source(thumb_path)
     assert body.properties["decorator"] == f"image({expected_thumb})"
 
 
 def test_sky_marker_image_source_handles_windows_paths(panel_modules):
-    sky_marker = import_module("lfs_plugins.sky_marker_panel")
+    _, _, rml_paths = panel_modules
 
-    source = sky_marker._encode_rml_path(
+    source = rml_paths.rml_image_source(
         r"C:\Users\Utilisateur\scene output\projection_dome\sky_cubemap\sky_preview_pos_z.png"
     )
 
     assert source == (
-        "C:/Users/Utilisateur/scene%20output/projection_dome/"
+        "file:///C:/Users/Utilisateur/scene%20output/projection_dome/"
         "sky_cubemap/sky_preview_pos_z.png"
     )
     assert "%5C" not in source
 
 
 def test_sky_marker_image_source_uses_workspace_drive_for_root_relative_windows_paths(panel_modules):
-    sky_marker = import_module("lfs_plugins.sky_marker_panel")
+    _, _, rml_paths = panel_modules
 
-    source = sky_marker._encode_rml_path(
+    source = rml_paths.rml_image_source(
         r"\temp\gs_tests\kapel\output\projection_dome\sky_cubemap\sky_overlay_neg_z_ui_6.png",
         r"D:\temp\gs_tests\kapel\output\projection_dome\sky_cubemap",
     )
 
     assert source == (
-        "D:/temp/gs_tests/kapel/output/projection_dome/"
+        "file:///D:/temp/gs_tests/kapel/output/projection_dome/"
         "sky_cubemap/sky_overlay_neg_z_ui_6.png"
     )
     assert "%5C" not in source
+
+
+def test_direct_image_sources_use_file_uri_for_posix_paths(panel_modules, tmp_path):
+    _, _, rml_paths = panel_modules
+
+    source = rml_paths.rml_image_source(tmp_path / "sky cubemap" / "sky preview.png")
+
+    assert source.startswith("file:///")
+    assert "%20" in source
