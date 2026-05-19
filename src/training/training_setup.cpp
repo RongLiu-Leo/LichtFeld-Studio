@@ -4,6 +4,7 @@
 
 #include "training_setup.hpp"
 #include "core/events.hpp"
+#include "core/image_io.hpp"
 #include "core/logger.hpp"
 #include "core/mesh_data.hpp"
 #include "core/path_utils.hpp"
@@ -15,11 +16,19 @@
 #include "dataset.hpp"
 #include "io/loader.hpp"
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <fstream>
 #include <format>
 #include <glm/geometric.hpp>
 #include <glm/gtc/matrix_inverse.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <nlohmann/json.hpp>
+#include <optional>
+#include <string>
+#include <tuple>
 #include <vector>
 
 namespace lfs::training {
@@ -86,6 +95,425 @@ namespace lfs::training {
             }
             target.means = lfs::core::Tensor::cat({prefix.means.cpu(), target.means.cpu()}, 0);
             target.colors = lfs::core::Tensor::cat({prefix.colors.cpu(), target.colors.cpu()}, 0);
+        }
+
+        void appendPointCloud(lfs::core::PointCloud& target,
+                              const lfs::core::PointCloud& suffix) {
+            if (suffix.size() <= 0) {
+                return;
+            }
+            if (target.size() <= 0) {
+                target = lfs::core::PointCloud(suffix.means.cpu(), suffix.colors.cpu());
+                return;
+            }
+            target.means = lfs::core::Tensor::cat({target.means.cpu(), suffix.means.cpu()}, 0);
+            target.colors = lfs::core::Tensor::cat({target.colors.cpu(), suffix.colors.cpu()}, 0);
+        }
+
+        struct DomeProjectionCleanupResult {
+            lfs::core::PointCloud regular_point_cloud;
+            lfs::core::PointCloud projected_sky_point_cloud;
+            size_t projected_sky_points = 0;
+            size_t masked_sky_points = 0;
+            size_t preserved_masked_non_sky_points = 0;
+            size_t clamped_regular_points = 0;
+            size_t dropped_invalid_points = 0;
+        };
+
+        struct SkyMaskFaceLookup {
+            std::string id;
+            std::vector<uint8_t> mask;
+        };
+
+        struct SkyMaskLookup {
+            int face_size = 0;
+            int marked_pixels = 0;
+            std::vector<SkyMaskFaceLookup> faces;
+        };
+
+        uint8_t colorToByte(const float value) {
+            return static_cast<uint8_t>(std::clamp(value, 0.0f, 1.0f) * 255.0f + 0.5f);
+        }
+
+        bool colorHasInformation(const glm::vec3& color) {
+            if (!std::isfinite(color.r) || !std::isfinite(color.g) || !std::isfinite(color.b)) {
+                return false;
+            }
+            const float r = std::clamp(color.r, 0.0f, 1.0f);
+            const float g = std::clamp(color.g, 0.0f, 1.0f);
+            const float b = std::clamp(color.b, 0.0f, 1.0f);
+            const float max_channel = std::max(r, std::max(g, b));
+            const float luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+            return luma > 0.08f && max_channel > 0.10f;
+        }
+
+        glm::vec3 pointColorRgb(const uint8_t* colors_ptr, const size_t index) {
+            return glm::vec3(
+                static_cast<float>(colors_ptr[index * 3u + 0u]) / 255.0f,
+                static_cast<float>(colors_ptr[index * 3u + 1u]) / 255.0f,
+                static_cast<float>(colors_ptr[index * 3u + 2u]) / 255.0f);
+        }
+
+        bool pointColorMatchesDominantSky(const glm::vec3& color,
+                                          const std::optional<glm::vec3>& dominant_color,
+                                          const float dominant_color_radius) {
+            if (!dominant_color || dominant_color_radius <= 0.0f || !colorHasInformation(color)) {
+                return false;
+            }
+            const glm::vec3 dominant = glm::clamp(*dominant_color, glm::vec3(0.0f), glm::vec3(1.0f));
+            const glm::vec3 clamped = glm::clamp(color, glm::vec3(0.0f), glm::vec3(1.0f));
+            const float luma = 0.2126f * clamped.r + 0.7152f * clamped.g + 0.0722f * clamped.b;
+            const float dominant_luma = 0.2126f * dominant.r + 0.7152f * dominant.g + 0.0722f * dominant.b;
+            const float distance = glm::length(glm::clamp(color, glm::vec3(0.0f), glm::vec3(1.0f)) -
+                                               dominant);
+            const float tolerance = std::clamp(dominant_color_radius, 0.10f, 0.45f);
+            return distance <= tolerance && std::abs(luma - dominant_luma) <= std::max(0.18f, tolerance);
+        }
+
+        std::filesystem::path resolveSkyMaskManifestPath(const std::filesystem::path& manifest_path,
+                                                         const nlohmann::json& value) {
+            if (!value.is_string()) {
+                return {};
+            }
+            std::filesystem::path path = lfs::core::utf8_to_path(value.get<std::string>());
+            if (path.is_relative()) {
+                path = manifest_path.parent_path() / path;
+            }
+            return path;
+        }
+
+        std::vector<uint8_t> loadSkyMaskPixels(const std::filesystem::path& mask_path,
+                                               const int face_size) {
+            const size_t pixel_count = static_cast<size_t>(face_size) * static_cast<size_t>(face_size);
+            std::vector<uint8_t> mask(pixel_count, 0);
+            if (mask_path.empty() || !std::filesystem::exists(mask_path)) {
+                return mask;
+            }
+
+            unsigned char* data = nullptr;
+            int width = 0;
+            int height = 0;
+            int channels = 0;
+            try {
+                std::tie(data, width, height, channels) = lfs::core::load_image(mask_path, -1, 0);
+            } catch (const std::exception& e) {
+                LOG_WARN("Sky mask lookup skipped '{}': {}", lfs::core::path_to_utf8(mask_path), e.what());
+                return mask;
+            }
+
+            if (!data || width != face_size || height != face_size || channels < 1) {
+                if (data) {
+                    lfs::core::free_image(data);
+                }
+                return mask;
+            }
+
+            for (size_t idx = 0; idx < pixel_count; ++idx) {
+                mask[idx] = data[idx * static_cast<size_t>(channels)] >= 128 ? 255 : 0;
+            }
+            lfs::core::free_image(data);
+            return mask;
+        }
+
+        SkyMaskLookup loadSkyMaskLookup(const std::filesystem::path& manifest_path) {
+            SkyMaskLookup lookup;
+            if (manifest_path.empty() || !std::filesystem::exists(manifest_path)) {
+                return lookup;
+            }
+
+            nlohmann::json manifest;
+            try {
+                std::ifstream file(manifest_path);
+                if (!file) {
+                    return lookup;
+                }
+                file >> manifest;
+            } catch (const std::exception& e) {
+                LOG_WARN("Failed to parse sky mask lookup '{}': {}",
+                         lfs::core::path_to_utf8(manifest_path),
+                         e.what());
+                return lookup;
+            }
+
+            lookup.face_size = manifest.value("face_size", 0);
+            if (lookup.face_size < 16 || !manifest.contains("faces") || !manifest["faces"].is_object()) {
+                lookup.face_size = 0;
+                return lookup;
+            }
+
+            constexpr std::array<std::string_view, 6> kFaces{
+                "pos_x", "neg_x", "neg_y", "pos_y", "pos_z", "neg_z"};
+            lookup.faces.reserve(kFaces.size());
+            for (const std::string_view face_id : kFaces) {
+                const std::string id(face_id);
+                if (!manifest["faces"].contains(id) || !manifest["faces"][id].is_object()) {
+                    continue;
+                }
+                const auto& face_json = manifest["faces"][id];
+                const std::filesystem::path mask_path =
+                    resolveSkyMaskManifestPath(manifest_path,
+                                               face_json.contains("mask") ? face_json["mask"] : nlohmann::json{});
+                auto mask = loadSkyMaskPixels(mask_path, lookup.face_size);
+                lookup.marked_pixels += static_cast<int>(std::count_if(mask.begin(), mask.end(), [](const uint8_t v) {
+                    return v >= 128;
+                }));
+                lookup.faces.push_back(SkyMaskFaceLookup{
+                    .id = id,
+                    .mask = std::move(mask),
+                });
+            }
+            return lookup;
+        }
+
+        const SkyMaskFaceLookup* findSkyMaskFace(const SkyMaskLookup& lookup, const std::string_view id) {
+            for (const auto& face : lookup.faces) {
+                if (face.id == id) {
+                    return &face;
+                }
+            }
+            return nullptr;
+        }
+
+        bool directionToSkyMaskPixel(const glm::vec3& dir,
+                                     std::string_view& face_id,
+                                     int& x,
+                                     int& y,
+                                     const int face_size) {
+            const glm::vec3 abs_dir(std::abs(dir.x), std::abs(dir.y), std::abs(dir.z));
+            float a = 0.0f;
+            float b = 0.0f;
+            float major = 0.0f;
+            if (abs_dir.x >= abs_dir.y && abs_dir.x >= abs_dir.z) {
+                major = std::max(abs_dir.x, 1.0e-6f);
+                if (dir.x >= 0.0f) {
+                    face_id = "pos_x";
+                    a = -dir.z / major;
+                } else {
+                    face_id = "neg_x";
+                    a = dir.z / major;
+                }
+                b = -dir.y / major;
+            } else if (abs_dir.y >= abs_dir.z) {
+                major = std::max(abs_dir.y, 1.0e-6f);
+                if (dir.y >= 0.0f) {
+                    face_id = "pos_y";
+                    a = dir.x / major;
+                    b = -dir.z / major;
+                } else {
+                    face_id = "neg_y";
+                    a = dir.x / major;
+                    b = dir.z / major;
+                }
+            } else {
+                major = std::max(abs_dir.z, 1.0e-6f);
+                if (dir.z >= 0.0f) {
+                    face_id = "pos_z";
+                    a = dir.x / major;
+                } else {
+                    face_id = "neg_z";
+                    a = -dir.x / major;
+                }
+                b = -dir.y / major;
+            }
+
+            if (!std::isfinite(a) || !std::isfinite(b) || face_size <= 0) {
+                return false;
+            }
+            x = std::clamp(static_cast<int>(std::floor((std::clamp(a, -1.0f, 1.0f) + 1.0f) *
+                                                       0.5f * static_cast<float>(face_size))),
+                           0,
+                           face_size - 1);
+            y = std::clamp(static_cast<int>(std::floor((1.0f - std::clamp(b, -1.0f, 1.0f)) *
+                                                       0.5f * static_cast<float>(face_size))),
+                           0,
+                           face_size - 1);
+            return true;
+        }
+
+        bool directionInSkyMask(const SkyMaskLookup& lookup, const glm::vec3& dir) {
+            if (lookup.face_size <= 0 || lookup.marked_pixels <= 0 || lookup.faces.empty()) {
+                return false;
+            }
+            std::string_view face_id;
+            int x = 0;
+            int y = 0;
+            if (!directionToSkyMaskPixel(dir, face_id, x, y, lookup.face_size)) {
+                return false;
+            }
+
+            const auto* face = findSkyMaskFace(lookup, face_id);
+            if (!face || face->mask.empty()) {
+                return false;
+            }
+
+            constexpr int kAbsorbRadius = 3;
+            for (int dy = -kAbsorbRadius; dy <= kAbsorbRadius; ++dy) {
+                const int yy = y + dy;
+                if (yy < 0 || yy >= lookup.face_size) {
+                    continue;
+                }
+                for (int dx = -kAbsorbRadius; dx <= kAbsorbRadius; ++dx) {
+                    const int xx = x + dx;
+                    if (xx < 0 || xx >= lookup.face_size) {
+                        continue;
+                    }
+                    const size_t idx = static_cast<size_t>(yy) * static_cast<size_t>(lookup.face_size) +
+                                       static_cast<size_t>(xx);
+                    if (idx < face->mask.size() && face->mask[idx] >= 128) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        std::array<uint8_t, 3> dominantSkyColorBytes(const std::optional<glm::vec3>& dominant_color) {
+            const glm::vec3 color = dominant_color.value_or(glm::vec3(0.82f, 0.88f, 0.96f));
+            return {
+                colorToByte(color.r),
+                colorToByte(color.g),
+                colorToByte(color.b),
+            };
+        }
+
+        lfs::core::Tensor pointCloudColorsAsUint8(const lfs::core::PointCloud& point_cloud) {
+            auto colors = point_cloud.colors.cpu();
+            if (colors.dtype() == lfs::core::DataType::UInt8) {
+                return colors.contiguous();
+            }
+            return colors.to(lfs::core::DataType::Float32)
+                .mul(255.0f)
+                .clamp(0.0f, 255.0f)
+                .to(lfs::core::DataType::UInt8)
+                .contiguous();
+        }
+
+        lfs::core::PointCloud makePointCloudFromVectors(std::vector<float>& means,
+                                                        std::vector<uint8_t>& colors) {
+            const size_t count = means.size() / 3u;
+            if (count == 0) {
+                return {};
+            }
+
+            auto means_tensor = lfs::core::Tensor::from_vector(means, {count, size_t{3}}, lfs::core::Device::CPU);
+            auto colors_tensor = lfs::core::Tensor::empty({count, size_t{3}},
+                                                          lfs::core::Device::CPU,
+                                                          lfs::core::DataType::UInt8);
+            std::memcpy(colors_tensor.data_ptr(), colors.data(), colors.size() * sizeof(uint8_t));
+            return lfs::core::PointCloud(std::move(means_tensor), std::move(colors_tensor));
+        }
+
+        DomeProjectionCleanupResult projectInitialPointCloudToDome(
+            const lfs::core::PointCloud& point_cloud,
+            const glm::mat4& model_world,
+            const glm::mat4& dome_world,
+            const SkyMaskLookup& sky_mask_lookup,
+            const std::optional<glm::vec3>& dominant_sky_color,
+            const float dominant_sky_color_radius) {
+            DomeProjectionCleanupResult result;
+            const size_t count = static_cast<size_t>(point_cloud.size());
+            if (count == 0) {
+                return result;
+            }
+
+            auto means_cpu = point_cloud.means.cpu().contiguous();
+            auto colors_cpu = pointCloudColorsAsUint8(point_cloud);
+            const float* means_ptr = means_cpu.ptr<float>();
+            const uint8_t* colors_ptr = colors_cpu.ptr<uint8_t>();
+
+            std::vector<float> regular_means;
+            std::vector<uint8_t> regular_colors;
+            std::vector<float> sky_means;
+            std::vector<uint8_t> sky_colors;
+            regular_means.reserve(count * 3u);
+            regular_colors.reserve(count * 3u);
+            sky_means.reserve(std::min<size_t>(count, 4096u) * 3u);
+            sky_colors.reserve(std::min<size_t>(count, 4096u) * 3u);
+
+            const glm::mat4 dome_from_world = glm::inverse(dome_world);
+            const glm::mat4 model_from_world = glm::inverse(model_world);
+            const auto sky_color = dominantSkyColorBytes(dominant_sky_color);
+
+            const auto push_regular = [&](const glm::vec3& p, const size_t i) {
+                regular_means.insert(regular_means.end(), {p.x, p.y, p.z});
+                regular_colors.insert(regular_colors.end(), {
+                    colors_ptr[i * 3u + 0u],
+                    colors_ptr[i * 3u + 1u],
+                    colors_ptr[i * 3u + 2u],
+                });
+            };
+            const auto push_sky = [&](const glm::vec3& p) {
+                sky_means.insert(sky_means.end(), {p.x, p.y, p.z});
+                sky_colors.insert(sky_colors.end(), {sky_color[0], sky_color[1], sky_color[2]});
+            };
+
+            for (size_t i = 0; i < count; ++i) {
+                const glm::vec3 model_point(
+                    means_ptr[i * 3u + 0u],
+                    means_ptr[i * 3u + 1u],
+                    means_ptr[i * 3u + 2u]);
+                if (!std::isfinite(model_point.x) ||
+                    !std::isfinite(model_point.y) ||
+                    !std::isfinite(model_point.z)) {
+                    ++result.dropped_invalid_points;
+                    continue;
+                }
+
+                const glm::vec3 world_point = glm::vec3(model_world * glm::vec4(model_point, 1.0f));
+                glm::vec3 dome_point = glm::vec3(dome_from_world * glm::vec4(world_point, 1.0f));
+                const float radius = glm::length(dome_point);
+                if (!std::isfinite(radius) || radius <= 1.0e-6f) {
+                    ++result.dropped_invalid_points;
+                    continue;
+                }
+
+                const glm::vec3 dir = dome_point / radius;
+                const bool marked_sky_direction = directionInSkyMask(sky_mask_lookup, dir);
+                const glm::vec3 point_color = pointColorRgb(colors_ptr, i);
+                const bool sky_colored_point = pointColorMatchesDominantSky(
+                    point_color,
+                    dominant_sky_color,
+                    dominant_sky_color_radius);
+                const bool outside_dome = radius > 1.001f;
+                if (!marked_sky_direction && !outside_dome) {
+                    push_regular(model_point, i);
+                    continue;
+                }
+                if (marked_sky_direction && !outside_dome && !sky_colored_point) {
+                    push_regular(model_point, i);
+                    ++result.preserved_masked_non_sky_points;
+                    continue;
+                }
+
+                const bool sky_half_space = dir.y <= 0.0f;
+                const bool project_to_sky_shell =
+                    (marked_sky_direction && sky_colored_point) ||
+                    (outside_dome && sky_half_space && sky_colored_point);
+                const glm::vec3 projected_dome = dir * (project_to_sky_shell ? 1.0f : 0.995f);
+                const glm::vec3 projected_world = glm::vec3(dome_world * glm::vec4(projected_dome, 1.0f));
+                const glm::vec3 projected_model = glm::vec3(model_from_world * glm::vec4(projected_world, 1.0f));
+                if (!std::isfinite(projected_model.x) ||
+                    !std::isfinite(projected_model.y) ||
+                    !std::isfinite(projected_model.z)) {
+                    ++result.dropped_invalid_points;
+                    continue;
+                }
+
+                if (project_to_sky_shell) {
+                    push_sky(projected_model);
+                    ++result.projected_sky_points;
+                    if (marked_sky_direction) {
+                        ++result.masked_sky_points;
+                    }
+                } else {
+                    push_regular(projected_model, i);
+                    ++result.clamped_regular_points;
+                }
+            }
+
+            result.regular_point_cloud = makePointCloudFromVectors(regular_means, regular_colors);
+            result.projected_sky_point_cloud = makePointCloudFromVectors(sky_means, sky_colors);
+            return result;
         }
 
         int skyGaussianCap(const int max_cap, const size_t regular_count) {
@@ -460,14 +888,38 @@ namespace lfs::training {
 
             if (sky_result->gaussian_count > 0) {
                 auto sky_point_cloud = std::move(sky_result->point_cloud);
+                if (const auto dome_id = lfs::core::findProjectionDome(scene)) {
+                    const glm::mat4 dome_world = scene.getWorldTransform(*dome_id);
+                    const SkyMaskLookup sky_mask_lookup = loadSkyMaskLookup(params.optimization.sky_mask_path);
+                    auto cleanup = projectInitialPointCloudToDome(
+                        point_cloud_to_use,
+                        model_world,
+                        dome_world,
+                        sky_mask_lookup,
+                        sky_result->dominant_color,
+                        sky_result->dominant_color_radius);
+                    if (cleanup.projected_sky_points > 0 || cleanup.preserved_masked_non_sky_points > 0 ||
+                        cleanup.clamped_regular_points > 0 ||
+                        cleanup.dropped_invalid_points > 0) {
+                        point_cloud_to_use = std::move(cleanup.regular_point_cloud);
+                        appendPointCloud(sky_point_cloud, cleanup.projected_sky_point_cloud);
+                        LOG_INFO("Projection dome cleaned initial SfM cloud: {} sky/outlier points projected to frozen shell ({} by painted mask), {} masked non-sky-colored points preserved, {} regular points clamped inside sphere, {} invalid points dropped",
+                                 cleanup.projected_sky_points,
+                                 cleanup.masked_sky_points,
+                                 cleanup.preserved_masked_non_sky_points,
+                                 cleanup.clamped_regular_points,
+                                 cleanup.dropped_invalid_points);
+                    }
+                }
                 frozen_sky_prefix = static_cast<size_t>(sky_point_cloud.size());
                 frozen_sky_initial_scale = skyInitialScale(point_cloud_to_use, sky_point_cloud);
 
                 if (max_cap > 0) {
                     const size_t cap = static_cast<size_t>(max_cap);
                     if (frozen_sky_prefix >= cap) {
+                        const size_t current_regular_count = static_cast<size_t>(point_cloud_to_use.size());
                         const size_t sky_keep =
-                            regular_point_count > 0 ? std::max<size_t>(1, cap / 5) : cap;
+                            current_regular_count > 0 ? std::max<size_t>(1, cap / 5) : cap;
                         sky_point_cloud = selectPointCloudRows(sky_point_cloud, std::min(frozen_sky_prefix, sky_keep));
                         frozen_sky_prefix = static_cast<size_t>(sky_point_cloud.size());
                         const size_t regular_cap = cap - frozen_sky_prefix;

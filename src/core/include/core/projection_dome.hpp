@@ -102,6 +102,9 @@ namespace lfs::core {
         PointCloud point_cloud;
         int marked_pixels = 0;
         int gaussian_count = 0;
+        std::optional<glm::vec3> dominant_color;
+        float dominant_color_radius = 0.0f;
+        int dominant_color_samples = 0;
     };
 
     [[nodiscard]] LFS_CORE_API std::shared_ptr<MeshData>

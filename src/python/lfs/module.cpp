@@ -1285,6 +1285,14 @@ NB_MODULE(lichtfeld, m) {
             output["node_name"] = preview_name;
             output["marked_pixels"] = result->marked_pixels;
             output["gaussian_count"] = result->gaussian_count;
+            if (result->dominant_color) {
+                output["dominant_color"] = nb::make_tuple(
+                    result->dominant_color->r,
+                    result->dominant_color->g,
+                    result->dominant_color->b);
+                output["dominant_color_radius"] = result->dominant_color_radius;
+                output["dominant_color_samples"] = result->dominant_color_samples;
+            }
             return output;
         },
         nb::arg("manifest_path"),

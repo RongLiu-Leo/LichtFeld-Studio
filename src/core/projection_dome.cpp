@@ -814,6 +814,7 @@ namespace lfs::core {
 
         struct SkyColorStats {
             glm::vec3 weighted_sum{0.0f};
+            glm::vec3 weighted_sq_sum{0.0f};
             float weight_sum = 0.0f;
             int accepted_samples = 0;
             int rejected_samples = 0;
@@ -826,7 +827,9 @@ namespace lfs::core {
                 return;
             }
             const float weight = confidence * confidence;
-            stats.weighted_sum += clampColor(color) * weight;
+            const glm::vec3 clamped = clampColor(color);
+            stats.weighted_sum += clamped * weight;
+            stats.weighted_sq_sum += clamped * clamped * weight;
             stats.weight_sum += weight;
             ++stats.accepted_samples;
         }
@@ -869,6 +872,16 @@ namespace lfs::core {
                 return std::nullopt;
             }
             return color;
+        }
+
+        [[nodiscard]] float dominantSkyColorRadius(const SkyColorStats& stats, const glm::vec3& mean) {
+            if (stats.weight_sum <= 1.0e-6f || stats.accepted_samples <= 0) {
+                return 0.0f;
+            }
+            const glm::vec3 second_moment = stats.weighted_sq_sum / stats.weight_sum;
+            const glm::vec3 variance = glm::max(second_moment - mean * mean, glm::vec3(0.0f));
+            const float rms_radius = std::sqrt(std::max(0.0f, variance.r + variance.g + variance.b));
+            return std::clamp(2.5f * rms_radius + 0.06f, 0.12f, 0.42f);
         }
 
         [[nodiscard]] SkyFaceColorMap buildSkyFaceColorMap(
@@ -1654,11 +1667,14 @@ namespace lfs::core {
         }
 
         const std::optional<glm::vec3> dominant_sky_color = dominantSkyColor(masked_sky_stats);
+        const float dominant_sky_radius =
+            dominant_sky_color ? dominantSkyColorRadius(masked_sky_stats, *dominant_sky_color) : 0.0f;
         if (dominant_sky_color) {
-            LOG_INFO("Sky initialization dominant masked sky color rgb=({:.2f}, {:.2f}, {:.2f}) from {} confident samples ({} rejected)",
+            LOG_INFO("Sky initialization dominant masked sky color rgb=({:.2f}, {:.2f}, {:.2f}), radius {:.3f} from {} confident samples ({} rejected)",
                      dominant_sky_color->r,
                      dominant_sky_color->g,
                      dominant_sky_color->b,
+                     dominant_sky_radius,
                      masked_sky_stats.accepted_samples,
                      masked_sky_stats.rejected_samples);
         } else {
@@ -1768,6 +1784,9 @@ namespace lfs::core {
             return ProjectionDomeSkyPointCloudResult{
                 .marked_pixels = total_marked,
                 .gaussian_count = 0,
+                .dominant_color = dominant_sky_color,
+                .dominant_color_radius = dominant_sky_radius,
+                .dominant_color_samples = masked_sky_stats.accepted_samples,
             };
         }
 
@@ -1802,6 +1821,9 @@ namespace lfs::core {
             .point_cloud = PointCloud(std::move(means), std::move(color_tensor)),
             .marked_pixels = total_marked,
             .gaussian_count = static_cast<int>(gaussian_count),
+            .dominant_color = dominant_sky_color,
+            .dominant_color_radius = dominant_sky_radius,
+            .dominant_color_samples = masked_sky_stats.accepted_samples,
         };
     }
 
