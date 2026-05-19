@@ -170,3 +170,18 @@ def test_sky_marker_image_source_handles_windows_paths(panel_modules):
         "sky_cubemap/sky_preview_pos_z.png"
     )
     assert "%5C" not in source
+
+
+def test_sky_marker_image_source_uses_workspace_drive_for_root_relative_windows_paths(panel_modules):
+    sky_marker = import_module("lfs_plugins.sky_marker_panel")
+
+    source = sky_marker._encode_rml_path(
+        r"\temp\gs_tests\kapel\output\projection_dome\sky_cubemap\sky_overlay_neg_z_ui_6.png",
+        r"D:\temp\gs_tests\kapel\output\projection_dome\sky_cubemap",
+    )
+
+    assert source == (
+        "D:/temp/gs_tests/kapel/output/projection_dome/"
+        "sky_cubemap/sky_overlay_neg_z_ui_6.png"
+    )
+    assert "%5C" not in source
