@@ -1560,7 +1560,12 @@ namespace lfs::vis {
                 return;
             }
 
-            case input::Action::CAMERA_RESET_HOME:
+            case input::Action::CAMERA_SET_HOME:
+                activeKeyboardViewport().camera.saveHomePosition();
+                publishCameraMove(&activeKeyboardViewport());
+                return;
+
+                case input::Action::CAMERA_RESET_HOME:
                 activeKeyboardViewport().camera.resetToHome();
                 publishCameraMove(&activeKeyboardViewport());
                 return;
