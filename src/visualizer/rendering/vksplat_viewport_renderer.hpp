@@ -13,10 +13,12 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cuda_runtime.h>
 #include <expected>
 #include <glm/glm.hpp>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace lfs::vis {
 
@@ -100,6 +102,11 @@ namespace lfs::vis {
             bool force_input_upload,
             OutputSlot output_slot = OutputSlot::Main,
             bool synchronize_input_upload = false);
+        [[nodiscard]] std::expected<RenderResult, std::string> rerenderSelectionOverlay(
+            VulkanContext& context,
+            const lfs::core::SplatData& splat_data,
+            const lfs::rendering::ViewportRenderRequest& request,
+            OutputSlot output_slot = OutputSlot::Main);
         [[nodiscard]] std::expected<std::shared_ptr<lfs::core::Tensor>, std::string> readOutputImage(
             VulkanContext& context,
             OutputSlot output_slot = OutputSlot::Main) const;
@@ -182,10 +189,29 @@ namespace lfs::vis {
             lfs::core::Tensor selection_source;
             lfs::core::Tensor preview_source;
             lfs::core::Tensor color_table_source;
+            // Fingerprint of the palette currently staged in color_table_source.
+            // Hits on lasso-drag frames where the theme/palette is unchanged,
+            // letting us skip the ~5 ms CPU-tensor build + H2D transfer.
+            // Validity gate is color_table_source.is_valid().
+            std::array<glm::vec4, lfs::rendering::kSelectionColorTableCount> cached_color_palette{};
             lfs::core::Tensor transform_indices_source;
             lfs::core::Tensor node_mask_source;
+            // Fingerprint of emphasized_node_mask currently staged in
+            // node_mask_source. Skips the CPU-tensor build + H2D when the user
+            // hasn't changed the selected node set (common during lasso drag).
+            std::vector<bool> cached_emphasized_node_mask;
             lfs::core::Tensor overlay_params_source;
+            // Mirror of the CPU bytes currently staged in overlay_params_source.
+            // The full overlay-params table is built on CPU each frame (cheap),
+            // then memcmp'd against this to decide whether the ~6 ms H2D is
+            // needed. Output-byte fingerprint is robust: any input change that
+            // matters is reflected in the bytes, no field-by-field hashing.
+            lfs::core::Tensor cached_overlay_params_cpu;
             lfs::core::Tensor model_transforms_source;
+            // Same output-bytes fingerprint cache as overlay_params: skips the
+            // ~5 ms NULL-stream H2D when the transforms haven't changed (the
+            // common case during a lasso drag on a static scene).
+            lfs::core::Tensor cached_model_transforms_cpu;
         };
         struct CudaSelectionQuerySlot {
             VulkanContext::ExternalBuffer buffer{};
@@ -201,12 +227,20 @@ namespace lfs::vis {
         };
 
         void detachManagedBuffers();
-        void plugRingInputs(std::size_t ring_slot, std::size_t num_splats);
+        void plugRingInputs(std::size_t ring_slot, std::size_t num_splats, bool reset_cached_raster_state);
         void aliasSortScratchToInputSlot(std::size_t ring_slot);
         void releaseInputSlot(VulkanContext& context, std::size_t ring_slot);
 
         VulkanContext* context_ = nullptr;
         bool initialized_ = false;
+        // Dedicated non-blocking CUDA stream for overlay-source H2D uploads.
+        // Created with cudaStreamNonBlocking so it does NOT implicitly
+        // serialize with the legacy default (NULL) stream where the rest of
+        // the project's CUDA work runs — otherwise sub-KB uploads would still
+        // wait for unrelated CUDA work to drain. Downstream Vulkan compute
+        // observes the upload via the per-slot timeline semaphore signal, so
+        // cross-API ordering is preserved without per-frame sync.
+        cudaStream_t overlay_upload_stream_ = nullptr;
         VulkanGSRenderer renderer_;
         VulkanGSPipelineBuffers buffers_;
         std::unique_ptr<ComposePipeline> compose_;

@@ -199,11 +199,18 @@ namespace lfs::rendering {
         bool equirectangular = false;
     };
 
+    struct PointCloudOverlayState {
+        std::shared_ptr<lfs::core::Tensor> selection_mask;
+        GaussianTransientMaskOverlayState transient_mask;
+        std::array<glm::vec4, kSelectionColorTableCount> selection_colors = defaultSelectionColorTable();
+    };
+
     struct PointCloudRenderRequest {
         FrameView frame_view;
         PointCloudRenderState render;
         PointCloudSceneState scene;
         PointCloudFilterState filters;
+        PointCloudOverlayState overlay;
         bool transparent_background = false;
     };
 
@@ -267,6 +274,7 @@ namespace lfs::rendering {
         PointCloudRenderState render;
         PointCloudSceneState scene;
         PointCloudFilterState filters;
+        PointCloudOverlayState overlay;
     };
 
     struct SplitViewPanelContent {
