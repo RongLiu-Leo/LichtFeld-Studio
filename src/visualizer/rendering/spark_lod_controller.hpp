@@ -6,6 +6,10 @@
 #include "core/splat_data.hpp"
 #include <vector>
 #include <cstdint>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <optional>
 #include <glm/glm.hpp>
 
 namespace lfs::vis {
@@ -31,6 +35,9 @@ public:
 
     // Synchronous traversal. Returns selected count.
     size_t update(const glm::mat4& view_matrix, const LodParameters& params);
+    void updateAsync(const glm::mat4& view_matrix, const LodParameters& params);
+    bool swapAsyncResults();
+    bool hasReadyResults() const;
 
     // Accessors
     bool hasTree() const;
@@ -51,11 +58,30 @@ private:
     float computePixelScale(uint32_t node_index,
                            const glm::mat4& view_matrix,
                            const LodParameters& params) const;
+    size_t traverse(const glm::mat4& view_matrix,
+                    const LodParameters& params,
+                    std::vector<uint32_t>& out_indices,
+                    std::vector<uint32_t>& out_lod_levels) const;
+    void workerLoop(std::stop_token stop_token);
+
+    struct WorkItem {
+        glm::mat4 view_matrix;
+        LodParameters params;
+    };
 
     const lfs::core::SplatData* data_ = nullptr;
     std::vector<LodTreeNode> nodes_;
     std::vector<uint32_t> selected_indices_;
     std::vector<uint32_t> selected_lod_levels_;
+    mutable std::mutex mutex_;
+    std::condition_variable_any cv_;
+    std::jthread worker_;
+    std::optional<WorkItem> pending_work_;
+    bool ready_available_ = false;
+    std::vector<uint32_t> async_indices_;
+    std::vector<uint32_t> async_lod_levels_;
+    std::vector<uint32_t> ready_swap_indices_;
+    std::vector<uint32_t> ready_swap_lod_levels_;
     LodParameters last_params_;
 };
 

@@ -827,6 +827,17 @@ namespace lfs::vis {
             auto request = request_override
                                ? *request_override
                                : buildViewportRenderRequest(frame_ctx, panel_size, &source_viewport, panel_id);
+            if (settings_.lod_enabled && lod_controller_ && lod_controller_->hasTree()) {
+                const auto& selected = lod_controller_->selectedIndices();
+                if (!selected.empty()) {
+                    request.lod_indices = selected.data();
+                    request.lod_count = selected.size();
+                    if (settings_.lod_debug_colors) {
+                        request.lod_levels = lod_controller_->selectedLodLevels().data();
+                    }
+                    request.lod_debug_mode = settings_.lod_debug_colors;
+                }
+            }
             std::vector<glm::mat4> transforms_storage;
             if (model_transforms_override) {
                 request.scene.model_transforms = model_transforms_override;
@@ -1316,15 +1327,23 @@ namespace lfs::vis {
                 lfs::rendering::normalizeViewerRasterBackend(request.raster_backend, request.gut);
             request.gut = lfs::rendering::isGutBackend(request.raster_backend);
 
-            // LOD traversal
-            if (settings_.lod_enabled && model && model->lod_tree && model->lod_tree->has_tree()) {
+            const bool lod_active =
+                settings_.lod_enabled && model && model->lod_tree && model->lod_tree->has_tree();
+            if (lod_active) {
                 if (!lod_controller_) {
                     lod_controller_ = std::make_unique<SparkLodController>();
                 }
                 if (lod_controller_model_ != model) {
+                    lod_controller_.reset();
+                    lod_controller_ = std::make_unique<SparkLodController>();
                     lod_controller_->attach(*model);
                     lod_controller_model_ = model;
+                    lod_need_sync_fallback_ = true;
                 }
+                if (!lod_was_active_last_frame_) {
+                    lod_need_sync_fallback_ = true;
+                }
+
                 SparkLodController::LodParameters params;
                 params.max_splats = settings_.lod_max_splats;
                 params.pixel_scale_limit = settings_.lod_pixel_scale_limit;
@@ -1336,53 +1355,15 @@ namespace lfs::vis {
 
                 // Get view matrix from the frame context
                 const glm::mat4 view_matrix = request.frame_view.getViewMatrix();
-                lod_controller_->update(view_matrix, params);
+                if (lod_need_sync_fallback_) {
+                    lod_controller_->update(view_matrix, params);
+                    lod_need_sync_fallback_ = false;
+                } else {
+                    lod_controller_->swapAsyncResults();
+                    lod_controller_->updateAsync(view_matrix, params);
+                }
                 const auto& selected = lod_controller_->selectedIndices();
                 const auto& selected_levels = lod_controller_->selectedLodLevels();
-                static std::uint32_t lod_log_counter = 0;
-                const bool log_this_frame = selected.empty() || ((++lod_log_counter % 120u) == 0u);
-                if (log_this_frame) {
-                    std::size_t invalid_indices = 0;
-                    std::size_t duplicate_indices = 0;
-                    std::uint32_t min_idx = 0;
-                    std::uint32_t max_idx = 0;
-                    if (!selected.empty()) {
-                        auto [min_it, max_it] = std::minmax_element(selected.begin(), selected.end());
-                        min_idx = *min_it;
-                        max_idx = *max_it;
-                        const auto model_size_u32 = static_cast<std::uint32_t>(model->size());
-                        std::vector<std::uint32_t> sorted_indices(selected.begin(), selected.end());
-                        std::sort(sorted_indices.begin(), sorted_indices.end());
-                        duplicate_indices = std::adjacent_find(sorted_indices.begin(), sorted_indices.end()) != sorted_indices.end()
-                                                ? (sorted_indices.size() - static_cast<std::size_t>(
-                                                                              std::distance(sorted_indices.begin(),
-                                                                                            std::unique(sorted_indices.begin(),
-                                                                                                        sorted_indices.end()))))
-                                                : 0;
-                        for (const std::uint32_t idx : selected) {
-                            if (idx >= model_size_u32) {
-                                ++invalid_indices;
-                            }
-                        }
-                    }
-                    LOG_INFO(
-                        "LOD debug: model_splats={} tree_nodes={} selected={} max_splats={} pixel_limit={} min_idx={} max_idx={} invalid_idx={} duplicate_idx={}",
-                        model->size(),
-                        model->lod_tree ? model->lod_tree->total_nodes() : 0,
-                        selected.size(),
-                        params.max_splats,
-                        params.pixel_scale_limit,
-                        min_idx,
-                        max_idx,
-                        invalid_indices,
-                        duplicate_indices);
-                    if (selected.size() <= 1 && model->lod_tree && !model->lod_tree->child_count.empty()) {
-                        LOG_INFO(
-                            "LOD debug detail: root_child_count={} root_child_start={} (selected <= 1 often indicates traversal budget gating at root)",
-                            model->lod_tree->child_count[0],
-                            model->lod_tree->child_start.empty() ? 0u : model->lod_tree->child_start[0]);
-                    }
-                }
                 if (!selected.empty()) {
                     request.lod_indices = selected.data();
                     request.lod_count = selected.size();
@@ -1392,8 +1373,11 @@ namespace lfs::vis {
                 }
                 request.lod_debug_mode = settings_.lod_debug_colors;
             } else {
+                lod_controller_.reset();
                 lod_controller_model_ = nullptr;
+                lod_need_sync_fallback_ = true;
             }
+            lod_was_active_last_frame_ = lod_active;
 
             if (lfs::rendering::isVkSplatBackend(request.raster_backend)) {
                 if (!context.vulkan_context) {
