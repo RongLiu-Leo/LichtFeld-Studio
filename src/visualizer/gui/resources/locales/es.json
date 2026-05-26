@@ -46,6 +46,11 @@
     "preferences": "Preferencias",
     "histogram": "Histogram"
   },
+  "tooltip_lod_enabled": "Habilitar renderizado jerárquico de nivel de detalle para archivos RAD",
+  "tooltip_lod_max_splats": "Número máximo de splats a renderizar por fotograma",
+  "tooltip_lod_pixel_scale_limit": "Escala mínima de píxel en pantalla para que un splat sea visible",
+  "tooltip_lod_render_scale": "Multiplicador de resolución para los cálculos de LOD",
+  "tooltip_lod_debug_mode": "Colorear splats según su nivel de LOD para depuración",
   "getting_started": {
     "title": "Primeros Pasos",
     "description": "Aprenda a preparar datasets y comenzar con LichtFeld Studio:",
@@ -85,6 +90,22 @@
     "build_info.property": "Propiedad",
     "build_info.value": "Valor",
     "separator": "  |  "
+  },
+  "tooltip": {
+    "lod_enabled": "Habilitar renderizado jerárquico de nivel de detalle para archivos RAD",
+    "lod_max_splats": "Número máximo de splats a renderizar por fotograma",
+    "lod_pixel_scale_limit": "Escala mínima de píxel en pantalla para que un splat sea visible",
+    "lod_render_scale": "Multiplicador de resolución para los cálculos de LOD",
+    "lod_debug_mode": "Colorear splats según su nivel de LOD para depuración"
+  },
+  "rendering_panel": {
+    "fov_format": "FOV: {hfov:.1f}° H / {vfov:.1f}° V",
+    "section_lod": "LOD",
+    "lod_enabled": "Habilitar LOD",
+    "lod_max_splats": "Splats máximos",
+    "lod_pixel_scale_limit": "Límite de escala de píxel",
+    "lod_render_scale": "Escala de render",
+    "lod_debug_mode": "Colores de depuración"
   },
   "asset_manager": {
     "title": "Gestor de Activos",

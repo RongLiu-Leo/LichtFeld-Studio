@@ -46,6 +46,11 @@
     "preferences": "偏好设置",
     "histogram": "Histogram"
   },
+  "tooltip_lod_enabled": "启用 RAD 文件的分层 LOD 渲染",
+  "tooltip_lod_max_splats": "每帧渲染的最大 Splat 数量",
+  "tooltip_lod_pixel_scale_limit": "Splat 可见所需的最小屏幕像素尺度",
+  "tooltip_lod_render_scale": "LOD 计算的分辨率倍率",
+  "tooltip_lod_debug_mode": "按 LOD 级别为 Splat 着色以便调试",
   "getting_started": {
     "title": "入门指南",
     "description": "学习如何准备数据集并开始使用LichtFeld Studio：",
@@ -681,6 +686,11 @@
     "simplify_apply": "根据所选来源创建一个新的简化 splat 节点",
     "simplify_cancel": "取消当前正在运行的 splat 简化任务",
     "render_scale": "查看器分辨率（越低=越少VRAM）",
+    "lod_enabled": "启用 RAD 文件的分层 LOD 渲染",
+    "lod_max_splats": "每帧渲染的最大 Splat 数量",
+    "lod_pixel_scale_limit": "Splat 可见所需的最小屏幕像素尺度",
+    "lod_render_scale": "LOD 计算的分辨率倍率",
+    "lod_debug_mode": "按 LOD 级别为 Splat 着色以便调试",
     "point_cloud_forced": "训练开始前强制启用",
     "desaturate_unselected": "使未选择的PLY变暗",
     "desaturate_cropping": "变暗裁剪区域外部而非隐藏",
@@ -1051,6 +1061,15 @@
     "drop_files_hint": "或使用 文件 > 导入数据集 / 导入PLY",
     "drop_to_import": "放下以导入",
     "drop_to_import_subtitle": "PLY、SOG、SPZ、USD、COLMAP数据集或项目"
+  },
+  "rendering_panel": {
+    "fov_format": "FOV: {hfov:.1f}° H / {vfov:.1f}° V",
+    "section_lod": "LOD",
+    "lod_enabled": "启用LOD",
+    "lod_max_splats": "最大Splat数",
+    "lod_pixel_scale_limit": "像素尺度阈值",
+    "lod_render_scale": "渲染尺度",
+    "lod_debug_mode": "调试颜色"
   },
   "asset_manager": {
     "title": "资源管理器",
