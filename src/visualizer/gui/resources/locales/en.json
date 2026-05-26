@@ -46,6 +46,11 @@
     "preferences": "Preferences",
     "histogram": "Histogram"
   },
+  "tooltip_lod_enabled": "Enable hierarchical level-of-detail rendering for RAD files",
+  "tooltip_lod_max_splats": "Maximum number of splats to render per frame",
+  "tooltip_lod_pixel_scale_limit": "Minimum screen-space pixel scale for a splat to be visible",
+  "tooltip_lod_render_scale": "Resolution multiplier for LOD calculations",
+  "tooltip_lod_debug_mode": "Color splats by their LOD level for debugging",
   "getting_started": {
     "title": "Getting Started",
     "description": "Learn how to prepare datasets and get started with LichtFeld Studio:",
