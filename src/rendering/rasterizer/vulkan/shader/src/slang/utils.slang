@@ -1043,8 +1043,8 @@ struct Uniforms {
     uint camera_model;
     uint sort_capacity;
     uint shN_layout_slots;
-    uint pad1;
-    uint pad2;
+    uint lod_enabled;
+    uint lod_count;
     float fx;
     float fy;
     float cx;

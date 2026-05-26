@@ -167,6 +167,8 @@ add_library(lfs_io STATIC
         loaders/spz_loader.cpp
         loaders/usd_loader.hpp
         loaders/usd_loader.cpp
+        loaders/rad_loader.hpp
+        loaders/rad_loader.cpp
         loaders/checkpoint_loader.hpp
         loaders/checkpoint_loader.cpp
         loaders/mesh_loader.hpp

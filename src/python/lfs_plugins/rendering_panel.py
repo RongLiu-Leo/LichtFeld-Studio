@@ -61,6 +61,7 @@ BOOL_PROPS = [
     "equirectangular", "mip_filter",
     "mesh_wireframe", "mesh_backface_culling", "mesh_shadow_enabled",
     "apply_appearance_correction", "ppisp_vignette_enabled",
+    "lod_enabled", "lod_debug_mode",
 ]
 
 SLIDER_PROPS = [
@@ -70,6 +71,7 @@ SLIDER_PROPS = [
     "ppisp_exposure", "ppisp_vignette_strength", "ppisp_gamma_multiplier",
     "ppisp_gamma_red", "ppisp_gamma_green", "ppisp_gamma_blue",
     "ppisp_crf_toe", "ppisp_crf_shoulder",
+    "lod_max_splats", "lod_pixel_scale_limit", "lod_render_scale",
 ]
 
 SCRUB_FIELD_DEFS = {
@@ -99,6 +101,9 @@ SCRUB_FIELD_DEFS = {
     "simplify_knn_k": ScrubFieldSpec(1.0, float(MAX_SIMPLIFY_KNN_K), 1.0, "%d", data_type=int),
     "simplify_merge_cap": ScrubFieldSpec(0.01, 0.5, 0.01, "%.2f"),
     "simplify_opacity_prune_threshold": ScrubFieldSpec(0.0, 1.0, 0.01, "%.2f"),
+    "lod_max_splats": ScrubFieldSpec(100000.0, 5000000.0, 100000.0, "%.0f", data_type=int),
+    "lod_pixel_scale_limit": ScrubFieldSpec(0.00001, 0.01, 0.00001, "%.5f"),
+    "lod_render_scale": ScrubFieldSpec(0.1, 2.0, 0.1, "%.1f"),
 }
 
 SELECT_PROPS = [
@@ -131,6 +136,7 @@ SECTION_NAMES = (
     "transform",
     "viewport",
     "camera",
+    "lod",
     "simplify",
     "selection",
     "mesh",
@@ -182,6 +188,11 @@ LOCALE_KEY = {
     "ppisp_gamma_blue": "main_panel.ppisp_gamma_blue",
     "ppisp_crf_toe": "main_panel.ppisp_crf_toe",
     "ppisp_crf_shoulder": "main_panel.ppisp_crf_shoulder",
+    "lod_enabled": "rendering_panel.lod_enabled",
+    "lod_debug_mode": "rendering_panel.lod_debug_mode",
+    "lod_max_splats": "rendering_panel.lod_max_splats",
+    "lod_pixel_scale_limit": "rendering_panel.lod_pixel_scale_limit",
+    "lod_render_scale": "rendering_panel.lod_render_scale",
 }
 
 
@@ -237,7 +248,7 @@ class RenderingPanel(Panel):
         self._handle = None
         self._transform_controls = TransformControlsController()
         self._color_edit_prop = None
-        self._collapsed = {"selection", "mesh", "post_process", "ppisp_crf"}
+        self._collapsed = {"lod", "selection", "mesh", "post_process", "ppisp_crf"}
         self._popup_el = None
         self._doc = None
         self._picker_click_handled = False
@@ -258,6 +269,8 @@ class RenderingPanel(Panel):
         self._last_environment_state = None
         self._last_projection_state = None
         self._last_custom_environment_map_path = ""
+        self._last_lod_total_splats = 0
+        self._last_lod_selected_splats = 0
         self._escape_revert = w.EscapeRevertController()
         self._scrub_fields = ScrubFieldController(
             SCRUB_FIELD_DEFS,
@@ -311,6 +324,10 @@ class RenderingPanel(Panel):
                 model.bind(prop_id,
                            lambda p=prop_id: getattr(s(), p, False),
                            lambda v: self._set_equirectangular(v))
+            elif prop_id == "lod_debug_mode":
+                model.bind(prop_id,
+                           lambda: getattr(s(), "lod_debug_colors", False),
+                           lambda v: setattr(s(), "lod_debug_colors", v) if s() else None)
             else:
                 model.bind(prop_id,
                            lambda p=prop_id: getattr(s(), p, False),
@@ -393,6 +410,8 @@ class RenderingPanel(Panel):
                          lambda: "Viewport")
         model.bind_func("label_hdr_camera",
                          lambda: "Camera & Projection")
+        model.bind_func("label_hdr_lod",
+                         lambda: _tr_fallback("rendering_panel.section_lod", "LOD"))
         model.bind_func("label_hdr_simplify",
                          lambda: _tr_fallback("rendering_panel.section_simplify", "Splat Simplify"))
         model.bind_func("label_hdr_selection",
@@ -459,6 +478,20 @@ class RenderingPanel(Panel):
         model.bind_func("simplify_show_error", lambda: bool(self._simplify_error_text))
         model.bind_func("simplify_error_text", lambda: self._simplify_error_text)
 
+        model.bind_func("lod_total_splats", self._lod_total_splats)
+        model.bind_func("lod_selected_splats", self._lod_selected_splats)
+
+        model.bind_func("tooltip_lod_enabled",
+                         lambda: lf.ui.tr("tooltip.lod_enabled") or "")
+        model.bind_func("tooltip_lod_max_splats",
+                         lambda: lf.ui.tr("tooltip.lod_max_splats") or "")
+        model.bind_func("tooltip_lod_pixel_scale_limit",
+                         lambda: lf.ui.tr("tooltip.lod_pixel_scale_limit") or "")
+        model.bind_func("tooltip_lod_render_scale",
+                         lambda: lf.ui.tr("tooltip.lod_render_scale") or "")
+        model.bind_func("tooltip_lod_debug_mode",
+                         lambda: lf.ui.tr("tooltip.lod_debug_mode") or "")
+
         model.bind("theme_vignette_enabled",
                    lambda: bool((vignette := _theme_vignette()) and vignette.enabled),
                    lambda v: lf.ui.set_theme_vignette_enabled(bool(v)))
@@ -518,6 +551,7 @@ class RenderingPanel(Panel):
                 dirty = True
         dirty |= self._refresh_simplify_source(force=False)
         dirty |= self._sync_simplify_task_state(force=False)
+        dirty |= self._sync_lod_stats()
         dirty |= self._scrub_fields.sync_all()
         return dirty
 
@@ -915,6 +949,14 @@ class RenderingPanel(Panel):
         for field in fields:
             self._handle.dirty(field)
 
+    def _lod_total_splats(self):
+        _node, _name, count = self._active_splat_node()
+        return count
+
+    def _lod_selected_splats(self):
+        _node, _name, count = self._active_splat_node()
+        return count
+
     def _active_splat_node(self):
         scene = getattr(lf, "get_scene", lambda: None)()
         if scene is None:
@@ -1122,6 +1164,17 @@ class RenderingPanel(Panel):
             return f"{int(round(float(self._simplify_progress_value) * 100.0))}%"
         except (TypeError, ValueError):
             return "0%"
+
+    def _sync_lod_stats(self) -> bool:
+        total = self._lod_total_splats()
+        selected = self._lod_selected_splats()
+        changed = total != self._last_lod_total_splats or selected != self._last_lod_selected_splats
+        if not changed:
+            return False
+        self._last_lod_total_splats = total
+        self._last_lod_selected_splats = selected
+        self._dirty_model("lod_total_splats", "lod_selected_splats")
+        return True
 
     def _sync_simplify_task_state(self, force: bool) -> bool:
         active = bool(getattr(lf, "is_splat_simplify_active", lambda: False)())

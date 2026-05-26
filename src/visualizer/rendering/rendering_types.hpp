@@ -252,6 +252,18 @@ namespace lfs::vis {
         glm::vec3 depth_filter_min = glm::vec3(-50.0f, -10000.0f, 0.0f);
         glm::vec3 depth_filter_max = glm::vec3(50.0f, 10000.0f, 100.0f);
         lfs::geometry::EuclideanTransform depth_filter_transform;
+
+        // ---- LOD (Spark-style) ----
+        bool lod_enabled = false;           // Master toggle
+        bool lod_auto_enable_rad = false; // Keep LOD off by default, even for .rad
+        size_t lod_max_splats = 1'500'000; // Splat budget (desktop default)
+        float lod_pixel_scale_limit = 0.0001f;
+        float lod_render_scale = 1.0f;
+        float lod_behind_camera_penalty = 2.0f;
+        float lod_cone_foveation = 1.0f;
+        float lod_cone_inner_degrees = 0.0f;
+        float lod_cone_outer_degrees = 0.0f;
+        bool lod_debug_colors = false;      // Per-level color tinting
     };
 
     inline void enforceProjectionBackend(RenderSettings& settings) {

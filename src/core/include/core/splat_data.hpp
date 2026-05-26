@@ -11,7 +11,7 @@
 #include <expected>
 #include <filesystem>
 #include <functional>
-#include <glm/fwd.hpp>
+#include <glm/glm.hpp>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -25,6 +25,17 @@ namespace lfs::core {
     namespace param {
         struct TrainingParameters;
     }
+
+    struct SplatLodTree {
+        std::vector<uint16_t> child_count;
+        std::vector<uint32_t> child_start;
+        std::vector<uint8_t>  lod_level;
+        std::vector<glm::vec3> centers;
+        std::vector<float>     sizes;
+
+        size_t total_nodes() const { return child_count.size(); }
+        bool   has_tree() const  { return !child_count.empty(); }
+    };
 
     /**
      * @brief Core data structure for Gaussian splat representation
@@ -162,6 +173,9 @@ namespace lfs::core {
     public:
         // Holds the magnitude of the screen space gradient (used for densification)
         Tensor _densification_info;
+
+        // Optional LOD tree (populated by RAD loader, null for training/non-RAD scenes)
+        std::unique_ptr<SplatLodTree> lod_tree;
 
     private:
         int _active_sh_degree = 0;

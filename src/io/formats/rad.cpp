@@ -2715,12 +2715,15 @@ namespace lfs::io {
                 std::vector<float> all_means;
                 std::vector<float> all_opacity;
                 std::vector<float> all_sh0;
-                std::vector<float> all_scales;
+                std::vector<float> all_scales_linear;
                 std::vector<float> all_rotation;
                 std::vector<float> all_shN;
+                std::vector<uint16_t> all_child_count;
+                std::vector<uint32_t> all_child_start;
 
                 const int max_sh = meta.max_sh.value_or(0);
                 const int sh_coeffs = max_sh > 0 ? SH_COEFFS_FOR_DEGREE[max_sh] : 0;
+                const bool has_lod_tree = meta.lod_tree.value_or(false);
 
                 for (size_t chunk_idx = 0; chunk_idx < meta.chunks.size(); ++chunk_idx) {
                     if (offset + 8 > data.size()) {
@@ -2775,6 +2778,12 @@ namespace lfs::io {
                     std::vector<float> chunk_scales(chunk_count * 3);
                     std::vector<float> chunk_rotation(chunk_count * 4);
                     std::vector<float> chunk_shN(chunk_count * sh_coeffs * 3, 0.0f);
+                    std::vector<uint16_t> chunk_child_count;
+                    std::vector<uint32_t> chunk_child_start;
+                    if (has_lod_tree) {
+                        chunk_child_count.resize(chunk_count);
+                        chunk_child_start.resize(chunk_count);
+                    }
 
                     // Temporary buffers for component data
                     std::vector<float> comp_data(chunk_count);
@@ -2901,13 +2910,25 @@ namespace lfs::io {
                                 int coeff = std::stoi(prop.property.substr(first_underscore + 1, second_underscore - first_underscore - 1));
                                 int ch = prop.property.back() - '0';
                                 PropertyDecoder::decode_sh(prop_data.data(), comp_data.data(), 1, chunk_count,
-                                                           prop.encoding,
-                                                           prop.min_val.value_or(0.0f),
-                                                           prop.max_val.value_or(1.0f),
-                                                           prop.base.value_or(0.0f),
-                                                           prop.scale.value_or(1.0f));
+                                                            prop.encoding,
+                                                            prop.min_val.value_or(0.0f),
+                                                            prop.max_val.value_or(1.0f),
+                                                            prop.base.value_or(0.0f),
+                                                            prop.scale.value_or(1.0f));
                                 for (size_t i = 0; i < chunk_count; ++i) {
                                     chunk_shN[i * sh_coeffs * 3 + coeff * 3 + ch] = comp_data[i];
+                                }
+                            }
+                        } else if (prop.property == PROP_CHILD_COUNT) {
+                            if (prop_data.size() >= chunk_count * 2) {
+                                for (size_t i = 0; i < chunk_count; ++i) {
+                                    chunk_child_count[i] = decode_u16(&prop_data[i * 2]);
+                                }
+                            }
+                        } else if (prop.property == PROP_CHILD_START) {
+                            if (prop_data.size() >= chunk_count * 4) {
+                                for (size_t i = 0; i < chunk_count; ++i) {
+                                    chunk_child_start[i] = decode_u32(&prop_data[i * 4]);
                                 }
                             }
                         }
@@ -2917,9 +2938,13 @@ namespace lfs::io {
                     all_means.insert(all_means.end(), chunk_means.begin(), chunk_means.end());
                     all_opacity.insert(all_opacity.end(), chunk_opacity.begin(), chunk_opacity.end());
                     all_sh0.insert(all_sh0.end(), chunk_sh0.begin(), chunk_sh0.end());
-                    all_scales.insert(all_scales.end(), chunk_scales.begin(), chunk_scales.end());
+                    all_scales_linear.insert(all_scales_linear.end(), chunk_scales.begin(), chunk_scales.end());
                     all_rotation.insert(all_rotation.end(), chunk_rotation.begin(), chunk_rotation.end());
                     all_shN.insert(all_shN.end(), chunk_shN.begin(), chunk_shN.end());
+                    if (has_lod_tree) {
+                        all_child_count.insert(all_child_count.end(), chunk_child_count.begin(), chunk_child_count.end());
+                        all_child_start.insert(all_child_start.end(), chunk_child_start.begin(), chunk_child_start.end());
+                    }
 
                     // Move to next chunk
                     offset = chunk_end;
@@ -2928,10 +2953,29 @@ namespace lfs::io {
                 // Create tensors
                 const size_t N = meta.count;
 
+                // RAD stores display RGB in SH0 slot (0.5 + SH_C0 * sh0_raw).
+                // Convert back to optimizer-domain sh0_raw expected by SplatData.
+                for (float& v : all_sh0) {
+                    v = (v - 0.5f) / SH_C0;
+                }
+
+                // RAD stores activated opacity alpha in [0, 1]. Convert back to
+                // optimizer-domain logits expected by SplatData.
+                for (float& v : all_opacity) {
+                    const float a = std::clamp(v, 1.0e-6f, 1.0f - 1.0e-6f);
+                    v = std::log(a / (1.0f - a));
+                }
+
                 Tensor means_tensor = Tensor::from_vector(all_means, {N, 3}, Device::CPU);
                 Tensor opacity_tensor = Tensor::from_vector(all_opacity, {N, 1}, Device::CPU);
                 Tensor sh0_tensor = Tensor::from_vector(all_sh0, {N, 1, 3}, Device::CPU);
-                Tensor scales_tensor = Tensor::from_vector(all_scales, {N, 3}, Device::CPU);
+                // RAD stores activated (linear) scale values. SplatData expects
+                // optimizer-domain scaling_raw (log-space), so convert here.
+                std::vector<float> all_scales_raw = all_scales_linear;
+                for (float& v : all_scales_raw) {
+                    v = std::log(std::max(v, 1.0e-8f));
+                }
+                Tensor scales_tensor = Tensor::from_vector(all_scales_raw, {N, 3}, Device::CPU);
                 Tensor rotation_tensor = Tensor::from_vector(all_rotation, {N, 4}, Device::CPU);
 
                 Tensor shN_tensor;
@@ -2950,6 +2994,30 @@ namespace lfs::io {
                     std::move(opacity_tensor),
                     1.0f // scene_scale
                 );
+
+                // Attach LOD tree if present
+                if (!all_child_count.empty()) {
+                    if (all_child_count.size() != N || all_child_start.size() != N) {
+                        return std::unexpected("RAD LOD tree size mismatch");
+                    }
+                    auto tree = std::make_unique<lfs::core::SplatLodTree>();
+                    tree->child_count = std::move(all_child_count);
+                    tree->child_start = std::move(all_child_start);
+                    tree->centers.reserve(N);
+                    tree->sizes.reserve(N);
+                    for (size_t i = 0; i < N; ++i) {
+                        const float cx = all_means[i * 3 + 0];
+                        const float cy = all_means[i * 3 + 1];
+                        const float cz = all_means[i * 3 + 2];
+                        tree->centers.emplace_back(cx, cy, cz);
+
+                        const float sx = all_scales_linear[i * 3 + 0];
+                        const float sy = all_scales_linear[i * 3 + 1];
+                        const float sz = all_scales_linear[i * 3 + 2];
+                        tree->sizes.push_back(2.0f * std::max({sx, sy, sz}));
+                    }
+                    splat_data.lod_tree = std::move(tree);
+                }
 
                 return std::expected<SplatData, std::string>(std::move(splat_data));
             }

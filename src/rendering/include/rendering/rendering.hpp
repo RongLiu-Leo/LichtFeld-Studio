@@ -172,6 +172,13 @@ namespace lfs::rendering {
         bool depth_view = false;
         float depth_view_min = DEFAULT_NEAR_PLANE;
         float depth_view_max = DEFAULT_FAR_PLANE;
+        
+        // LOD index indirection (optional)
+        const uint32_t* lod_indices = nullptr;
+        size_t lod_count = 0;
+        // LOD debug levels (optional, parallel to lod_indices)
+        const uint32_t* lod_levels = nullptr;
+        bool lod_debug_mode = false;
     };
 
     struct PointCloudSceneState {

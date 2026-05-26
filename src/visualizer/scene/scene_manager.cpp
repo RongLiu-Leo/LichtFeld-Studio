@@ -565,6 +565,19 @@ namespace lfs::vis {
 
                 const auto* splat_for_cropbox = scene_.getNode(name);
                 if (splat_for_cropbox) {
+                    // Keep LOD OFF by default. We only expose availability here.
+                    const bool has_lod_tree =
+                        (ext == ".rad" && splat_for_cropbox->model &&
+                         splat_for_cropbox->model->lod_tree &&
+                         splat_for_cropbox->model->lod_tree->has_tree());
+                    if (auto* rm = services().renderingOrNull()) {
+                        rm->setLodAvailable(has_lod_tree);
+                        rm->setLodEnabled(false);
+                    }
+                    if (has_lod_tree) {
+                        LOG_INFO("RAD file loaded with LOD tree (available), LOD kept disabled by default");
+                    }
+
                     const core::NodeId cropbox_id = scene_.getCropBoxForSplat(splat_for_cropbox->id);
                     if (cropbox_id != core::NULL_NODE) {
                         const auto* cropbox_node = scene_.getNodeById(cropbox_id);

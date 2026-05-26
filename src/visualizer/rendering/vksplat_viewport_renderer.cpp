@@ -70,6 +70,32 @@ namespace lfs::vis {
             return std::format("{} failed: {}", operation, vkResultToString(result));
         }
 
+        void recordUpdateBufferChunks(
+            VkCommandBuffer command_buffer,
+            const _VulkanBuffer& dst,
+            const void* src_data,
+            const std::size_t byte_size) {
+            if (command_buffer == VK_NULL_HANDLE || dst.buffer == VK_NULL_HANDLE ||
+                src_data == nullptr || byte_size == 0) {
+                return;
+            }
+
+            // Vulkan requires vkCmdUpdateBuffer update chunks <= 65536 bytes and
+            // 4-byte aligned.
+            constexpr std::size_t kMaxUpdateBytes = 65536;
+            const auto* src = static_cast<const std::uint8_t*>(src_data);
+            std::size_t offset = 0;
+            while (offset < byte_size) {
+                const std::size_t chunk = std::min(kMaxUpdateBytes, byte_size - offset);
+                vkCmdUpdateBuffer(command_buffer,
+                                  dst.buffer,
+                                  dst.offset + offset,
+                                  chunk,
+                                  src + offset);
+                offset += chunk;
+            }
+        }
+
         [[nodiscard]] std::uint32_t vksplatBaseCameraModel(
             const lfs::rendering::FrameView& frame_view,
             const bool equirectangular) {
@@ -2605,16 +2631,70 @@ namespace lfs::vis {
         VulkanGSRendererUniforms uniforms{};
         {
             LOG_TIMER("vksplat.render.populateUniforms");
+            const std::size_t render_splat_count = request.lod_count > 0 ? request.lod_count : buffers_.num_splats;
             populateVksplatCameraUniforms(uniforms,
                                           request.frame_view,
                                           request.scene,
                                           active_sh_degree,
                                           lfs::core::sh_float4_slots_for_rest(
                                               static_cast<std::uint32_t>(splat_data.max_sh_coeffs_rest())),
-                                          buffers_.num_splats,
+                                          render_splat_count,
                                           request.equirectangular,
                                           request.gut);
             uniforms.step = static_cast<std::uint32_t>(modelTransformCount(request.scene.model_transforms));
+            uniforms.lod_enabled = request.lod_count > 0 ? 1u : 0u;
+            uniforms.lod_count = static_cast<std::uint32_t>(request.lod_count);
+        }
+
+        // Stage LOD indices on host; actual GPU upload happens inside the
+        // active command batch right before projection dispatch.
+        if (request.lod_count > 0 && request.lod_indices != nullptr) {
+            auto& lod_buf = buffers_.lod_indices;
+            if (lod_buf.deviceSize() < request.lod_count) {
+                renderer_.resizeAndCopyDeviceBuffer(lod_buf, request.lod_count, false);
+            }
+            lod_buf.resize(request.lod_count);
+            std::memcpy(lod_buf.data(), request.lod_indices, request.lod_count * sizeof(uint32_t));
+            buffers_.has_lod_indices = true;
+        } else {
+            buffers_.has_lod_indices = false;
+        }
+
+        // Stage LOD debug levels on host; upload inside the active command
+        // batch right before projection dispatch.
+        if (request.lod_count > 0 && request.lod_levels != nullptr) {
+            auto& levels_buf = buffers_.lod_levels;
+            if (levels_buf.deviceSize() < request.lod_count) {
+                renderer_.resizeAndCopyDeviceBuffer(levels_buf, request.lod_count, false);
+            }
+            levels_buf.resize(request.lod_count);
+            std::memcpy(levels_buf.data(), request.lod_levels, request.lod_count * sizeof(uint32_t));
+            buffers_.has_lod_levels = true;
+        } else {
+            buffers_.has_lod_levels = false;
+        }
+
+        // lod_enabled: 0=off, 1=LOD on, 2=LOD on + debug coloring in shader.
+        if (uniforms.lod_enabled != 0u && request.lod_debug_mode && buffers_.has_lod_levels) {
+            uniforms.lod_enabled = 2u;
+        }
+
+        if (uniforms.lod_enabled != 0u) {
+            static std::uint32_t lod_dispatch_log_counter = 0;
+            const bool log_this_frame = (uniforms.lod_count == 0u) || ((++lod_dispatch_log_counter % 120u) == 0u);
+            if (log_this_frame) {
+                const std::uint32_t lod_count = uniforms.lod_count;
+                const std::uint32_t uniform_num_splats = uniforms.num_splats;
+                const std::uint32_t lod_mode = uniforms.lod_enabled;
+                LOG_INFO(
+                    "LOD dispatch: uniform_lod_count={} uniform_num_splats={} model_num_splats={} has_lod_indices={} has_lod_levels={} lod_mode={}",
+                    lod_count,
+                    uniform_num_splats,
+                    buffers_.num_splats,
+                    buffers_.has_lod_indices ? 1 : 0,
+                    buffers_.has_lod_levels ? 1 : 0,
+                    lod_mode);
+            }
         }
 
         if (input_binding->uses_temporary_upload_slot && !request.gut) {
@@ -2633,6 +2713,18 @@ namespace lfs::vis {
             auto batch = DeviceGuard(&renderer_);
             {
                 LOG_TIMER("vksplat.render.record");
+                if (buffers_.has_lod_indices && !buffers_.lod_indices.empty()) {
+                    recordUpdateBufferChunks(renderer_.activeCommandBuffer(),
+                                             buffers_.lod_indices.deviceBuffer,
+                                             buffers_.lod_indices.data(),
+                                             buffers_.lod_indices.size() * sizeof(std::uint32_t));
+                }
+                if (buffers_.has_lod_levels && !buffers_.lod_levels.empty()) {
+                    recordUpdateBufferChunks(renderer_.activeCommandBuffer(),
+                                             buffers_.lod_levels.deviceBuffer,
+                                             buffers_.lod_levels.data(),
+                                             buffers_.lod_levels.size() * sizeof(std::uint32_t));
+                }
                 renderer_.executeProjectionForward(uniforms,
                                                    buffers_,
                                                    overlay_bindings->transform_indices,
@@ -2640,7 +2732,9 @@ namespace lfs::vis {
                                                    overlay_bindings->overlay_params,
                                                    overlay_bindings->model_transforms,
                                                    0,
-                                                   request.gut);
+                                                   request.gut,
+                                                   buffers_.has_lod_indices ? buffers_.lod_indices.deviceBuffer : _VulkanBuffer(),
+                                                   buffers_.has_lod_levels ? buffers_.lod_levels.deviceBuffer : _VulkanBuffer());
                 // Two-stage sort (Splatshop, matches gsplat_fwd reference):
                 //   1. Depth-sort N primitives by radial distance (full 32-bit key).
                 //   2. Reorder tiles_touched into depth-rank order so the cumsum

@@ -134,6 +134,12 @@ namespace lfs::vis {
         std::array<float, 3> depth_filter_max{50.0f, 10000.0f, 100.0f};
         std::array<float, 4> depth_filter_rotation{1.0f, 0.0f, 0.0f, 0.0f};
         std::array<float, 3> depth_filter_translation{0.0f, 0.0f, 0.0f};
+
+        bool lod_enabled = false;
+        bool lod_debug_colors = false;
+        float lod_max_splats = 1500000.0f;
+        float lod_pixel_scale_limit = 0.0001f;
+        float lod_render_scale = 1.0f;
     };
 
     using GetRenderSettingsCallback = std::function<std::optional<RenderSettingsProxy>()>;

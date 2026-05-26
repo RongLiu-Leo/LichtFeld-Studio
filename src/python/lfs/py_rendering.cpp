@@ -293,6 +293,17 @@ namespace lfs::python {
                      "Compute metrics when jumping to a source camera",
                      {{"Off", "OFF", 0}, {"PSNR", "PSNR", 1}, {"PSNR + SSIM", "PSNR_SSIM", 2}}, 0);
 
+        add_bool(&Proxy::lod_enabled, "lod_enabled", "Enable LOD",
+                 "Enable hierarchical level-of-detail rendering", false);
+        add_bool(&Proxy::lod_debug_colors, "lod_debug_colors", "Debug Colors",
+                 "Color splats by their LOD level for debugging", false);
+        add_float(&Proxy::lod_max_splats, "lod_max_splats", "Max Splats",
+                  "Maximum number of splats to render per frame", 1500000.0, 100000.0, 5000000.0);
+        add_float(&Proxy::lod_pixel_scale_limit, "lod_pixel_scale_limit", "Pixel Scale Limit",
+                  "Minimum screen-space pixel scale for a splat to be visible", 0.0001, 0.00001, 0.01);
+        add_float(&Proxy::lod_render_scale, "lod_render_scale", "Render Scale",
+                  "Resolution multiplier for LOD calculations", 1.0, 0.1, 2.0);
+
         add_bool(&Proxy::apply_appearance_correction, "apply_appearance_correction", "Appearance Correction",
                  "Enable PPISP appearance correction", false);
         add_int_enum(&Proxy::ppisp_mode, "ppisp_mode", "Mode", "PPISP correction mode",

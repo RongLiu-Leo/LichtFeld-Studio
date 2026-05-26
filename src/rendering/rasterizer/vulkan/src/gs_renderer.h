@@ -15,8 +15,8 @@ PACK_STRUCT(struct VulkanGSRendererUniforms {
     uint32_t camera_model;
     uint32_t sort_capacity;
     uint32_t shN_layout_slots;
-    uint32_t pad1;
-    uint32_t pad2;
+    uint32_t lod_enabled;        // Reuses former pad1 slot
+    uint32_t lod_count;          // Reuses former pad2 slot
     float fx;
     float fy;
     float cx;
@@ -88,7 +88,9 @@ public:
                                   const _VulkanBuffer& overlay_params,
                                   const _VulkanBuffer& model_transforms,
                                   size_t alloc_reserve = 0,
-                                  bool use_gut_projection = false);
+                                  bool use_gut_projection = false,
+                                  const _VulkanBuffer& lod_indices = _VulkanBuffer(),
+                                  const _VulkanBuffer& lod_levels = _VulkanBuffer());
     void executeGenerateKeys(const VulkanGSRendererUniforms& uniforms, VulkanGSPipelineBuffers& buffers);
     void executeComputeTileRanges(const VulkanGSRendererUniforms& uniforms, VulkanGSPipelineBuffers& buffers);
     void executeRasterizeForward(const VulkanGSRendererUniforms& uniforms,
@@ -137,8 +139,8 @@ protected:
         Buffer<int32_t>& input_buffer,
         Buffer<int32_t>& output_buffer);
 
-    _ComputePipeline pipeline_projection_forward = _ComputePipeline(19);
-    _ComputePipeline pipeline_projection_forward_3dgut = _ComputePipeline(19);
+    _ComputePipeline pipeline_projection_forward = _ComputePipeline(21);
+    _ComputePipeline pipeline_projection_forward_3dgut = _ComputePipeline(21);
     _ComputePipeline pipeline_selection_mask = _ComputePipeline(9);
     _ComputePipeline pipeline_selection_polygon_rasterize = _ComputePipeline(2);
     _ComputePipeline pipeline_generate_keys = _ComputePipeline(7);

@@ -120,6 +120,23 @@ namespace lfs::vis {
         }
     }
 
+    void RenderingManager::setLodAvailable(bool available) {
+        lod_available_ = available;
+    }
+
+    void RenderingManager::setLodEnabled(bool enabled) {
+        {
+            std::lock_guard<std::mutex> lock(settings_mutex_);
+            settings_.lod_enabled = enabled;
+        }
+        markDirty(DirtyFlag::SPLATS);
+    }
+
+    bool RenderingManager::isLodEnabled() const {
+        std::lock_guard<std::mutex> lock(settings_mutex_);
+        return settings_.lod_enabled;
+    }
+
     void RenderingManager::updateSettings(const RenderSettings& new_settings) {
         bool clear_metrics = false;
         {

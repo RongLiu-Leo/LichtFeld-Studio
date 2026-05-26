@@ -146,6 +146,14 @@ struct VulkanGSPipelineBuffers {
     // can size buffers without a synchronous cumsum readback.
     size_t num_indices_high_water = 0;
 
+    // LOD index indirection buffer
+    Buffer<uint32_t> lod_indices;  // [M] selected splat indices
+    bool has_lod_indices = false;
+
+    // LOD debug level per selected splat
+    Buffer<uint32_t> lod_levels;
+    bool has_lod_levels = false;
+
     template <typename T>
     static void reorderSH(Buffer<T>& coeffs);
     template <typename T>

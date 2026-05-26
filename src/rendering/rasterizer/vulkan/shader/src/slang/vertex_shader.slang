@@ -75,6 +75,19 @@ Gaussian_3D load_zero_gaussian() {
     return { g_xyz_ws, g_sh_coeffs, g_rotations, g_scales, g_opacities };
 }
 
+[ForceInline]
+float3 lod_debug_color(uint level) {
+    const uint idx = level & 7u;
+    if (idx == 0u) return float3(1.00, 0.20, 0.20);
+    if (idx == 1u) return float3(0.20, 0.95, 0.20);
+    if (idx == 2u) return float3(0.20, 0.55, 1.00);
+    if (idx == 3u) return float3(1.00, 0.95, 0.20);
+    if (idx == 4u) return float3(1.00, 0.45, 0.20);
+    if (idx == 5u) return float3(0.85, 0.35, 1.00);
+    if (idx == 6u) return float3(0.20, 0.95, 0.95);
+    return float3(1.00, 0.50, 0.85);
+}
+
 [Differentiable]
 Splat_2D_Vertex project_gaussian_to_camera(Gaussian_3D g, Camera cam, uint active_sh) {
     float3 xyz_vs = project_point(g.xyz_ws, cam);
@@ -345,6 +358,10 @@ layout(binding=17) StructuredBuffer<float4> model_transforms;
 // Two-stage sort: per-primitive depth key written only at the success path.
 // CPU pre-fills with 0xFFFFFFFFu so invisible primitives sort to the tail.
 layout(binding=18) RWStructuredBuffer<uint32_t> out_primitive_depth_keys;
+// LOD index indirection buffer
+layout(binding=19) StructuredBuffer<uint32_t> lod_indices;
+// LOD debug levels buffer (reserved for future use)
+layout(binding=20) StructuredBuffer<uint32_t> lod_levels;
 
 #elif EXPORT_MODE == EXPORT_MODE_VULKAN_BACKWARD
 
@@ -392,9 +409,20 @@ void main(
     const float4x4 world_view_transform = (uniforms.world_view_transform);
 
     uint g_idx = dispatchThreadID.x;
-    
+    uint render_idx = g_idx;
+    uint lod_level = 0u;
+
     if (g_idx >= uniforms.num_splats)
         return;
+
+    // LOD indirection
+    if (uniforms.lod_enabled != 0) {
+        g_idx = lod_indices[render_idx];
+        if (uniforms.lod_enabled == 2) {
+            lod_level = lod_levels[render_idx];
+        }
+    }
+    const uint out_idx = render_idx;
 
   #if EXPORT_MODE == EXPORT_MODE_VULKAN_BACKWARD
     // no overlap
@@ -534,14 +562,14 @@ void main(
     }
 
     if (!active) {
-        out_overlay_flags[g_idx] = overlay_flags;
-        out_radii[g_idx] = 0;
-        out_tiles_touched[g_idx] = 0;
+        out_overlay_flags[out_idx] = overlay_flags;
+        out_radii[out_idx] = 0;
+        out_tiles_touched[out_idx] = 0;
       #if USE_EMULATED_INT64
-        out_rect_tile_space[2*g_idx+0] = 0;
-        out_rect_tile_space[2*g_idx+1] = 0;
+        out_rect_tile_space[2*out_idx+0] = 0;
+        out_rect_tile_space[2*out_idx+1] = 0;
       #else
-        out_rect_tile_space[g_idx] = int64_t(0);
+        out_rect_tile_space[out_idx] = int64_t(0);
       #endif
         return;
     }
@@ -598,14 +626,14 @@ void main(
         splat.det <= 0.0
     ) {
         #if EXPORT_MODE == EXPORT_MODE_VULKAN_FORWARD
-            out_overlay_flags[g_idx] = overlay_flags;
-            out_radii[g_idx] = 0;
-            out_tiles_touched[g_idx] = 0;
+            out_overlay_flags[out_idx] = overlay_flags;
+            out_radii[out_idx] = 0;
+            out_tiles_touched[out_idx] = 0;
           #if USE_EMULATED_INT64
-            out_rect_tile_space[2*g_idx+0] = 0;
-            out_rect_tile_space[2*g_idx+1] = 0;
+            out_rect_tile_space[2*out_idx+0] = 0;
+            out_rect_tile_space[2*out_idx+1] = 0;
           #else
-            out_rect_tile_space[g_idx] = int64_t(0);
+            out_rect_tile_space[out_idx] = int64_t(0);
           #endif
         #endif
         return;
@@ -634,14 +662,14 @@ void main(
     int32_t n_tiles = int32_t(rect_tile_space.max_x - rect_tile_space.min_x) * int32_t(rect_tile_space.max_y - rect_tile_space.min_y);
     if (n_tiles == 0) {
         #if EXPORT_MODE == EXPORT_MODE_VULKAN_FORWARD
-            out_overlay_flags[g_idx] = overlay_flags;
-            out_radii[g_idx] = 0;
-            out_tiles_touched[g_idx] = 0;
+            out_overlay_flags[out_idx] = overlay_flags;
+            out_radii[out_idx] = 0;
+            out_tiles_touched[out_idx] = 0;
           #if USE_EMULATED_INT64
-            out_rect_tile_space[2*g_idx+0] = 0;
-            out_rect_tile_space[2*g_idx+1] = 0;
+            out_rect_tile_space[2*out_idx+0] = 0;
+            out_rect_tile_space[2*out_idx+1] = 0;
           #else
-            out_rect_tile_space[g_idx] = int64_t(0);
+            out_rect_tile_space[out_idx] = int64_t(0);
           #endif
         #endif
         return;
@@ -657,17 +685,17 @@ void main(
   #endif
 
     // out_radii[g_idx] = (uint32_t)radius;  // inria
-    out_radii[g_idx] = (uint32_t)ceil(max(radii.x, radii.y));  // gsplat, only used in densification
-    out_tiles_touched[g_idx] = n_tiles;
+    out_radii[out_idx] = (uint32_t)ceil(max(radii.x, radii.y));  // gsplat, only used in densification
+    out_tiles_touched[out_idx] = n_tiles;
   #if USE_EMULATED_INT64
-    out_rect_tile_space[2*g_idx+0] = (int32_t)rect_tile_space.min_x | ((int32_t)rect_tile_space.min_y << 16);
-    out_rect_tile_space[2*g_idx+1] = (int32_t)rect_tile_space.max_x | ((int32_t)rect_tile_space.max_y << 16);
+    out_rect_tile_space[2*out_idx+0] = (int32_t)rect_tile_space.min_x | ((int32_t)rect_tile_space.min_y << 16);
+    out_rect_tile_space[2*out_idx+1] = (int32_t)rect_tile_space.max_x | ((int32_t)rect_tile_space.max_y << 16);
   #else
-    out_rect_tile_space[g_idx] = reinterpret<int64_t>(rect_tile_space);
+    out_rect_tile_space[out_idx] = reinterpret<int64_t>(rect_tile_space);
   #endif
 
     if (n_tiles == 0) {
-        out_overlay_flags[g_idx] = overlay_flags;
+        out_overlay_flags[out_idx] = overlay_flags;
         return;
     }
 
@@ -680,17 +708,22 @@ void main(
     float3 cam_origin = no_diff camera_origin_ws(cam);
     float3 sort_delta = mean_ws - cam_origin;
     float radial_sort_metric = dot(sort_delta, sort_delta);
-    out_primitive_depth_keys[g_idx] = reinterpret<uint32_t>(radial_sort_metric);
+    out_primitive_depth_keys[out_idx] = reinterpret<uint32_t>(radial_sort_metric);
 
 #endif  // EXPORT_MODE != EXPORT_MODE_VULKAN_BACKWARD
 
 #if EXPORT_MODE == EXPORT_MODE_VULKAN_FORWARD
 
-    out_xy_vs[g_idx] = splat.xyz_vs.xy;
-    out_depths[g_idx] = splat.xyz_vs.z;
-    out_inv_cov_vs[g_idx] = splat.inv_cov_vs_opac;
-    write_t3_float3(splat.rgb, g_idx, out_rgb);
-    out_overlay_flags[g_idx] = overlay_flags;
+    if (uniforms.lod_enabled == 2) {
+        const float3 debug_rgb = lod_debug_color(lod_level);
+        splat.rgb = lerp(splat.rgb, debug_rgb, 0.80f);
+    }
+
+    out_xy_vs[out_idx] = splat.xyz_vs.xy;
+    out_depths[out_idx] = splat.xyz_vs.z;
+    out_inv_cov_vs[out_idx] = splat.inv_cov_vs_opac;
+    write_t3_float3(splat.rgb, out_idx, out_rgb);
+    out_overlay_flags[out_idx] = overlay_flags;
 
 #elif EXPORT_MODE == EXPORT_MODE_VULKAN_BACKWARD
 

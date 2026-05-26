@@ -82,6 +82,11 @@ namespace lfs::vis {
         p.depth_filter_max = detail::to_array(s.depth_filter_max);
         p.depth_filter_rotation = detail::to_array(s.depth_filter_transform.getRotation());
         p.depth_filter_translation = detail::to_array(s.depth_filter_transform.getTranslation());
+        p.lod_enabled = s.lod_enabled;
+        p.lod_debug_colors = s.lod_debug_colors;
+        p.lod_max_splats = static_cast<float>(s.lod_max_splats);
+        p.lod_pixel_scale_limit = s.lod_pixel_scale_limit;
+        p.lod_render_scale = s.lod_render_scale;
         return p;
     }
 
@@ -159,6 +164,11 @@ namespace lfs::vis {
         s.depth_filter_transform =
             lfs::geometry::EuclideanTransform(detail::to_quat(p.depth_filter_rotation),
                                               detail::to_vec3(p.depth_filter_translation));
+        s.lod_enabled = p.lod_enabled;
+        s.lod_debug_colors = p.lod_debug_colors;
+        s.lod_max_splats = static_cast<size_t>(p.lod_max_splats);
+        s.lod_pixel_scale_limit = p.lod_pixel_scale_limit;
+        s.lod_render_scale = p.lod_render_scale;
     }
 
 } // namespace lfs::vis

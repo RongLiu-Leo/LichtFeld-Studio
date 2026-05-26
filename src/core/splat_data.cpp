@@ -485,7 +485,8 @@ namespace lfs::core {
           _rotation(std::move(other._rotation)),
           _opacity(std::move(other._opacity)),
           _densification_info(std::move(other._densification_info)),
-          _deleted(std::move(other._deleted)) {
+          _deleted(std::move(other._deleted)),
+          lod_tree(std::move(other.lod_tree)) {
         // Reset the moved-from object
         other._active_sh_degree = 0;
         other._max_sh_degree = 0;
@@ -508,6 +509,9 @@ namespace lfs::core {
             _opacity = std::move(other._opacity);
             _densification_info = std::move(other._densification_info);
             _deleted = std::move(other._deleted);
+
+            // Move LOD tree
+            lod_tree = std::move(other.lod_tree);
         }
         return *this;
     }

@@ -146,11 +146,13 @@ void VulkanGSRenderer::executeProjectionForward(
     const _VulkanBuffer& overlay_params,
     const _VulkanBuffer& model_transforms,
     size_t alloc_reserve,
-    bool use_gut_projection) {
+    bool use_gut_projection,
+    const _VulkanBuffer& lod_indices,
+    const _VulkanBuffer& lod_levels) {
     PerfTimer::Timer<PerfTimer::ProjectionForward> timer(this);
     DEVICE_GUARD;
 
-    size_t num_splats = buffers.num_splats;
+    const size_t num_splats = static_cast<size_t>(uniforms.num_splats);
 
     bufferMemoryBarrier({
                             {buffers.xyz_ws.deviceBuffer, TRANSFER_COMPUTE_SHADER_WRITE},
@@ -182,33 +184,52 @@ void VulkanGSRenderer::executeProjectionForward(
     bufferMemoryBarrier({{primitive_depth_keys, TRANSFER_COMPUTE_SHADER_WRITE}},
                         COMPUTE_SHADER_READ_WRITE);
 
+    // Ensure transfer writes to optional LOD buffers are visible to projection.
+    if (lod_indices.buffer != VK_NULL_HANDLE || lod_levels.buffer != VK_NULL_HANDLE) {
+        bufferMemoryBarrier(
+            {
+                {lod_indices, TRANSFER_COMPUTE_SHADER_WRITE},
+                {lod_levels, TRANSFER_COMPUTE_SHADER_WRITE},
+            },
+            COMPUTE_SHADER_READ);
+    }
+
+    const _VulkanBuffer lod_indices_binding =
+        (lod_indices.buffer != VK_NULL_HANDLE) ? lod_indices : primitive_depth_keys;
+    const _VulkanBuffer lod_levels_binding =
+        (lod_levels.buffer != VK_NULL_HANDLE) ? lod_levels : primitive_depth_keys;
+
+    std::vector<_VulkanBuffer> projection_buffers = {
+        // inputs
+        buffers.xyz_ws.deviceBuffer,
+        buffers.sh0.deviceBuffer,
+        buffers.shN.deviceBuffer,
+        buffers.rotations.deviceBuffer,
+        buffers.scaling_raw.deviceBuffer,
+        buffers.opacity_raw.deviceBuffer,
+        // outputs
+        resizeDeviceBuffer(buffers.tiles_touched, alloc_size),
+        resizeDeviceBuffer(buffers.rect_tile_space, alloc_size),
+        resizeDeviceBuffer(buffers.radii, alloc_size),
+        resizeDeviceBuffer(buffers.xy_vs, 2 * alloc_size),
+        resizeDeviceBuffer(buffers.depths, alloc_size),
+        resizeDeviceBuffer(buffers.inv_cov_vs_opacity, 4 * alloc_size),
+        resizeDeviceBuffer(buffers.rgb, 3 * alloc_size),
+        resizeDeviceBuffer(buffers.overlay_flags, alloc_size),
+        transform_indices,
+        node_mask,
+        overlay_params,
+        model_transforms,
+        primitive_depth_keys,
+        lod_indices_binding,
+        lod_levels_binding,
+    };
+
     executeCompute(
         {{num_splats, SUBGROUP_SIZE}},
         &uniforms, sizeof(uniforms),
         use_gut_projection ? pipeline_projection_forward_3dgut : pipeline_projection_forward,
-        {
-            // inputs
-            buffers.xyz_ws.deviceBuffer,
-            buffers.sh0.deviceBuffer,
-            buffers.shN.deviceBuffer,
-            buffers.rotations.deviceBuffer,
-            buffers.scaling_raw.deviceBuffer,
-            buffers.opacity_raw.deviceBuffer,
-            // outputs
-            resizeDeviceBuffer(buffers.tiles_touched, alloc_size),
-            resizeDeviceBuffer(buffers.rect_tile_space, alloc_size),
-            resizeDeviceBuffer(buffers.radii, alloc_size),
-            resizeDeviceBuffer(buffers.xy_vs, 2 * alloc_size),
-            resizeDeviceBuffer(buffers.depths, alloc_size),
-            resizeDeviceBuffer(buffers.inv_cov_vs_opacity, 4 * alloc_size),
-            resizeDeviceBuffer(buffers.rgb, 3 * alloc_size),
-            resizeDeviceBuffer(buffers.overlay_flags, alloc_size),
-            transform_indices,
-            node_mask,
-            overlay_params,
-            model_transforms,
-            primitive_depth_keys,
-        });
+        projection_buffers);
 }
 
 void VulkanGSRenderer::executeGenerateKeys(
@@ -217,7 +238,7 @@ void VulkanGSRenderer::executeGenerateKeys(
     PerfTimer::Timer<PerfTimer::GenerateKeys> timer(this);
     DEVICE_GUARD;
 
-    const size_t num_elements = buffers.num_splats;
+    const size_t num_elements = static_cast<size_t>(uniforms.num_splats);
     // num_indices here is the deferred-readback high-water-mark estimate, not the
     // exact GPU value. The shader clamps writes to uniforms.sort_capacity, so a
     // stale estimate can drop a frame's excess intersections but cannot overrun
@@ -612,7 +633,7 @@ void VulkanGSRenderer::executeCalculateIndexBufferOffset(
     VulkanGSPipelineBuffers& buffers) {
     PerfTimer::Timer<PerfTimer::CalculateIndexBufferOffset> timer(this);
 
-    const size_t num_elements = buffers.num_splats;
+    const size_t num_elements = static_cast<size_t>(uniforms.num_splats);
     if (num_elements == 0) {
         buffers.num_indices = 0;
         return;
@@ -817,7 +838,7 @@ void VulkanGSRenderer::executeSortPrimitivesByDepth(
     VulkanGSPipelineBuffers& buffers) {
     PerfTimer::Timer<PerfTimer::SortRTS> timer(this);
 
-    const size_t num_splats = buffers.num_splats;
+    const size_t num_splats = static_cast<size_t>(uniforms.num_splats);
     if (num_splats == 0)
         return;
 
@@ -890,7 +911,7 @@ void VulkanGSRenderer::executeApplyDepthOrdering(
     PerfTimer::Timer<PerfTimer::CalculateIndexBufferOffset> timer(this);
     DEVICE_GUARD;
 
-    const size_t num_splats = buffers.num_splats;
+    const size_t num_splats = static_cast<size_t>(uniforms.num_splats);
     if (num_splats == 0)
         return;
 

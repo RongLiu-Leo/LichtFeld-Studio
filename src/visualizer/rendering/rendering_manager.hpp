@@ -18,6 +18,7 @@
 #include "rendering/rendering.hpp"
 #include "rendering/screen_overlay_renderer.hpp"
 #include "rendering_types.hpp"
+#include "spark_lod_controller.hpp"
 #include "split_view_service.hpp"
 #include "viewport_artifact_service.hpp"
 #include "viewport_frame_lifecycle_service.hpp"
@@ -425,6 +426,11 @@ namespace lfs::vis {
         }
         bool consumeResizeCompleted() { return frame_lifecycle_service_.consumeResizeCompleted(); }
 
+        // LOD management
+        void setLodAvailable(bool available);
+        void setLodEnabled(bool enabled);
+        [[nodiscard]] bool isLodEnabled() const;
+
     private:
         struct CameraMetricsJobRequest {
             uint64_t generation = 0;
@@ -472,6 +478,8 @@ namespace lfs::vis {
         std::uint64_t vulkan_viewport_image_generation_ = 0;
         std::unique_ptr<VksplatViewportRenderer> vksplat_viewport_renderer_;
         std::unique_ptr<PointCloudVulkanRenderer> point_cloud_vulkan_renderer_;
+        std::unique_ptr<SparkLodController> lod_controller_;
+        const lfs::core::SplatData* lod_controller_model_ = nullptr;
         // Cached SH0→RGB derivation for the point-cloud Vulkan path. Refreshed
         // only when the source sh0_raw() pointer/size changes so the Vulkan
         // renderer's per-tensor upload cache stays warm across frames.
@@ -513,6 +521,7 @@ namespace lfs::vis {
         uint64_t camera_metrics_request_generation_ = 0;
         std::chrono::steady_clock::time_point last_camera_metrics_refresh_time_{};
         bool initialized_ = false;
+        bool lod_available_ = false;
 
         ViewportInteractionContext viewport_interaction_context_;
 
