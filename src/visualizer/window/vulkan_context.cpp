@@ -1356,6 +1356,11 @@ namespace lfs::vis {
         create_info.device = device_;
         create_info.instance = instance_;
         create_info.vulkanApiVersion = VK_API_VERSION_1_3;
+        // Default large-heap block size is 256 MiB, which left ~130-200 MiB of
+        // device memory parked in partially-filled blocks (block_bytes vs
+        // allocation_bytes). 64 MiB caps trailing-block waste; large buffers still
+        // get dedicated allocations and bypass blocks entirely.
+        create_info.preferredLargeHeapBlockSize = VkDeviceSize{64} << 20;
 
         const VkResult result = vmaCreateAllocator(&create_info, &allocator_);
         if (result != VK_SUCCESS) {
@@ -1392,6 +1397,7 @@ namespace lfs::vis {
         profiler.setGauge("vulkan.vma.budget_usage", static_cast<double>(total_usage));
         profiler.setGauge("vulkan.vma.block_bytes", static_cast<double>(total_block_bytes));
         profiler.setGauge("vulkan.vma.allocation_bytes", static_cast<double>(total_allocation_bytes));
+        profiler.setVulkanVmaBlockBytes(static_cast<std::size_t>(total_block_bytes));
         const std::uint64_t block_free =
             total_block_bytes > total_allocation_bytes ? total_block_bytes - total_allocation_bytes : 0;
         recordCurrentVulkanBytes("vulkan.vma", "allocator_free_in_blocks", static_cast<std::size_t>(block_free));

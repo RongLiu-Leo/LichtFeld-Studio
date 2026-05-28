@@ -4,6 +4,7 @@
 #pragma once
 
 #include "core/logger.hpp"
+#include "diagnostics/vram_profiler.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -90,6 +91,7 @@ namespace lfs::core {
                     stats_.cache_hits.fetch_add(1, std::memory_order_relaxed);
                     stats_.bytes_cached.fetch_sub(bucket_size, std::memory_order_relaxed);
                     stats_.bytes_wasted.fetch_add(bucket_size - bytes, std::memory_order_relaxed);
+                    publish_cache_bytes();
                     return ptr;
                 }
             }
@@ -115,6 +117,7 @@ namespace lfs::core {
             buckets_[bucket_idx].cached_bytes += bucket_size;
             stats_.free_count.fetch_add(1, std::memory_order_relaxed);
             stats_.bytes_cached.fetch_add(bucket_size, std::memory_order_relaxed);
+            publish_cache_bytes();
             return true;
         }
 
@@ -157,6 +160,7 @@ namespace lfs::core {
                 buckets_[i].cached_bytes = 0;
             }
             stats_.bytes_cached.store(0, std::memory_order_relaxed);
+            publish_cache_bytes();
         }
 
         const Stats& stats() const { return stats_; }
@@ -183,6 +187,15 @@ namespace lfs::core {
         SizeBucketedPool& operator=(const SizeBucketedPool&) = delete;
 
     private:
+        // Publish the live reuse-cache size so the HUD can split it out of
+        // cuda.pool.untracked_used: these are freed-but-retained cudaMallocAsync
+        // buffers, still in the pool's UsedMemCurrent but dropped from the tensor
+        // allocator's live map. Reclaimable via trim_cache().
+        void publish_cache_bytes() const {
+            lfs::diagnostics::VramProfiler::instance().setCudaPoolBucketCacheBytes(
+                stats_.bytes_cached.load(std::memory_order_relaxed));
+        }
+
         struct Bucket {
             std::vector<void*> cache;
             std::mutex mutex;

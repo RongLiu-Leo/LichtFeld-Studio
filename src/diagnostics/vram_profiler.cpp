@@ -309,9 +309,14 @@ namespace lfs::diagnostics {
         VramProcessSnapshot process;
         std::size_t pinned_host_used = 0;
         std::size_t vulkan_vma_used = 0;
+        std::size_t vulkan_vma_block_bytes = 0;
         std::size_t exportable_splat_bytes = 0;
+        // Pushed lock-free from the tensor pool's hot path; read into the snapshot
+        // under the mutex. A lossy gauge, so no sequence bump on update.
+        std::atomic<std::size_t> cuda_pool_bucket_cache_bytes{0};
         std::size_t cuda_context_baseline = 0;
         std::size_t cuda_warmup_bytes = 0;
+        std::size_t cuda_device_baseline = 0;
         std::unordered_map<std::string, std::size_t> cuda_phase_bytes;
         std::uint64_t allocation_events = 0;
         std::uint64_t free_events = 0;
@@ -377,6 +382,7 @@ namespace lfs::diagnostics {
             impl_->accounted_history.clear();
             impl_->pinned_host_used = 0;
             impl_->vulkan_vma_used = 0;
+            impl_->vulkan_vma_block_bytes = 0;
             impl_->exportable_splat_bytes = 0;
             // cuda_context_baseline intentionally preserved: it captures the irreducible
             // runtime overhead once at process startup and is valid for the session.
@@ -962,6 +968,19 @@ namespace lfs::diagnostics {
         impl_->sequence.fetch_add(1, std::memory_order_relaxed);
     }
 
+    void VramProfiler::setVulkanVmaBlockBytes(const std::size_t bytes) {
+        std::lock_guard lock(impl_->mutex);
+        impl_->vulkan_vma_block_bytes = bytes;
+        impl_->process.vulkan_vma_block_bytes = bytes;
+        impl_->sequence.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void VramProfiler::setCudaPoolBucketCacheBytes(const std::size_t bytes) {
+        // Lock-free: called from the tensor allocator's per-allocation path. Read
+        // into the process snapshot during the periodic sampleCudaMemory pass.
+        impl_->cuda_pool_bucket_cache_bytes.store(bytes, std::memory_order_relaxed);
+    }
+
     void VramProfiler::setExportableSplatBytes(const std::size_t bytes) {
         std::lock_guard lock(impl_->mutex);
         impl_->exportable_splat_bytes = bytes;
@@ -1006,15 +1025,29 @@ namespace lfs::diagnostics {
         impl_->sequence.fetch_add(1, std::memory_order_relaxed);
     }
 
+    void VramProfiler::captureCudaDeviceBaseline() {
+        std::size_t used = 0;
+        if (!sample_cuda_used_bytes(used))
+            return;
+        std::lock_guard lock(impl_->mutex);
+        if (impl_->cuda_device_baseline == 0)
+            impl_->cuda_device_baseline = used;
+        impl_->sequence.fetch_add(1, std::memory_order_relaxed);
+    }
+
     void VramProfiler::captureCudaWarmupDelta() {
         std::size_t used = 0;
         if (!sample_cuda_used_bytes(used))
             return;
         std::lock_guard lock(impl_->mutex);
-        if (impl_->cuda_warmup_bytes != 0)
+        if (impl_->cuda_warmup_bytes != 0 || impl_->cuda_device_baseline == 0)
             return;
-        if (used > impl_->cuda_context_baseline) {
-            impl_->cuda_warmup_bytes = used - impl_->cuda_context_baseline;
+        // Diff device-wide cudaMemGetInfo against a device-wide baseline captured at
+        // the same point — NOT the NVML per-PID context baseline. Mixing the two
+        // metrics produced a meaningless offset. This delta is the VRAM the kernel
+        // warmup committed (cubin upload + per-launch driver reservations).
+        if (used > impl_->cuda_device_baseline) {
+            impl_->cuda_warmup_bytes = used - impl_->cuda_device_baseline;
             impl_->process.cuda_warmup_bytes = impl_->cuda_warmup_bytes;
         }
         impl_->sequence.fetch_add(1, std::memory_order_relaxed);
@@ -1092,6 +1125,9 @@ namespace lfs::diagnostics {
             }
             process.pinned_host_used = impl_->pinned_host_used;
             process.vulkan_vma_used = impl_->vulkan_vma_used;
+            process.vulkan_vma_block_bytes = impl_->vulkan_vma_block_bytes;
+            process.cuda_pool_bucket_cache_bytes =
+                impl_->cuda_pool_bucket_cache_bytes.load(std::memory_order_relaxed);
             process.exportable_splat_bytes = impl_->exportable_splat_bytes;
             process.cuda_context_baseline = impl_->cuda_context_baseline;
             process.cuda_warmup_bytes = impl_->cuda_warmup_bytes;

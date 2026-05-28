@@ -44,6 +44,8 @@ namespace lfs::vis::gui {
             {"cuda_pool_reserved", "CUDA pool reserved"},
             {"cuda_pool_fragmentation", "Pool fragmentation"},
             {"pinned_host", "Pinned host"},
+            {"vulkan_budget", "Vulkan budget (raw)"},
+            {"vulkan_blocks", "Vulkan VMA blocks"},
             {"sampled", "Sampled subtotal"},
             {"allocator_live", "Allocator live"},
             {"process_gap", "Unsampled gap"},
@@ -626,6 +628,9 @@ namespace lfs::vis::gui {
         write("cuda_pool_fragmentation",
               formatBytes(s.process.cuda_pool_valid ? s.process.cuda_pool_fragmentation : 0));
         write("pinned_host", formatBytes(s.process.pinned_host_used));
+        write("vulkan_budget", formatBytes(s.process.vulkan_vma_used),
+              formatPercent(s.process.vulkan_vma_used, process_used));
+        write("vulkan_blocks", formatBytes(s.process.vulkan_vma_block_bytes));
         write("sampled", formatBytes(s.sampled_live_bytes),
               formatPercent(s.sampled_live_bytes, process_used));
         write("allocator_live", formatBytes(s.accounted_live_bytes),
@@ -764,12 +769,13 @@ namespace lfs::vis::gui {
         if (proc.cuda_warmup_bytes > 0) {
             add_synthetic_row("cuda.warmup_kernels", proc.cuda_warmup_bytes);
         }
-        if (proc.vulkan_vma_used > 0) {
-            // The Vulkan budget reports the *whole* process heap. Subtract the
-            // Vulkan-backed rows we have named explicitly, legacy vksplat.* rows,
-            // and the CUDA-exportable splat block imported as VkDeviceMemory. What
-            // remains is the driver-owned/unknown residual, not a catch-all for
-            // allocations we already labelled.
+        if (proc.vulkan_vma_block_bytes > 0) {
+            // Residual against the memory VMA actually owns (blockBytes), NOT the
+            // VK_EXT_memory_budget figure: that one reports the whole process heap
+            // (CUDA, imported blocks, driver) and would attribute ~1 GiB of non-Vulkan
+            // memory here. Subtract the Vulkan rows we have named; what is left is
+            // genuinely unnamed Vulkan (VMA block reserve, swap-chain, etc.). The
+            // larger process gap belongs to process.residual below, not Vulkan.
             const auto vksplat_it = groups.find("vksplat");
             const std::size_t vksplat_labeled =
                 vksplat_it != groups.end() ? vksplat_it->second : 0;
@@ -779,20 +785,28 @@ namespace lfs::vis::gui {
                     vulkan_labeled += bytes;
                 }
             }
-            const std::size_t deductions =
-                vksplat_labeled + vulkan_labeled + proc.exportable_splat_bytes;
+            const std::size_t deductions = vksplat_labeled + vulkan_labeled;
             const std::size_t vulkan_residual =
-                proc.vulkan_vma_used > deductions ? proc.vulkan_vma_used - deductions : 0;
+                proc.vulkan_vma_block_bytes > deductions ? proc.vulkan_vma_block_bytes - deductions : 0;
             if (vulkan_residual > 0) {
-                // Driver/runtime backing heap plus any unnamed VMA allocation. Not an
-                // actionable app allocation, so flag it unaccounted (dimmed) — but show
-                // it, otherwise the visible rows silently fall short of Sum/Process.
                 add_synthetic_row("vulkan.residual", vulkan_residual, true);
             }
         }
 
         if (pool_untracked > 0) {
-            add_synthetic_row("cuda.pool.untracked_used", pool_untracked);
+            // Split the pool memory the allocator's live map doesn't cover. The
+            // size-bucketed reuse cache (freed-but-retained buffers) is the large
+            // reclaimable part and is measured directly; whatever remains is bucket
+            // rounding plus genuine third-party (thrust/CUB) pool use.
+            const std::size_t bucket_cache =
+                std::min(proc.cuda_pool_bucket_cache_bytes, pool_untracked);
+            if (bucket_cache > 0) {
+                add_synthetic_row("cuda.pool.bucket_cache", bucket_cache);
+            }
+            const std::size_t pool_remainder = pool_untracked - bucket_cache;
+            if (pool_remainder > 0) {
+                add_synthetic_row("cuda.pool.untracked_used", pool_remainder);
+            }
         }
 
         const bool cuda_runtime_active =

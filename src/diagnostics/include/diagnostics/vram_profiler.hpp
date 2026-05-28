@@ -104,6 +104,10 @@ namespace lfs::diagnostics {
         std::size_t cuda_pool_used = 0;
         std::size_t cuda_pool_reserved = 0;
         std::size_t cuda_pool_fragmentation = 0;
+        // Live size-bucketed reuse cache: freed-but-retained cudaMallocAsync buffers
+        // still counted in cuda_pool_used but not in the allocator's live map. Lets
+        // the HUD split cuda.pool.untracked_used into reclaimable cache vs the rest.
+        std::size_t cuda_pool_bucket_cache_bytes = 0;
         std::size_t cuda_context_baseline = 0;
         std::size_t cuda_warmup_bytes = 0;
         std::size_t cuda_phase_primary_context = 0;
@@ -113,12 +117,18 @@ namespace lfs::diagnostics {
         std::size_t cuda_phase_malloc_heap = 0;
         std::size_t cuda_phase_curand_load = 0;
         std::size_t pinned_host_used = 0;
+        // VK_EXT_memory_budget heap usage: the driver's estimate of the *whole
+        // process* device heap (CUDA allocations, imported external blocks,
+        // swap-chain, descriptor pools, driver internals) — NOT just VMA memory.
         std::size_t vulkan_vma_used = 0;
+        // VMA blockBytes: device memory VMA actually owns. This is the real
+        // Vulkan footprint the HUD attributes a residual against; vulkan_vma_used
+        // overcounts it ~3x with non-Vulkan process memory.
+        std::size_t vulkan_vma_block_bytes = 0;
         // CUDA-allocated exportable VMM block backing the splat tensors (shared
-        // with Vulkan via VK_EXT_external_memory). The same physical bytes are
-        // visible through both VK_EXT_memory_budget (vulkan_vma_used) and the
-        // per-tensor model.* rows; the HUD subtracts this from the Vulkan
-        // residual to avoid double-counting.
+        // with Vulkan via VK_EXT_external_memory). Imported memory is not part of
+        // vulkan_vma_block_bytes, so the per-tensor model.* rows account for it
+        // without overlapping the Vulkan residual.
         std::size_t exportable_splat_bytes = 0;
         std::size_t process_used = 0;
         std::size_t total_used = 0;
@@ -271,8 +281,11 @@ namespace lfs::diagnostics {
 
         void setPinnedHostUsed(std::size_t bytes);
         void setVulkanVmaUsed(std::size_t bytes);
+        void setVulkanVmaBlockBytes(std::size_t bytes);
+        void setCudaPoolBucketCacheBytes(std::size_t bytes);
         void setExportableSplatBytes(std::size_t bytes);
         void captureCudaContextBaseline();
+        void captureCudaDeviceBaseline();
         void captureCudaWarmupDelta();
         void recordCudaPhaseBytes(std::string_view phase, std::size_t bytes);
         void setCudaContextBaselineBytes(std::size_t bytes);

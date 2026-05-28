@@ -125,6 +125,11 @@ namespace {
         // The per-PID baseline = current NVML reading. Used as the breakdown's anchor
         // so cuda.context.residual = baseline − Σphases.
         p.setCudaContextBaselineBytes(process_used_now());
+
+        // Device-wide (cudaMemGetInfo) baseline captured at the same point, so the
+        // later kernel-warmup delta is measured against a matching metric instead of
+        // the NVML per-PID anchor.
+        p.captureCudaDeviceBaseline();
     }
 
     // Register OpenUSD plugin resources deployed beside the executable.
