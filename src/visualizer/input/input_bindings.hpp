@@ -116,6 +116,7 @@ namespace lfs::vis::input {
         PIE_MENU,
         DEPTH_ADJUST_NEAR, // Deprecated: migrated to DEPTH_ADJUST_FAR on load
         CAMERA_RESET_HOME,
+        HISTOGRAM_ZOOM_MARKED,
 
     };
 

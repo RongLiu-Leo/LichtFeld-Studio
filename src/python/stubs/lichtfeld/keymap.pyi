@@ -1,5 +1,6 @@
 """Keymap configuration"""
 
+from collections.abc import Sequence
 import enum
 
 
@@ -144,6 +145,8 @@ class Action(enum.Enum):
 
     DEPTH_ADJUST_NEAR = 69
 
+    HISTOGRAM_ZOOM_MARKED = 71
+
 class ToolMode(enum.Enum):
     GLOBAL = 0
 
@@ -229,6 +232,9 @@ class MouseButtonTrigger:
 
 def get_action_for_key(mode: ToolMode, key: int, modifiers: int = 0) -> Action:
     """Get action bound to a key in given mode"""
+
+def get_action_for_scroll(mode: ToolMode, modifiers: int = 0, held_keys: Sequence[int] = []) -> Action:
+    """Get action bound to a mouse scroll trigger in given mode"""
 
 def get_key_for_action(action: Action, mode: ToolMode = ToolMode.GLOBAL) -> int:
     """Get key code bound to an action"""

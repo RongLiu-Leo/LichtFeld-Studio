@@ -97,6 +97,8 @@ class _MouseEventStub:
         meta: bool = False,
         shift: bool = False,
         modifiers: int | None = None,
+        wheel_delta: float | None = None,
+        wheel_delta_y: float | None = None,
     ):
         self._params = {
             "mouse_x": str(mouse_x),
@@ -105,6 +107,10 @@ class _MouseEventStub:
         }
         if modifiers is not None:
             self._params["modifiers"] = str(modifiers)
+        if wheel_delta is not None:
+            self._params["wheel_delta"] = str(wheel_delta)
+        if wheel_delta_y is not None:
+            self._params["wheel_delta_y"] = str(wheel_delta_y)
         self._bools = {"ctrl_key": ctrl, "meta_key": meta, "shift_key": shift}
         self.stopped = False
 
@@ -687,6 +693,88 @@ def test_compare_ctrl_a_selects_full_grid(histogram_panel_module, lf, numpy, mon
     )
     assert len(panel._selected_compare_cells) == panel._compare_x_bin_count * panel._compare_y_bin_count
     numpy.testing.assert_array_equal(scene.selection_mask.cpu().numpy(), numpy.ones(3, dtype=bool))
+
+
+def test_histogram_ctrl_scroll_zooms_at_cursor_through_keymap(histogram_panel_module, lf, numpy, monkeypatch):
+    panel = histogram_panel_module.HistogramPanel()
+    panel._show_chart = True
+    panel._handle = _UpdateHandleStub()
+    panel._primary_valid_values = lf.Tensor.from_numpy(
+        numpy.array([0.05, 0.15, 0.25, 0.35, 0.45], dtype=numpy.float32)
+    )
+    panel._primary_histogram_min = 0.0
+    panel._primary_histogram_max = 1.0
+    panel._auto_histogram_min = 0.0
+    panel._auto_histogram_max = 1.0
+    panel._histogram_bin_count = 10
+    # Chart geometry so a mouse-x maps to a value; cursor sits at the chart centre (value 0.5).
+    panel._chart_el = SimpleNamespace(absolute_left=0.0, absolute_width=100.0)
+    # Isolate the cursor-zoom math from data snapping (snapping is exercised separately).
+    monkeypatch.setattr(panel, "_snap_histogram_zoom_bounds_to_data", lambda lo, hi: (lo, hi))
+
+    zoom_action = object()
+    seen_scrolls = []
+
+    def get_action_for_scroll(mode, modifiers):
+        seen_scrolls.append((mode, modifiers))
+        return zoom_action if modifiers == 2 else object()
+
+    fake_keymap = SimpleNamespace(
+        Modifier=SimpleNamespace(
+            SHIFT=SimpleNamespace(value=1),
+            CTRL=SimpleNamespace(value=2),
+            ALT=SimpleNamespace(value=4),
+            SUPER=SimpleNamespace(value=8),
+        ),
+        ToolMode=SimpleNamespace(GLOBAL="global"),
+        Action=SimpleNamespace(HISTOGRAM_ZOOM_MARKED=zoom_action),
+        get_action_for_scroll=get_action_for_scroll,
+    )
+    monkeypatch.setattr(histogram_panel_module.lf, "keymap", fake_keymap, raising=False)
+
+    # A refresh would re-bin against the new custom range; mirror that so the view the
+    # next scroll reads from tracks the committed range.
+    def sync_view_from_custom_range():
+        panel._primary_histogram_min = (
+            panel._auto_histogram_min
+            if panel._custom_range_min_value is None
+            else panel._custom_range_min_value
+        )
+        panel._primary_histogram_max = (
+            panel._auto_histogram_max
+            if panel._custom_range_max_value is None
+            else panel._custom_range_max_value
+        )
+
+    monkeypatch.setattr(panel, "_refresh", sync_view_from_custom_range)
+
+    # Zoom in: the value under the cursor (0.5) stays pinned while the span shrinks 20%.
+    zoom_event = _MouseEventStub(mouse_x=50.0, modifiers=RML_KM_CTRL, wheel_delta=-1.0)
+    panel._on_chart_mousescroll(zoom_event)
+    assert zoom_event.stopped is True
+    assert seen_scrolls == [("global", 2)]
+    assert panel._custom_range_min_value == pytest.approx(0.1)
+    assert panel._custom_range_max_value == pytest.approx(0.9)
+
+    # Zoom in again around the same cursor value.
+    second_zoom_event = _MouseEventStub(mouse_x=50.0, modifiers=RML_KM_CTRL, wheel_delta=-1.0)
+    panel._on_chart_mousescroll(second_zoom_event)
+    assert second_zoom_event.stopped is True
+    assert panel._custom_range_min_value == pytest.approx(0.18)
+    assert panel._custom_range_max_value == pytest.approx(0.82)
+
+    # Zoom back out widens the window around the cursor.
+    zoom_out_event = _MouseEventStub(mouse_x=50.0, modifiers=RML_KM_CTRL, wheel_delta=1.0)
+    panel._on_chart_mousescroll(zoom_out_event)
+    assert zoom_out_event.stopped is True
+    assert panel._custom_range_min_value == pytest.approx(0.1)
+    assert panel._custom_range_max_value == pytest.approx(0.9)
+
+    # Zooming all the way out drops the custom range entirely (back to the full extent).
+    for _ in range(10):
+        panel._on_chart_mousescroll(_MouseEventStub(mouse_x=50.0, modifiers=RML_KM_CTRL, wheel_delta=1.0))
+    assert panel._custom_range_min_value is None
+    assert panel._custom_range_max_value is None
 
 
 def test_histogram_delete_shortcut_deletes_panel_selection(histogram_panel_module, lf, numpy, monkeypatch):

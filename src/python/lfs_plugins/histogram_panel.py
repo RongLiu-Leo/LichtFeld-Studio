@@ -27,6 +27,9 @@ DEFAULT_COMPARE_Y_BIN_COUNT = 20
 MIN_COMPARE_BIN_COUNT = 8
 MAX_COMPARE_BIN_COUNT = 48
 HISTOGRAM_BAR_GAP = 2.0
+# Span multiplier per wheel notch. <1 so one notch zooms in by 20%, smooth enough
+# to frame a feature in a few notches without overshooting.
+HISTOGRAM_ZOOM_STEP = 0.8
 RML_KM_CTRL = 1 << 0
 RML_KM_SHIFT = 1 << 1
 RML_KM_ALT = 1 << 2
@@ -167,7 +170,7 @@ class HistogramPanel(Panel):
         self._marked_count_text = _trf("histogram.gaussian_count", "{count} Gaussians", count="0")
         self._status_hint = _tr(
             "histogram.status_drag_delete",
-            "Left-drag across the histogram to mark a range, then delete it.",
+            "Left-drag to mark a range, then delete it  ·  Ctrl+scroll to zoom",
         )
         self._selection_left_style = "0%"
         self._selection_width_style = "0%"
@@ -248,10 +251,14 @@ class HistogramPanel(Panel):
         model.bind_func("compare_x_axis_max", lambda: self._compare_x_axis_max)
         model.bind_func("compare_y_axis_min", lambda: self._compare_y_axis_min)
         model.bind_func("compare_y_axis_max", lambda: self._compare_y_axis_max)
-        model.bind_func("show_selection_overlay", lambda: self._histogram_overlay_bounds is not None)
+        # The sweep rectangle is only a live drag affordance; once committed, the marked bars
+        # themselves carry the selection colour, so the box hides on mouse-up.
+        model.bind_func("show_selection_overlay",
+                        lambda: self._dragging_mark and self._histogram_overlay_bounds is not None)
         model.bind_func("selection_left_style", lambda: self._selection_left_style)
         model.bind_func("selection_width_style", lambda: self._selection_width_style)
-        model.bind_func("show_compare_selection_overlay", lambda: self._compare_overlay_bounds is not None)
+        model.bind_func("show_compare_selection_overlay",
+                        lambda: self._dragging_compare_mark and self._compare_overlay_bounds is not None)
         model.bind_func("compare_selection_left_style", lambda: self._compare_selection_left_style)
         model.bind_func("compare_selection_top_style", lambda: self._compare_selection_top_style)
         model.bind_func("compare_selection_width_style", lambda: self._compare_selection_width_style)
@@ -306,8 +313,10 @@ class HistogramPanel(Panel):
         self._sync_panel_space_state()
         if self._chart_el:
             self._chart_el.add_event_listener("mousedown", self._on_chart_mousedown)
+            self._chart_el.add_event_listener("mousescroll", self._on_chart_mousescroll)
         if self._compare_chart_el:
             self._compare_chart_el.add_event_listener("mousedown", self._on_compare_chart_mousedown)
+            self._compare_chart_el.add_event_listener("mousescroll", self._on_compare_chart_mousescroll)
         for input_id in ("range-min-input", "range-max-input",
                          "compare-range-x-min-input", "compare-range-x-max-input"):
             el = doc.get_element_by_id(input_id)
@@ -546,6 +555,274 @@ class HistogramPanel(Panel):
         if self._handle:
             self._handle.dirty_all()
 
+    def _refresh_range_preserving_mark(self):
+        self._scene_generation = -1
+        self._refresh()
+        if self._handle:
+            self._handle.dirty_all()
+
+    def _assign_custom_range_values(self, range_min: float, range_max: float) -> bool:
+        lo = float(min(range_min, range_max))
+        hi = float(max(range_min, range_max))
+        if not (math.isfinite(lo) and math.isfinite(hi)) or hi <= lo:
+            return False
+        changed = (
+            self._custom_range_min_value != lo or
+            self._custom_range_max_value != hi
+        )
+        self._custom_range_min_value = lo
+        self._custom_range_max_value = hi
+        self._custom_range_min_str = self._format_range_input(lo)
+        self._custom_range_max_str = self._format_range_input(hi)
+        return changed
+
+    def _clear_custom_range_values(self) -> bool:
+        if not self._has_custom_range():
+            return False
+        self._reset_custom_range()
+        return True
+
+    def _assign_compare_y_custom_range_values(self, range_min: float, range_max: float) -> bool:
+        lo = float(min(range_min, range_max))
+        hi = float(max(range_min, range_max))
+        if not (math.isfinite(lo) and math.isfinite(hi)) or hi <= lo:
+            return False
+        changed = (
+            self._compare_y_custom_range_min_value != lo or
+            self._compare_y_custom_range_max_value != hi
+        )
+        self._compare_y_custom_range_min_value = lo
+        self._compare_y_custom_range_max_value = hi
+        self._compare_y_custom_range_min_str = self._format_range_input(lo)
+        self._compare_y_custom_range_max_str = self._format_range_input(hi)
+        return changed
+
+    def _clear_compare_y_custom_range_values(self) -> bool:
+        if not self._has_compare_y_custom_range():
+            return False
+        self._reset_compare_y_custom_range()
+        return True
+
+    @staticmethod
+    def _value_at_fraction(fraction: float, lo: float, hi: float, log_scale: bool) -> float | None:
+        """Map a 0..1 position across the chart to a data value, matching the linear /
+        log-spaced bin layout so the value lands under the pixel the user pointed at."""
+        lo = float(lo)
+        hi = float(hi)
+        if not (math.isfinite(lo) and math.isfinite(hi)) or hi <= lo:
+            return None
+        fraction = min(1.0, max(0.0, float(fraction)))
+        if log_scale and lo > 0.0 and hi > 0.0:
+            log_lo = math.log(lo)
+            log_hi = math.log(hi)
+            return math.exp(log_lo + (log_hi - log_lo) * fraction)
+        return lo + (hi - lo) * fraction
+
+    @staticmethod
+    def _cursor_zoom_bounds(
+        current_min: float,
+        current_max: float,
+        focus: float,
+        domain_min: float,
+        domain_max: float,
+        zoom_in: bool,
+        log_scale: bool = False,
+    ) -> tuple[float, float] | None:
+        """Zoom [current_min, current_max] around ``focus`` (the value under the cursor),
+        keeping that value pinned to its on-screen position. Clamps to the data domain.
+        Returns the full domain when a zoom-out reaches it (caller drops the custom range),
+        or None when the inputs are degenerate."""
+        values = (current_min, current_max, focus, domain_min, domain_max)
+        if not all(math.isfinite(float(value)) for value in values):
+            return None
+
+        domain_lo, domain_hi = sorted((float(domain_min), float(domain_max)))
+        current_lo, current_hi = sorted((float(current_min), float(current_max)))
+        if domain_hi <= domain_lo or current_hi <= current_lo:
+            return None
+
+        use_log = log_scale and domain_lo > 0.0 and current_lo > 0.0 and float(focus) > 0.0
+        to_axis = math.log if use_log else (lambda value: value)
+        from_axis = math.exp if use_log else (lambda value: value)
+
+        axis_domain_lo = to_axis(domain_lo)
+        axis_domain_hi = to_axis(domain_hi)
+        axis_current_lo = min(max(to_axis(current_lo), axis_domain_lo), axis_domain_hi)
+        axis_current_hi = min(max(to_axis(current_hi), axis_domain_lo), axis_domain_hi)
+        axis_focus = min(max(to_axis(float(focus)), axis_current_lo), axis_current_hi)
+
+        span = axis_current_hi - axis_current_lo
+        domain_span = axis_domain_hi - axis_domain_lo
+        if span <= 0.0 or domain_span <= 0.0:
+            return None
+
+        target_span = span * HISTOGRAM_ZOOM_STEP if zoom_in else span / HISTOGRAM_ZOOM_STEP
+        if not zoom_in and target_span >= domain_span:
+            return from_axis(axis_domain_lo), from_axis(axis_domain_hi)
+        target_span = min(target_span, domain_span)
+        target_span = max(target_span, max(domain_span * 1e-9, 1e-30))
+
+        # Hold the focused value at its current fractional offset so the point under the
+        # cursor stays put as the window shrinks or grows around it.
+        fraction = (axis_focus - axis_current_lo) / span
+        new_lo = axis_focus - fraction * target_span
+        new_hi = new_lo + target_span
+
+        if new_lo < axis_domain_lo:
+            new_hi += axis_domain_lo - new_lo
+            new_lo = axis_domain_lo
+        if new_hi > axis_domain_hi:
+            new_lo -= new_hi - axis_domain_hi
+            new_hi = axis_domain_hi
+        new_lo = max(axis_domain_lo, new_lo)
+        new_hi = min(axis_domain_hi, new_hi)
+        if new_hi <= new_lo:
+            return None
+        return from_axis(new_lo), from_axis(new_hi)
+
+    @staticmethod
+    def _view_covers_domain(view_min: float, view_max: float, domain_min: float, domain_max: float) -> bool:
+        domain_lo, domain_hi = sorted((float(domain_min), float(domain_max)))
+        span = domain_hi - domain_lo
+        if span <= 0.0:
+            return True
+        tolerance = span * 1e-6
+        return float(view_min) <= domain_lo + tolerance and float(view_max) >= domain_hi - tolerance
+
+    def _snap_histogram_zoom_bounds_to_data(self, range_min: float, range_max: float) -> tuple[float, float]:
+        if self._primary_valid_values is None:
+            return float(range_min), float(range_max)
+        try:
+            finite_values = self._primary_valid_values.contiguous().cpu().to("float32")
+            return self._snap_bounds_to_data(
+                finite_values,
+                float(range_min),
+                float(range_max),
+                log_scale=self._log_scale_enabled,
+            )
+        except Exception:
+            return float(range_min), float(range_max)
+
+    def _histogram_value_for_mouse_x(self, mouse_x: float) -> float | None:
+        if self._chart_el is None:
+            return None
+        left = float(self._chart_el.absolute_left)
+        total_width, _, _ = self._histogram_bar_geometry(self._histogram_bin_count)
+        if total_width <= 0.0:
+            return None
+        return self._value_at_fraction(
+            (mouse_x - left) / total_width,
+            self._primary_histogram_min,
+            self._primary_histogram_max,
+            self._log_scale_enabled,
+        )
+
+    def _apply_histogram_view_range(self, range_min: float, range_max: float) -> bool:
+        lo = float(min(range_min, range_max))
+        hi = float(max(range_min, range_max))
+        if not (math.isfinite(lo) and math.isfinite(hi)) or hi <= lo:
+            return False
+        # Reaching the data extent drops the custom range so the panel returns to its
+        # pristine auto-ranged state instead of pinning a range that spans everything.
+        if self._view_covers_domain(lo, hi, self._auto_histogram_min, self._auto_histogram_max):
+            if not self._clear_custom_range_values():
+                return False
+        else:
+            lo, hi = self._snap_histogram_zoom_bounds_to_data(lo, hi)
+            if not self._assign_custom_range_values(lo, hi):
+                if self._handle:
+                    self._handle.dirty_all()
+                return True
+        self._refresh_range_preserving_mark()
+        return True
+
+    def _zoom_histogram_at_value(self, focus_value: float, zoom_in: bool) -> bool:
+        if not self._show_chart:
+            return False
+        # Already framing the whole distribution — a further zoom-out is a no-op.
+        if not zoom_in and not self._has_custom_range():
+            return False
+        bounds = self._cursor_zoom_bounds(
+            self._primary_histogram_min,
+            self._primary_histogram_max,
+            focus_value,
+            self._auto_histogram_min,
+            self._auto_histogram_max,
+            zoom_in,
+            log_scale=self._log_scale_enabled,
+        )
+        if bounds is None:
+            return False
+        return self._apply_histogram_view_range(*bounds)
+
+    def _compare_value_for_mouse(self, mouse_x: float, mouse_y: float) -> tuple[float, float] | None:
+        if self._compare_chart_el is None:
+            return None
+        left = float(self._compare_chart_el.absolute_left)
+        top = float(self._compare_chart_el.absolute_top)
+        width = max(float(self._compare_chart_el.absolute_width), 1.0)
+        height = max(float(self._compare_chart_el.absolute_height), 1.0)
+        x_value = self._value_at_fraction(
+            (mouse_x - left) / width, self._compare_x_min, self._compare_x_max, self._log_scale_enabled
+        )
+        # Screen y grows downward while the value axis grows upward, so invert.
+        y_value = self._value_at_fraction(
+            1.0 - (mouse_y - top) / height, self._compare_y_min, self._compare_y_max, self._log_scale_enabled
+        )
+        if x_value is None or y_value is None:
+            return None
+        return x_value, y_value
+
+    def _apply_compare_view_range(self, x_min: float, x_max: float, y_min: float, y_max: float) -> bool:
+        x_lo = float(min(x_min, x_max))
+        x_hi = float(max(x_min, x_max))
+        y_lo = float(min(y_min, y_max))
+        y_hi = float(max(y_min, y_max))
+        if x_hi <= x_lo or y_hi <= y_lo:
+            return False
+        changed = False
+        if self._view_covers_domain(x_lo, x_hi, self._auto_histogram_min, self._auto_histogram_max):
+            changed = self._clear_custom_range_values() or changed
+        else:
+            x_lo, x_hi = self._snap_histogram_zoom_bounds_to_data(x_lo, x_hi)
+            changed = self._assign_custom_range_values(x_lo, x_hi) or changed
+        if self._view_covers_domain(y_lo, y_hi, self._compare_y_auto_min, self._compare_y_auto_max):
+            changed = self._clear_compare_y_custom_range_values() or changed
+        else:
+            changed = self._assign_compare_y_custom_range_values(y_lo, y_hi) or changed
+        if changed:
+            self._refresh_range_preserving_mark()
+        elif self._handle:
+            self._handle.dirty_all()
+        return True
+
+    def _zoom_compare_at_value(self, focus_x: float, focus_y: float, zoom_in: bool) -> bool:
+        if not self._show_compare_chart:
+            return False
+        if not zoom_in and not self._has_any_custom_range():
+            return False
+        zoomed_x = self._cursor_zoom_bounds(
+            self._compare_x_min,
+            self._compare_x_max,
+            focus_x,
+            self._auto_histogram_min,
+            self._auto_histogram_max,
+            zoom_in,
+            log_scale=self._log_scale_enabled,
+        )
+        zoomed_y = self._cursor_zoom_bounds(
+            self._compare_y_min,
+            self._compare_y_max,
+            focus_y,
+            self._compare_y_auto_min,
+            self._compare_y_auto_max,
+            zoom_in,
+            log_scale=self._log_scale_enabled,
+        )
+        if zoomed_x is None or zoomed_y is None:
+            return False
+        return self._apply_compare_view_range(zoomed_x[0], zoomed_x[1], zoomed_y[0], zoomed_y[1])
+
     def _set_custom_range_min(self, value):
         # Per-keystroke setter: just buffer the text. Commit happens on Enter or blur
         # via _commit_custom_range so the user can type freely without the input
@@ -614,7 +891,7 @@ class HistogramPanel(Panel):
     def _on_range_input_blur(self, _event):
         self._commit_custom_range()
 
-    def _on_reset_range(self, _event=None):
+    def _on_reset_range(self, _handle, _event, _args):
         if not self._has_custom_range():
             return
         self._reset_custom_range()
@@ -694,7 +971,7 @@ class HistogramPanel(Panel):
     def _on_compare_y_range_input_blur(self, _event):
         self._commit_compare_y_range()
 
-    def _on_reset_compare_range(self, _event=None):
+    def _on_reset_compare_range(self, _handle, _event, _args):
         if not self._has_any_custom_range():
             return
         self._reset_custom_range()
@@ -1360,6 +1637,76 @@ class HistogramPanel(Panel):
             return bool(lf.ui.is_ctrl_down())
         except Exception:
             return False
+
+    @staticmethod
+    def _keymap_modifier_value(name: str, fallback: int) -> int:
+        try:
+            return int(getattr(lf.keymap.Modifier, name).value)
+        except Exception:
+            return fallback
+
+    @classmethod
+    def _event_keymap_modifier_mask(cls, event) -> int:
+        modifiers = 0
+        ctrl_pressed = cls._event_has_modifier(event, "ctrl_key", "ctrl", mask=RML_KM_CTRL)
+        shift_pressed = cls._event_has_modifier(event, "shift_key", "shift", mask=RML_KM_SHIFT)
+        alt_pressed = cls._event_has_modifier(event, "alt_key", "alt", mask=RML_KM_ALT)
+        super_pressed = cls._event_has_modifier(
+            event, "meta_key", "meta", "super_key", "super", mask=RML_KM_META
+        )
+
+        if cls._is_rml_event(event):
+            if not ctrl_pressed:
+                try:
+                    ctrl_pressed = bool(lf.ui.is_ctrl_down())
+                except Exception:
+                    pass
+            if not shift_pressed:
+                try:
+                    shift_pressed = bool(lf.ui.is_shift_down())
+                except Exception:
+                    pass
+
+        if shift_pressed:
+            modifiers |= cls._keymap_modifier_value("SHIFT", 1)
+        if ctrl_pressed:
+            modifiers |= cls._keymap_modifier_value("CTRL", 2)
+        if alt_pressed:
+            modifiers |= cls._keymap_modifier_value("ALT", 4)
+        if super_pressed:
+            modifiers |= cls._keymap_modifier_value("SUPER", 8)
+        return modifiers
+
+    @staticmethod
+    def _event_wheel_delta(event) -> float:
+        for key in ("wheel_delta_y", "wheel_delta"):
+            try:
+                raw = event.get_parameter(key, "")
+            except Exception:
+                continue
+            if raw is None:
+                continue
+            if isinstance(raw, str) and not raw.strip():
+                continue
+            try:
+                return float(raw)
+            except Exception:
+                continue
+        return 0.0
+
+    @classmethod
+    def _event_matches_histogram_zoom_binding(cls, event) -> bool:
+        keymap = getattr(lf, "keymap", None)
+        try:
+            if getattr(keymap, "is_capturing", lambda: False)():
+                return False
+            action = keymap.get_action_for_scroll(
+                keymap.ToolMode.GLOBAL,
+                cls._event_keymap_modifier_mask(event),
+            )
+            return action == keymap.Action.HISTOGRAM_ZOOM_MARKED
+        except Exception:
+            return cls._event_primary_shortcut_pressed(event)
 
     def _normalize_selection_mask(self, mask: lf.Tensor | None, reference: lf.Tensor | None) -> lf.Tensor | None:
         if mask is None or reference is None:
@@ -2668,6 +3015,18 @@ class HistogramPanel(Panel):
         self._sync_marked_range(apply_scene=False, preview_scene=True)
         event.stop_propagation()
 
+    def _on_chart_mousescroll(self, event):
+        if not self._show_chart or not self._event_matches_histogram_zoom_binding(event):
+            return
+        delta = self._event_wheel_delta(event)
+        if delta == 0.0:
+            return
+        focus_value = self._histogram_value_for_mouse_x(self._event_mouse_x(event))
+        if focus_value is not None:
+            self._zoom_histogram_at_value(focus_value, zoom_in=delta < 0.0)
+        # Claim the wheel so the dock/page doesn't scroll while the user zooms the chart.
+        event.stop_propagation()
+
     def _on_compare_chart_mousedown(self, event):
         if not self._show_compare_chart or self._compare_chart_el is None:
             return
@@ -2696,6 +3055,18 @@ class HistogramPanel(Panel):
         self._compare_mark_start = (x_bin, y_bin)
         self._compare_mark_end = (x_bin, y_bin)
         self._sync_compare_mark(apply_scene=False, preview_scene=True)
+        event.stop_propagation()
+
+    def _on_compare_chart_mousescroll(self, event):
+        if not self._show_compare_chart or not self._event_matches_histogram_zoom_binding(event):
+            return
+        delta = self._event_wheel_delta(event)
+        if delta == 0.0:
+            return
+        focus = self._compare_value_for_mouse(self._event_mouse_x(event), self._event_mouse_y(event))
+        if focus is not None:
+            self._zoom_compare_at_value(focus[0], focus[1], zoom_in=delta < 0.0)
+        # Claim the wheel so the dock/page doesn't scroll while the user zooms the chart.
         event.stop_propagation()
 
     def _on_document_mousemove(self, event):
@@ -2727,6 +3098,9 @@ class HistogramPanel(Panel):
             self._drag_compare_selection_base_cells = None
             if self._panel_selection_mask is None or not self._any_true(self._panel_selection_mask):
                 self._reset_marked_state(clear_scene=False)
+            # Re-render now that the drag flag is cleared so the sweep box hides.
+            if self._handle:
+                self._handle.dirty_all()
             event.stop_propagation()
             return
 
@@ -2749,6 +3123,9 @@ class HistogramPanel(Panel):
             # preview overlay so we don't leave a dangling rectangle on screen.
             if self._panel_selection_mask is None or not self._any_true(self._panel_selection_mask):
                 self._reset_marked_state(clear_scene=False)
+            # Re-render now that the drag flag is cleared so the sweep box hides.
+            if self._handle:
+                self._handle.dirty_all()
             event.stop_propagation()
 
     def _event_mouse_x(self, event) -> float:
@@ -3007,7 +3384,7 @@ class HistogramPanel(Panel):
         self._marked_count_text = _trf("histogram.gaussian_count", "{count} Gaussians", count="0")
         self._status_hint = _tr(
             "histogram.status_drag_delete",
-            "Left-drag across the histogram to mark a range, then delete it.",
+            "Left-drag to mark a range, then delete it  ·  Ctrl+scroll to zoom",
         )
         self._active_mark_source = None
         if clear_scene:

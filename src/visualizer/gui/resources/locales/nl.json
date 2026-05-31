@@ -1634,7 +1634,7 @@
     "no_marked_range": "No marked range",
     "gaussian_count": "{count} Gaussians",
     "range_value": "{min} to {max}",
-    "status_drag_delete": "Left-drag across the histogram to mark a range, then delete it.",
+    "status_drag_delete": "Left-drag to mark a range, then delete it  ·  Ctrl+scroll to zoom",
     "status_selection": "Marked range becomes the active Gaussian selection.",
     "summary": "{metric} distribution across {count} Gaussians",
     "bin_tooltip": "Bin {index}: {left} to {right} | {count} Gaussians",

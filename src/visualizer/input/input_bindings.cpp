@@ -26,7 +26,7 @@ namespace lfs::vis::input {
 
     namespace {
 
-        constexpr int PROFILE_VERSION = 13; // Version 13 adds CAMERA_SET_HOME action.
+        constexpr int PROFILE_VERSION = 14; // Version 14 adds histogram marked-range zoom.
         constexpr std::array<ToolMode, 8> ALL_MODES = {
             ToolMode::GLOBAL,
             ToolMode::SELECTION,
@@ -70,7 +70,7 @@ namespace lfs::vis::input {
         [[nodiscard]] std::optional<Action> findActionByDescription(std::string_view description) {
             static const auto* const table = [] {
                 auto* const m = new std::unordered_map<std::string, Action>();
-                constexpr int kActionCount = static_cast<int>(Action::DEPTH_ADJUST_NEAR) + 1;
+                constexpr int kActionCount = static_cast<int>(Action::HISTOGRAM_ZOOM_MARKED) + 1;
                 for (int i = 0; i < kActionCount; ++i) {
                     const auto a = static_cast<Action>(i);
                     m->emplace(toLowerCopy(getActionName(a)), a);
@@ -486,7 +486,8 @@ namespace lfs::vis::input {
                 (version < 9 && def.action == Action::CONFIRM_POLYGON) ||
                 (version < 10 && def.action == Action::UNDO_POLYGON_VERTEX) ||
                 (version < 12 && brush_resize_shift_scroll) ||
-                (version < 13 && def.action == Action::CAMERA_SET_HOME);
+                (version < 13 && def.action == Action::CAMERA_SET_HOME) ||
+                (version < 14 && def.action == Action::HISTOGRAM_ZOOM_MARKED);
             if (!should_add) {
                 continue;
             }
@@ -980,6 +981,7 @@ namespace lfs::vis::input {
             // UI
             {KeyTrigger{KEY_F12, MODIFIER_NONE}, Action::TOGGLE_UI, "Hide UI"},
             {KeyTrigger{KEY_F11, MODIFIER_NONE}, Action::TOGGLE_FULLSCREEN, "Fullscreen"},
+            {MouseScrollTrigger{MODIFIER_CTRL}, Action::HISTOGRAM_ZOOM_MARKED, "Zoom histogram at cursor"},
             // Sequencer
             {KeyTrigger{KEY_K, MODIFIER_NONE}, Action::SEQUENCER_ADD_KEYFRAME, "Add keyframe"},
             {KeyTrigger{KEY_U, MODIFIER_NONE}, Action::SEQUENCER_UPDATE_KEYFRAME, "Update keyframe"},
@@ -1145,6 +1147,7 @@ namespace lfs::vis::input {
         case Action::TOOL_BRUSH: return "Brush Tool";
         case Action::TOOL_ALIGN: return "Align Tool";
         case Action::PIE_MENU: return "Pie Menu";
+        case Action::HISTOGRAM_ZOOM_MARKED: return "Zoom Histogram at Cursor";
         default: return "Unknown";
         }
     }
@@ -1222,6 +1225,7 @@ namespace lfs::vis::input {
         case Action::TOOL_BRUSH: return "tool_brush";
         case Action::TOOL_ALIGN: return "tool_align";
         case Action::PIE_MENU: return "pie_menu";
+        case Action::HISTOGRAM_ZOOM_MARKED: return "histogram_zoom_marked";
         default: return {};
         }
     }
@@ -1229,7 +1233,7 @@ namespace lfs::vis::input {
     std::optional<Action> actionFromName(std::string_view name) {
         static const auto table = [] {
             std::unordered_map<std::string, Action> m;
-            for (int i = 0; i <= static_cast<int>(Action::PIE_MENU); ++i) {
+            for (int i = 0; i <= static_cast<int>(Action::HISTOGRAM_ZOOM_MARKED); ++i) {
                 const auto action = static_cast<Action>(i);
                 const auto key = actionNameKey(action);
                 if (!key.empty())
@@ -1791,6 +1795,11 @@ namespace lfs::vis::input {
             .inherits_from_global = true,
             .ui_section = ActionSection::UI,
         };
+        static constexpr ActionDescriptor d_ui_scroll{
+            .allowed_kinds = K::TRIGGER_KIND_MOUSE_SCROLL,
+            .inherits_from_global = true,
+            .ui_section = ActionSection::UI,
+        };
 
         static constexpr ActionDescriptor d_node_pick{
             .allowed_kinds = K::TRIGGER_KIND_MOUSE_BUTTON,
@@ -1899,6 +1908,8 @@ namespace lfs::vis::input {
         case Action::TOGGLE_UI:
         case Action::TOGGLE_FULLSCREEN:
             return d_ui_key;
+        case Action::HISTOGRAM_ZOOM_MARKED:
+            return d_ui_scroll;
 
         case Action::SEQUENCER_ADD_KEYFRAME:
         case Action::SEQUENCER_UPDATE_KEYFRAME:

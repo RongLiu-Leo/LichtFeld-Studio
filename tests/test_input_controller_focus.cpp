@@ -687,6 +687,23 @@ namespace lfs::vis {
         std::filesystem::remove(profile_path);
     }
 
+    TEST_F(InputControllerFocusTest, HistogramZoomMarkedDefaultsToCtrlScroll) {
+        input::InputBindings bindings;
+
+        EXPECT_EQ(bindings.getActionForScroll(input::ToolMode::GLOBAL, input::MODIFIER_CTRL),
+                  input::Action::HISTOGRAM_ZOOM_MARKED);
+
+        const auto trigger = bindings.getTriggerForAction(input::Action::HISTOGRAM_ZOOM_MARKED,
+                                                          input::ToolMode::GLOBAL);
+        ASSERT_TRUE(trigger.has_value());
+        const auto* scroll_trigger = std::get_if<input::MouseScrollTrigger>(&*trigger);
+        ASSERT_NE(scroll_trigger, nullptr);
+        EXPECT_EQ(scroll_trigger->modifiers, input::MODIFIER_CTRL);
+        EXPECT_FALSE(scroll_trigger->chord_key.has_value());
+        EXPECT_TRUE(input::describe(input::Action::HISTOGRAM_ZOOM_MARKED).allowed_kinds &
+                    input::TRIGGER_KIND_MOUSE_SCROLL);
+    }
+
     TEST_F(InputControllerFocusTest, LegacyProfileMigrationAddsOnlyVersionedModalDefaults) {
         const auto profile_path = std::filesystem::temp_directory_path() / "lfs_input_bindings_legacy_v5.json";
         std::filesystem::remove(profile_path);

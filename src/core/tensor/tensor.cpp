@@ -1205,18 +1205,10 @@ namespace lfs::core {
         }
 
         // Float32 <-> Int32
-        // DEBUG: Add logging for Float32->Int32 conversion
         if (dtype_ == DataType::Float32 && dtype == DataType::Int32) {
             auto result = empty(shape_, device_, DataType::Int32);
             if (numel() == 0)
                 return result;
-
-            // Read source value before conversion (for debugging)
-            if (numel() == 1 && device_ == Device::CUDA) {
-                float src_val;
-                cudaMemcpy(&src_val, ptr<float>(), sizeof(float), cudaMemcpyDeviceToHost);
-                printf("[to Float32->Int32] Source value: %f\n", src_val);
-            }
 
             if (device_ == Device::CUDA) {
                 tensor_ops::launch_convert_type<float, int>(
