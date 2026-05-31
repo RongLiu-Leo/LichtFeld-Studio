@@ -121,15 +121,12 @@ void SparkLodController::detach() {
     data_ = nullptr;
     nodes_.clear();
     selected_indices_.clear();
-    selected_lod_levels_.clear();
     {
         std::scoped_lock lock(mutex_);
         pending_work_.reset();
         ready_available_ = false;
         async_indices_.clear();
-        async_lod_levels_.clear();
         ready_swap_indices_.clear();
-        ready_swap_lod_levels_.clear();
     }
 }
 
@@ -157,7 +154,7 @@ size_t SparkLodController::update(const glm::mat4& view_matrix, const LodParamet
         std::scoped_lock lock(mutex_);
         ready_available_ = false;
     }
-    const size_t count = traverse(view_matrix, params, selected_indices_, selected_lod_levels_);
+    const size_t count = traverse(view_matrix, params, selected_indices_);
     last_params_ = params;
     return count;
 }
@@ -176,7 +173,6 @@ bool SparkLodController::swapAsyncResults() {
         return false;
     }
     selected_indices_.swap(ready_swap_indices_);
-    selected_lod_levels_.swap(ready_swap_lod_levels_);
     ready_available_ = false;
     return true;
 }
@@ -201,12 +197,11 @@ void SparkLodController::workerLoop(std::stop_token stop_token) {
             pending_work_.reset();
         }
 
-        traverse(work.view_matrix, work.params, async_indices_, async_lod_levels_);
+        traverse(work.view_matrix, work.params, async_indices_);
 
         {
             std::scoped_lock lock(mutex_);
             ready_swap_indices_.swap(async_indices_);
-            ready_swap_lod_levels_.swap(async_lod_levels_);
             ready_available_ = true;
         }
     }
@@ -214,16 +209,13 @@ void SparkLodController::workerLoop(std::stop_token stop_token) {
 
 size_t SparkLodController::traverse(const glm::mat4& view_matrix,
                                     const LodParameters& params,
-                                    std::vector<uint32_t>& out_indices,
-                                    std::vector<uint32_t>& out_lod_levels) const {
+                                    std::vector<uint32_t>& out_indices) const {
     out_indices.clear();
-    out_lod_levels.clear();
     if (nodes_.empty() || params.max_splats == 0) {
         return 0;
     }
 
     out_indices.reserve(params.max_splats);
-    out_lod_levels.reserve(params.max_splats);
 
     struct HeapNode {
         uint32_t index;
@@ -258,7 +250,6 @@ size_t SparkLodController::traverse(const glm::mat4& view_matrix,
         if (node.child_count == 0) {
             // Leaf: output directly.
             out_indices.push_back(top.index);
-            out_lod_levels.push_back(nodes_[top.index].lod_level);
             if (out_indices.size() >= params.max_splats) {
                 break;
             }
@@ -279,7 +270,6 @@ size_t SparkLodController::traverse(const glm::mat4& view_matrix,
                     const float scale = computePixelScale(child_idx, view_matrix, params);
                     if (scale <= params.pixel_scale_limit) {
                         out_indices.push_back(child_idx);
-                        out_lod_levels.push_back(nodes_[child_idx].lod_level);
                     } else {
                         heap.push({child_idx, scale});
                     }
@@ -295,7 +285,6 @@ size_t SparkLodController::traverse(const glm::mat4& view_matrix,
     // Drain remaining frontier nodes while honoring the budget.
     while (!heap.empty() && out_indices.size() < params.max_splats) {
         out_indices.push_back(heap.top().index);
-        out_lod_levels.push_back(nodes_[heap.top().index].lod_level);
         heap.pop();
     }
 
@@ -312,10 +301,6 @@ size_t SparkLodController::selectedCount() const {
 
 const std::vector<uint32_t>& SparkLodController::selectedIndices() const {
     return selected_indices_;
-}
-
-const std::vector<uint32_t>& SparkLodController::selectedLodLevels() const {
-    return selected_lod_levels_;
 }
 
 } // namespace lfs::vis

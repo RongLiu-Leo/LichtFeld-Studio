@@ -43,8 +43,6 @@ public:
     bool hasTree() const;
     size_t selectedCount() const;
     const std::vector<uint32_t>& selectedIndices() const;
-    // Returns the LOD level for each selected index (parallel to selectedIndices)
-    const std::vector<uint32_t>& selectedLodLevels() const;
 
 private:
     struct LodTreeNode {
@@ -60,8 +58,7 @@ private:
                            const LodParameters& params) const;
     size_t traverse(const glm::mat4& view_matrix,
                     const LodParameters& params,
-                    std::vector<uint32_t>& out_indices,
-                    std::vector<uint32_t>& out_lod_levels) const;
+                    std::vector<uint32_t>& out_indices) const;
     void workerLoop(std::stop_token stop_token);
 
     struct WorkItem {
@@ -72,16 +69,13 @@ private:
     const lfs::core::SplatData* data_ = nullptr;
     std::vector<LodTreeNode> nodes_;
     std::vector<uint32_t> selected_indices_;
-    std::vector<uint32_t> selected_lod_levels_;
     mutable std::mutex mutex_;
     std::condition_variable_any cv_;
     std::jthread worker_;
     std::optional<WorkItem> pending_work_;
     bool ready_available_ = false;
     std::vector<uint32_t> async_indices_;
-    std::vector<uint32_t> async_lod_levels_;
     std::vector<uint32_t> ready_swap_indices_;
-    std::vector<uint32_t> ready_swap_lod_levels_;
     LodParameters last_params_;
 };
 

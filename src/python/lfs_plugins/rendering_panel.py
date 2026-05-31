@@ -50,10 +50,8 @@ def _set_theme_vignette_style(*, intensity=None, radius=None, softness=None):
 
 SENSOR_HALF_HEIGHT_MM = 12.0
 DEFAULT_SIMPLIFY_TARGET_RATIO = 0.5
-DEFAULT_SIMPLIFY_KNN_K = 16
-DEFAULT_SIMPLIFY_MERGE_CAP = 0.5
+DEFAULT_SIMPLIFY_LOD_BASE = 2.0
 DEFAULT_SIMPLIFY_OPACITY_PRUNE_THRESHOLD = 0.1
-MAX_SIMPLIFY_KNN_K = 64
 
 BOOL_PROPS = [
     "show_coord_axes", "show_pivot", "show_grid", "show_camera_frustums",
@@ -98,8 +96,7 @@ SCRUB_FIELD_DEFS = {
     "theme_vignette_radius": ScrubFieldSpec(0.0, 1.0, 0.01, "%.2f"),
     "theme_vignette_softness": ScrubFieldSpec(0.0, 1.0, 0.01, "%.2f"),
     "simplify_target": ScrubFieldSpec(1.0, 1.0, 1.0, "%d", data_type=int),
-    "simplify_knn_k": ScrubFieldSpec(1.0, float(MAX_SIMPLIFY_KNN_K), 1.0, "%d", data_type=int),
-    "simplify_merge_cap": ScrubFieldSpec(0.01, 0.5, 0.01, "%.2f"),
+    "simplify_lod_base": ScrubFieldSpec(0.1, 10.0, 0.1, "%.1f"),
     "simplify_opacity_prune_threshold": ScrubFieldSpec(0.0, 1.0, 0.01, "%.2f"),
     "lod_max_splats": ScrubFieldSpec(100000.0, 5000000.0, 100000.0, "%.0f", data_type=int),
     "lod_pixel_scale_limit": ScrubFieldSpec(0.00001, 0.01, 0.00001, "%.5f"),
@@ -255,9 +252,8 @@ class RenderingPanel(Panel):
         self._last_panel_label = ""
         self._simplify_target_count = 0
         self._simplify_target_touched = False
-        self._simplify_knn_k = DEFAULT_SIMPLIFY_KNN_K
-        self._simplify_knn_k_touched = False
-        self._simplify_merge_cap = DEFAULT_SIMPLIFY_MERGE_CAP
+        self._simplify_lod_base = DEFAULT_SIMPLIFY_LOD_BASE
+        self._simplify_lod_base_touched = False
         self._simplify_opacity_prune_threshold = DEFAULT_SIMPLIFY_OPACITY_PRUNE_THRESHOLD
         self._simplify_source_name = ""
         self._simplify_original_count = 0
@@ -417,12 +413,9 @@ class RenderingPanel(Panel):
         model.bind("simplify_target",
                    lambda: str(self._compute_simplify_target_count()),
                    lambda v: self._set_simplify_target_count(v))
-        model.bind("simplify_knn_k",
-                   lambda: str(self._compute_simplify_knn_k()),
-                   lambda v: self._set_simplify_knn_k(v))
-        model.bind("simplify_merge_cap",
-                   lambda: f"{self._compute_simplify_merge_cap():.2f}",
-                   lambda v: self._set_simplify_merge_cap(v))
+        model.bind("simplify_lod_base",
+                   lambda: f"{self._compute_simplify_lod_base():.1f}",
+                   lambda v: self._set_simplify_lod_base(v))
         model.bind("simplify_opacity_prune_threshold",
                    lambda: f"{self._compute_simplify_opacity_prune_threshold():.2f}",
                    lambda v: self._set_simplify_opacity_prune_threshold(v))
@@ -456,10 +449,8 @@ class RenderingPanel(Panel):
                          lambda: _entry_label(_tr_fallback("rendering_panel.simplify_target", "Target")))
         model.bind_func("label_simplify_target_stat",
                          lambda: _tr_fallback("rendering_panel.simplify_target", "Target"))
-        model.bind_func("label_simplify_knn_k",
-                         lambda: _entry_label(_tr_fallback("rendering_panel.simplify_knn_k", "kNN K")))
-        model.bind_func("label_simplify_merge_cap",
-                         lambda: _entry_label(_tr_fallback("rendering_panel.simplify_merge_cap", "Merge Cap")))
+        model.bind_func("label_simplify_lod_base",
+                         lambda: _entry_label(_tr_fallback("rendering_panel.simplify_lod_base", "LOD Base")))
         model.bind_func("label_simplify_opacity_prune",
                          lambda: _entry_label(_tr_fallback("rendering_panel.simplify_opacity_prune", "Opacity Prune")))
         model.bind_func("label_simplify_original",
@@ -786,10 +777,8 @@ class RenderingPanel(Panel):
     def _get_scrub_value(self, prop):
         if prop == "simplify_target":
             return float(self._compute_simplify_target_count())
-        if prop == "simplify_knn_k":
-            return float(self._compute_simplify_knn_k())
-        if prop == "simplify_merge_cap":
-            return self._compute_simplify_merge_cap()
+        if prop == "simplify_lod_base":
+            return self._compute_simplify_lod_base()
         if prop == "simplify_opacity_prune_threshold":
             return self._compute_simplify_opacity_prune_threshold()
         if prop == "theme_vignette_intensity":
@@ -811,11 +800,8 @@ class RenderingPanel(Panel):
         if prop == "simplify_target":
             self._set_simplify_target_count(value)
             return
-        if prop == "simplify_knn_k":
-            self._set_simplify_knn_k(value)
-            return
-        if prop == "simplify_merge_cap":
-            self._set_simplify_merge_cap(value)
+        if prop == "simplify_lod_base":
+            self._set_simplify_lod_base(value)
             return
         if prop == "simplify_opacity_prune_threshold":
             self._set_simplify_opacity_prune_threshold(value)
@@ -1024,14 +1010,14 @@ class RenderingPanel(Panel):
                 self._simplify_target_count = self._clamp_simplify_target_count(self._simplify_target_count, source_count)
             else:
                 self._simplify_target_count = self._default_simplify_target_count(source_count)
-            if self._simplify_knn_k_touched and self._simplify_knn_k > 0:
-                self._simplify_knn_k = self._clamp_simplify_knn_k(self._simplify_knn_k, source_count)
+            if self._simplify_lod_base_touched and self._simplify_lod_base > 0:
+                self._simplify_lod_base = self._clamp_simplify_lod_base(self._simplify_lod_base)
             else:
-                self._simplify_knn_k = self._default_simplify_knn_k(source_count)
+                self._simplify_lod_base = DEFAULT_SIMPLIFY_LOD_BASE
         elif not self._simplify_target_touched:
             self._simplify_target_count = 0
-        if source_count <= 0 and not self._simplify_knn_k_touched:
-            self._simplify_knn_k = DEFAULT_SIMPLIFY_KNN_K
+        if source_count <= 0 and not self._simplify_lod_base_touched:
+            self._simplify_lod_base = DEFAULT_SIMPLIFY_LOD_BASE
         self._sync_simplify_scrub_spec()
         self._dirty_model(
             "simplify_has_source",
@@ -1039,8 +1025,7 @@ class RenderingPanel(Panel):
             "simplify_original_count",
             "simplify_target",
             "simplify_target_count",
-            "simplify_knn_k",
-            "simplify_merge_cap",
+            "simplify_lod_base",
             "simplify_opacity_prune_threshold",
             "simplify_output_name",
             "simplify_can_apply",
@@ -1056,10 +1041,9 @@ class RenderingPanel(Panel):
             "%d",
             data_type=int,
         )
-        knn_max = float(self._compute_simplify_knn_k_max())
-        knn_spec = ScrubFieldSpec(1.0, knn_max, 1.0, "%d", data_type=int)
+        lod_spec = ScrubFieldSpec(0.1, 10.0, 0.1, "%.1f")
         self._scrub_fields.set_spec("simplify_target", target_spec)
-        self._scrub_fields.set_spec("simplify_knn_k", knn_spec)
+        self._scrub_fields.set_spec("simplify_lod_base", lod_spec)
 
     def _default_simplify_target_count(self, original_count=None) -> int:
         source_count = self._simplify_original_count if original_count is None else int(original_count)
@@ -1093,54 +1077,24 @@ class RenderingPanel(Panel):
             return 0.0
         return float(self._compute_simplify_target_count()) / float(self._simplify_original_count)
 
-    def _compute_simplify_knn_k_max(self, original_count=None) -> int:
-        source_count = self._simplify_original_count if original_count is None else int(original_count)
-        if source_count <= 1:
-            return 1
-        return max(1, min(MAX_SIMPLIFY_KNN_K, source_count - 1))
-
-    def _default_simplify_knn_k(self, original_count=None) -> int:
-        clamped = self._clamp_simplify_knn_k(DEFAULT_SIMPLIFY_KNN_K, original_count)
-        return 1 if clamped is None else clamped
-
-    def _clamp_simplify_knn_k(self, value, original_count=None):
-        try:
-            parsed = int(round(float(str(value).strip().replace(",", "").replace("_", ""))))
-        except (TypeError, ValueError):
-            return None
-        return max(1, min(parsed, self._compute_simplify_knn_k_max(original_count)))
-
-    def _compute_simplify_knn_k(self, original_count=None) -> int:
-        clamped = self._clamp_simplify_knn_k(self._simplify_knn_k, original_count)
-        if clamped is not None:
-            return clamped
-        return self._default_simplify_knn_k(original_count)
-
-    def _set_simplify_knn_k(self, value):
-        next_value = self._clamp_simplify_knn_k(value)
-        if next_value is None or next_value == self._simplify_knn_k:
-            return
-        self._simplify_knn_k = next_value
-        self._simplify_knn_k_touched = True
-        self._dirty_model("simplify_knn_k")
-
-    def _clamp_simplify_merge_cap(self, value):
+    def _clamp_simplify_lod_base(self, value):
         try:
             parsed = float(str(value).strip().replace(",", "").replace("_", ""))
         except (TypeError, ValueError):
             return None
-        return max(0.01, min(parsed, 0.5))
+        return max(0.1, min(parsed, 10.0))
 
-    def _compute_simplify_merge_cap(self) -> float:
-        clamped = self._clamp_simplify_merge_cap(self._simplify_merge_cap)
-        return DEFAULT_SIMPLIFY_MERGE_CAP if clamped is None else clamped
+    def _compute_simplify_lod_base(self) -> float:
+        clamped = self._clamp_simplify_lod_base(self._simplify_lod_base)
+        return DEFAULT_SIMPLIFY_LOD_BASE if clamped is None else clamped
 
-    def _set_simplify_merge_cap(self, value):
-        next_value = self._clamp_simplify_merge_cap(value)
-        if next_value is None or math.isclose(next_value, self._simplify_merge_cap, abs_tol=1.0e-9):
+    def _set_simplify_lod_base(self, value):
+        next_value = self._clamp_simplify_lod_base(value)
+        if next_value is None or math.isclose(next_value, self._simplify_lod_base, abs_tol=1.0e-9):
             return
-        self._simplify_merge_cap = next_value
-        self._dirty_model("simplify_merge_cap")
+        self._simplify_lod_base = next_value
+        self._simplify_lod_base_touched = True
+        self._dirty_model("simplify_lod_base")
 
     def _clamp_simplify_opacity_prune_threshold(self, value):
         try:
@@ -1239,8 +1193,7 @@ class RenderingPanel(Panel):
         lf.simplify_splats(
             self._simplify_source_name,
             ratio=self._compute_simplify_ratio(),
-            knn_k=self._compute_simplify_knn_k(),
-            merge_cap=self._compute_simplify_merge_cap(),
+            lod_base=self._compute_simplify_lod_base(),
             opacity_prune_threshold=self._compute_simplify_opacity_prune_threshold(),
         )
         self._sync_simplify_task_state(force=True)

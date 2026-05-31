@@ -2937,22 +2937,8 @@ namespace lfs::vis {
             buffers_.has_lod_indices = false;
         }
 
-        // Stage LOD debug levels on host; upload inside the active command
-        // batch right before projection dispatch.
-        if (request.lod_count > 0 && request.lod_levels != nullptr) {
-            auto& levels_buf = buffers_.lod_levels;
-            if (levels_buf.deviceSize() < request.lod_count) {
-                renderer_.resizeAndCopyDeviceBuffer(levels_buf, request.lod_count, false);
-            }
-            levels_buf.resize(request.lod_count);
-            std::memcpy(levels_buf.data(), request.lod_levels, request.lod_count * sizeof(uint32_t));
-            buffers_.has_lod_levels = true;
-        } else {
-            buffers_.has_lod_levels = false;
-        }
-
         // lod_enabled: 0=off, 1=LOD on, 2=LOD on + debug coloring in shader.
-        if (uniforms.lod_enabled != 0u && request.lod_debug_mode && buffers_.has_lod_levels) {
+        if (uniforms.lod_enabled != 0u && request.lod_debug_mode) {
             uniforms.lod_enabled = 2u;
         }
 
@@ -2964,12 +2950,11 @@ namespace lfs::vis {
                 const std::uint32_t uniform_num_splats = uniforms.num_splats;
                 const std::uint32_t lod_mode = uniforms.lod_enabled;
                 LOG_INFO(
-                    "LOD dispatch: uniform_lod_count={} uniform_num_splats={} model_num_splats={} has_lod_indices={} has_lod_levels={} lod_mode={}",
+                    "LOD dispatch: uniform_lod_count={} uniform_num_splats={} model_num_splats={} has_lod_indices={} lod_mode={}",
                     lod_count,
                     uniform_num_splats,
                     buffers_.num_splats,
                     buffers_.has_lod_indices ? 1 : 0,
-                    buffers_.has_lod_levels ? 1 : 0,
                     lod_mode);
             }
         }
@@ -3008,6 +2993,12 @@ namespace lfs::vis {
                 LOG_TIMER("vksplat.render.record");
                 {
                     LOG_TIMER("vksplat.render.record.executeProjectionForward");
+                    if (buffers_.has_lod_indices && !buffers_.lod_indices.empty()) {
+                        recordUpdateBufferChunks(renderer_.activeCommandBuffer(),
+                                                 buffers_.lod_indices.deviceBuffer,
+                                                 buffers_.lod_indices.data(),
+                                                 buffers_.lod_indices.size() * sizeof(std::uint32_t));
+                    }
                     renderer_.executeProjectionForward(uniforms,
                                                        buffers_,
                                                        overlay_bindings->transform_indices,
@@ -3015,30 +3006,9 @@ namespace lfs::vis {
                                                        overlay_bindings->overlay_params,
                                                        overlay_bindings->model_transforms,
                                                        0,
-                                                       request.gut);
+                                                       request.gut,
+                                                       buffers_.has_lod_indices ? buffers_.lod_indices.deviceBuffer : _VulkanBuffer());
                 }
-                if (buffers_.has_lod_indices && !buffers_.lod_indices.empty()) {
-                    recordUpdateBufferChunks(renderer_.activeCommandBuffer(),
-                                             buffers_.lod_indices.deviceBuffer,
-                                             buffers_.lod_indices.data(),
-                                             buffers_.lod_indices.size() * sizeof(std::uint32_t));
-                }
-                if (buffers_.has_lod_levels && !buffers_.lod_levels.empty()) {
-                    recordUpdateBufferChunks(renderer_.activeCommandBuffer(),
-                                             buffers_.lod_levels.deviceBuffer,
-                                             buffers_.lod_levels.data(),
-                                             buffers_.lod_levels.size() * sizeof(std::uint32_t));
-                }
-                renderer_.executeProjectionForward(uniforms,
-                                                   buffers_,
-                                                   overlay_bindings->transform_indices,
-                                                   overlay_bindings->node_mask,
-                                                   overlay_bindings->overlay_params,
-                                                   overlay_bindings->model_transforms,
-                                                   0,
-                                                   request.gut,
-                                                   buffers_.has_lod_indices ? buffers_.lod_indices.deviceBuffer : _VulkanBuffer(),
-                                                   buffers_.has_lod_levels ? buffers_.lod_levels.deviceBuffer : _VulkanBuffer());
                 // Two-stage sort (Splatshop, matches gsplat_fwd reference):
                 //   1. Depth-sort N primitives by radial distance (full 32-bit key).
                 //   2. Reorder tiles_touched into depth-rank order so the cumsum

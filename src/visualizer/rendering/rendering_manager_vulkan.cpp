@@ -834,9 +834,6 @@ namespace lfs::vis {
                 if (!selected.empty()) {
                     request.lod_indices = selected.data();
                     request.lod_count = selected.size();
-                    if (settings_.lod_debug_colors) {
-                        request.lod_levels = lod_controller_->selectedLodLevels().data();
-                    }
                     request.lod_debug_mode = settings_.lod_debug_colors;
                 }
             }
@@ -1373,13 +1370,9 @@ namespace lfs::vis {
                     lod_controller_->updateAsync(view_matrix, params);
                 }
                 const auto& selected = lod_controller_->selectedIndices();
-                const auto& selected_levels = lod_controller_->selectedLodLevels();
                 if (!selected.empty()) {
                     request.lod_indices = selected.data();
                     request.lod_count = selected.size();
-                    if (settings_.lod_debug_colors && !selected_levels.empty()) {
-                        request.lod_levels = selected_levels.data();
-                    }
                 }
                 request.lod_debug_mode = settings_.lod_debug_colors;
             } else {

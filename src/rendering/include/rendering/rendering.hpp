@@ -176,8 +176,6 @@ namespace lfs::rendering {
         // LOD index indirection (optional)
         const uint32_t* lod_indices = nullptr;
         size_t lod_count = 0;
-        // LOD debug levels (optional, parallel to lod_indices)
-        const uint32_t* lod_levels = nullptr;
         bool lod_debug_mode = false;
     };
 

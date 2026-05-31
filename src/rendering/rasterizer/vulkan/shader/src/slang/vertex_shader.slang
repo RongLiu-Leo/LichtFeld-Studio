@@ -76,16 +76,10 @@ Gaussian_3D load_zero_gaussian() {
 }
 
 [ForceInline]
-float3 lod_debug_color(uint level) {
-    const uint idx = level & 7u;
-    if (idx == 0u) return float3(1.00, 0.20, 0.20);
-    if (idx == 1u) return float3(0.20, 0.95, 0.20);
-    if (idx == 2u) return float3(0.20, 0.55, 1.00);
-    if (idx == 3u) return float3(1.00, 0.95, 0.20);
-    if (idx == 4u) return float3(1.00, 0.45, 0.20);
-    if (idx == 5u) return float3(0.85, 0.35, 1.00);
-    if (idx == 6u) return float3(0.20, 0.95, 0.95);
-    return float3(1.00, 0.50, 0.85);
+float3 chunk_debug_color(uint chunk_id) {
+    float hue = fract(float(chunk_id) * 0.61803398875);
+    float3 rgb = clamp(abs(fmod(hue * 6.0 + float3(0.0, 4.0, 2.0), 6.0) - 3.0) - 1.0, 0.0, 1.0);
+    return lerp(float3(1.0), rgb, 0.85);
 }
 
 [Differentiable]
@@ -360,8 +354,7 @@ layout(binding=17) StructuredBuffer<float4> model_transforms;
 layout(binding=18) RWStructuredBuffer<uint32_t> out_primitive_depth_keys;
 // LOD index indirection buffer
 layout(binding=19) StructuredBuffer<uint32_t> lod_indices;
-// LOD debug levels buffer (reserved for future use)
-layout(binding=20) StructuredBuffer<uint32_t> lod_levels;
+
 
 #elif EXPORT_MODE == EXPORT_MODE_VULKAN_BACKWARD
 
@@ -410,7 +403,6 @@ void main(
 
     uint g_idx = dispatchThreadID.x;
     uint render_idx = g_idx;
-    uint lod_level = 0u;
 
     if (g_idx >= uniforms.num_splats)
         return;
@@ -418,9 +410,6 @@ void main(
     // LOD indirection
     if (uniforms.lod_enabled != 0) {
         g_idx = lod_indices[render_idx];
-        if (uniforms.lod_enabled == 2) {
-            lod_level = lod_levels[render_idx];
-        }
     }
     const uint out_idx = render_idx;
 
@@ -715,7 +704,7 @@ void main(
 #if EXPORT_MODE == EXPORT_MODE_VULKAN_FORWARD
 
     if (uniforms.lod_enabled == 2) {
-        const float3 debug_rgb = lod_debug_color(lod_level);
+        const float3 debug_rgb = chunk_debug_color(uint(g_idx) >> 12u);
         splat.rgb = lerp(splat.rgb, debug_rgb, 0.80f);
     }
 
