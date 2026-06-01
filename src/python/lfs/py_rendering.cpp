@@ -586,10 +586,14 @@ namespace lfs::python {
                  "Color splats by their LOD level for debugging", false);
         add_float(&Proxy::lod_max_splats, "lod_max_splats", "Max Splats",
                   "Maximum number of splats to render per frame", 1500000.0, 100000.0, 5000000.0);
-        add_float(&Proxy::lod_pixel_scale_limit, "lod_pixel_scale_limit", "Pixel Scale Limit",
-                  "Minimum screen-space pixel scale for a splat to be visible", 0.0001, 0.00001, 0.01);
         add_float(&Proxy::lod_render_scale, "lod_render_scale", "Render Scale",
                   "Resolution multiplier for LOD calculations", 1.0, 0.1, 2.0);
+        add_float(&Proxy::lod_cone_foveation, "lod_cone_foveation", "Cone Foveation",
+                  "Peripheral LOD penalty factor (1.0 = no penalty)", 1.0, 0.1, 2.0);
+        add_float(&Proxy::lod_cone_inner_degrees, "lod_cone_inner_degrees", "Cone Inner",
+                  "Inner cone angle in degrees (no penalty inside this angle)", 0.0, 0.0, 180.0);
+        add_float(&Proxy::lod_cone_outer_degrees, "lod_cone_outer_degrees", "Cone Outer",
+                  "Outer cone angle in degrees (full penalty beyond this angle)", 0.0, 0.0, 180.0);
 
         add_bool(&Proxy::apply_appearance_correction, "apply_appearance_correction", "Appearance Correction",
                  "Enable PPISP appearance correction", false);

@@ -1353,12 +1353,24 @@ namespace lfs::vis {
 
                 SparkLodController::LodParameters params;
                 params.max_splats = settings_.lod_max_splats;
-                params.pixel_scale_limit = settings_.lod_pixel_scale_limit;
                 params.lod_render_scale = settings_.lod_render_scale;
                 params.behind_camera_penalty = settings_.lod_behind_camera_penalty;
                 params.cone_foveation = settings_.lod_cone_foveation;
                 params.cone_inner_degrees = settings_.lod_cone_inner_degrees;
                 params.cone_outer_degrees = settings_.lod_cone_outer_degrees;
+
+                // Compute pixel_scale_limit dynamically from camera FOV and viewport size,
+                // matching Spark's runtime computation.
+                {
+                    const auto& fv = request.frame_view;
+                    if (fv.orthographic) {
+                        params.pixel_scale_limit = fv.ortho_scale / static_cast<float>(fv.size.y);
+                    } else {
+                        float vfov = lfs::rendering::focalLengthToVFov(fv.focal_length_mm);
+                        float half_tan_fov = std::tan(glm::radians(vfov) * 0.5f);
+                        params.pixel_scale_limit = (2.0f * half_tan_fov) / static_cast<float>(fv.size.y);
+                    }
+                }
 
                 // Get view matrix from the frame context
                 const glm::mat4 view_matrix = request.frame_view.getViewMatrix();

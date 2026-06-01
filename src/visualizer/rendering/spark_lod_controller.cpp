@@ -146,6 +146,39 @@ float SparkLodController::computePixelScale(uint32_t node_index,
         pixel_scale *= params.behind_camera_penalty;
     }
 
+    // Cone foveation: penalize off-axis splats so peripheral regions use finer LOD.
+    float forward_dot = -center_vs.z;
+    if (forward_dot > 0.0f && (params.cone_inner_degrees > 0.0f || params.cone_outer_degrees > 0.0f)) {
+        float inv_distance = 1.0f / radial_dist;
+        float dot = forward_dot * inv_distance;
+        float inner_degrees = std::clamp(params.cone_inner_degrees, 0.0f, 180.0f);
+        float outer_degrees = std::clamp(params.cone_outer_degrees, 0.0f, 180.0f);
+        float cone_dot0 = inner_degrees > 0.0f ? std::cos(glm::radians(inner_degrees * 0.5f)) : 1.0f;
+        float cone_dot = outer_degrees > 0.0f ? std::cos(glm::radians(outer_degrees * 0.5f)) : 1.0f;
+        cone_dot = std::min(cone_dot, cone_dot0);
+
+        float foveate;
+        if (dot >= cone_dot0) {
+            foveate = 1.0f;
+        } else if (dot >= cone_dot) {
+            float denom = cone_dot0 - cone_dot;
+            if (denom < 1.0e-6f) {
+                foveate = 1.0f;
+            } else {
+                float t = (dot - cone_dot) / denom;
+                foveate = params.cone_foveation + (1.0f - params.cone_foveation) * t;
+            }
+        } else {
+            if (cone_dot < 1.0e-6f) {
+                foveate = params.behind_camera_penalty;
+            } else {
+                float t = dot / cone_dot;
+                foveate = params.behind_camera_penalty + (params.cone_foveation - params.behind_camera_penalty) * t;
+            }
+        }
+        pixel_scale *= foveate;
+    }
+
     return pixel_scale;
 }
 

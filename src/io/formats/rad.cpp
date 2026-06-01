@@ -2016,38 +2016,42 @@ namespace lfs::io {
 
                 constexpr size_t kUpperLodFanout = 64;
 
-                // Build all LOD levels
-                std::vector<PackedSplatData> levels;
-                std::vector<std::vector<uint16_t>> child_counts;
-                std::vector<std::vector<uint32_t>> child_starts;
-
-                for (size_t i = 0; i < ratios.size(); ++i) {
-                    float ratio = ratios[i];
+                auto build_level_for_ratio = [&](const float ratio) -> std::optional<PackedSplatData> {
                     PackedSplatData level;
-
                     if (ratio >= 1.0f) {
-                        // Full detail - use source directly
                         level = pack_splat_data(source);
                     } else {
-                        // Simplified level
                         lfs::core::SplatSimplifyOptions options;
                         options.ratio = ratio;
                         auto result = lfs::core::simplify_splats(source, options, {});
                         if (!result || !result.value()) {
-                            LOG_WARN("RAD export: failed to build LOD at ratio {}, falling back to non-LOD", ratio);
                             return std::nullopt;
                         }
                         level = pack_splat_data(*result.value());
                     }
-
                     if (level.count == 0) {
-                        LOG_WARN("RAD export: LOD at ratio {} produced empty level, falling back to non-LOD", ratio);
                         return std::nullopt;
                     }
+                    return level;
+                };
 
-                    levels.push_back(std::move(level));
+                // Build all requested LOD levels first.
+                std::vector<PackedSplatData> levels;
+                std::vector<std::vector<uint16_t>> child_counts;
+                std::vector<std::vector<uint32_t>> child_starts;
+                std::vector<float> built_ratios;
+
+                for (size_t i = 0; i < ratios.size(); ++i) {
+                    const float ratio = ratios[i];
+                    auto level = build_level_for_ratio(ratio);
+                    if (!level.has_value()) {
+                        LOG_WARN("RAD export: failed to build LOD at ratio {}, falling back to non-LOD", ratio);
+                        return std::nullopt;
+                    }
+                    levels.push_back(std::move(*level));
                     child_counts.emplace_back();
                     child_starts.emplace_back();
+                    built_ratios.push_back(ratio);
                 }
 
                 // Verify all levels have same SH degree
@@ -2057,6 +2061,37 @@ namespace lfs::io {
                         LOG_WARN("RAD export: LOD levels disagree on SH degree, falling back to non-LOD");
                         return std::nullopt;
                     }
+                }
+
+                // Keep extending upward with real simplified levels instead of fabricating
+                // arbitrary 64-wide parents from consecutive rows. The chunk-local
+                // orientation artifacts came from those synthetic aggregate nodes.
+                const float min_ratio = 1.0f / static_cast<float>(std::max<unsigned long>(source.size(), 1ul));
+                while (levels.front().count > 1) {
+                    const size_t current_count = levels.front().count;
+                    const size_t target_parent_count = std::max<size_t>(
+                        1, (current_count + kUpperLodFanout - 1) / kUpperLodFanout);
+                    const float candidate_ratio = std::clamp(
+                        static_cast<float>(target_parent_count) / static_cast<float>(source.size()),
+                        min_ratio,
+                        built_ratios.front());
+
+                    if (candidate_ratio >= built_ratios.front()) {
+                        break;
+                    }
+
+                    auto parent_level = build_level_for_ratio(candidate_ratio);
+                    if (!parent_level.has_value()) {
+                        break;
+                    }
+                    if (parent_level->count >= current_count) {
+                        break;
+                    }
+
+                    levels.insert(levels.begin(), std::move(*parent_level));
+                    child_counts.insert(child_counts.begin(), {});
+                    child_starts.insert(child_starts.begin(), {});
+                    built_ratios.insert(built_ratios.begin(), candidate_ratio);
                 }
 
                 sort_level_spatially(levels.front());
@@ -2100,6 +2135,176 @@ namespace lfs::io {
                     reorder_level(fine, fine_order);
                 }
 
+                // Math helpers for merged node rotation (covariance -> eigen-decomposition -> quaternion)
+                auto quat_to_rotmat = [](const float qw, const float qx, const float qy, const float qz, std::array<float, 9>& out) {
+                    const float xx = qx * qx;
+                    const float yy = qy * qy;
+                    const float zz = qz * qz;
+                    const float wx = qw * qx;
+                    const float wy = qw * qy;
+                    const float wz = qw * qz;
+                    const float xy = qx * qy;
+                    const float xz = qx * qz;
+                    const float yz = qy * qz;
+                    out[0] = 1.0f - 2.0f * (yy + zz);
+                    out[1] = 2.0f * (xy - wz);
+                    out[2] = 2.0f * (xz + wy);
+                    out[3] = 2.0f * (xy + wz);
+                    out[4] = 1.0f - 2.0f * (xx + zz);
+                    out[5] = 2.0f * (yz - wx);
+                    out[6] = 2.0f * (xz - wy);
+                    out[7] = 2.0f * (yz + wx);
+                    out[8] = 1.0f - 2.0f * (xx + yy);
+                };
+
+                auto sigma_from_rot_var = [](const std::array<float, 9>& R, const float vx, const float vy, const float vz, std::array<float, 9>& out) {
+                    const std::array<float, 3> variance = {vx, vy, vz};
+                    std::array<float, 9> scaled{};
+                    for (int row = 0; row < 3; ++row) {
+                        for (int col = 0; col < 3; ++col) {
+                            scaled[row * 3 + col] = R[row * 3 + col] * variance[col];
+                        }
+                    }
+                    for (int row = 0; row < 3; ++row) {
+                        for (int col = 0; col < 3; ++col) {
+                            float sum = 0.0f;
+                            for (int k = 0; k < 3; ++k) {
+                                sum += scaled[row * 3 + k] * R[col * 3 + k];
+                            }
+                            out[row * 3 + col] = sum;
+                        }
+                    }
+                };
+
+                auto det3 = [](const std::array<float, 9>& A) -> float {
+                    return A[0] * (A[4] * A[8] - A[5] * A[7]) -
+                           A[1] * (A[3] * A[8] - A[5] * A[6]) +
+                           A[2] * (A[3] * A[7] - A[4] * A[6]);
+                };
+
+                auto sort_eigendecomposition = [&](const std::array<float, 3>& values, const std::array<float, 9>& vectors) -> std::pair<std::array<float, 3>, std::array<float, 9>> {
+                    std::array<int, 3> order = {0, 1, 2};
+                    std::sort(order.begin(), order.end(), [&](const int lhs, const int rhs) {
+                        if (values[lhs] != values[rhs])
+                            return values[lhs] > values[rhs];
+                        return lhs < rhs;
+                    });
+                    std::array<float, 3> sorted_values{};
+                    std::array<float, 9> sorted_vectors{};
+                    for (int col = 0; col < 3; ++col) {
+                        const int src_col = order[col];
+                        sorted_values[col] = values[src_col];
+                        for (int row = 0; row < 3; ++row)
+                            sorted_vectors[row * 3 + col] = vectors[row * 3 + src_col];
+                    }
+                    // Normalize eigenvectors (columns) to unit length
+                    for (int col = 0; col < 3; ++col) {
+                        float len = 0.0f;
+                        for (int row = 0; row < 3; ++row)
+                            len += sorted_vectors[row * 3 + col] * sorted_vectors[row * 3 + col];
+                        len = std::sqrt(len);
+                        if (len > 1.0e-6f) {
+                            for (int row = 0; row < 3; ++row)
+                                sorted_vectors[row * 3 + col] /= len;
+                        }
+                    }
+                    if (det3(sorted_vectors) < 0.0f) {
+                        sorted_vectors[2] *= -1.0f;
+                        sorted_vectors[5] *= -1.0f;
+                        sorted_vectors[8] *= -1.0f;
+                    }
+                    return {sorted_values, sorted_vectors};
+                };
+
+                auto eigen_symmetric_3x3_jacobi = [&](const std::array<float, 9>& Ain) -> std::pair<std::array<float, 3>, std::array<float, 9>> {
+                    std::array<float, 9> A = Ain;
+                    std::array<float, 9> V = {
+                        1.0f, 0.0f, 0.0f,
+                        0.0f, 1.0f, 0.0f,
+                        0.0f, 0.0f, 1.0f,
+                    };
+                    for (int iter = 0; iter < 32; ++iter) {
+                        int p = 0, q = 1;
+                        float max_abs = std::abs(A[1]);
+                        if (std::abs(A[2]) > max_abs) { p = 0; q = 2; max_abs = std::abs(A[2]); }
+                        if (std::abs(A[5]) > max_abs) { p = 1; q = 2; max_abs = std::abs(A[5]); }
+                        if (max_abs < 1e-12f) break;
+                        const int pp = 3 * p + p;
+                        const int qq = 3 * q + q;
+                        const int pq = 3 * p + q;
+                        const float app = A[pp];
+                        const float aqq = A[qq];
+                        const float apq = A[pq];
+                        const float tau = (aqq - app) / (2.0f * apq);
+                        const float t = std::copysign(1.0f, tau) / (std::abs(tau) + std::sqrt(1.0f + tau * tau));
+                        const float c = 1.0f / std::sqrt(1.0f + t * t);
+                        const float s = t * c;
+                        for (int k = 0; k < 3; ++k) {
+                            if (k == p || k == q) continue;
+                            const int kp = 3 * k + p;
+                            const int kq = 3 * k + q;
+                            const float akp = A[kp];
+                            const float akq = A[kq];
+                            A[kp] = c * akp - s * akq;
+                            A[3 * p + k] = A[kp];
+                            A[kq] = s * akp + c * akq;
+                            A[3 * q + k] = A[kq];
+                        }
+                        A[pp] = c * c * app - 2.0f * s * c * apq + s * s * aqq;
+                        A[qq] = s * s * app + 2.0f * s * c * apq + c * c * aqq;
+                        A[pq] = 0.0f;
+                        A[3 * q + p] = 0.0f;
+                        for (int k = 0; k < 3; ++k) {
+                            const int kp = 3 * k + p;
+                            const int kq = 3 * k + q;
+                            const float vkp = V[kp];
+                            const float vkq = V[kq];
+                            V[kp] = c * vkp - s * vkq;
+                            V[kq] = s * vkp + c * vkq;
+                        }
+                    }
+                    std::array<float, 3> values = {A[0], A[4], A[8]};
+                    return sort_eigendecomposition(values, V);
+                };
+
+                auto rotmat_to_quat = [](const std::array<float, 9>& R, std::array<float, 4>& out) {
+                    const float m00 = R[0];
+                    const float m11 = R[4];
+                    const float m22 = R[8];
+                    const float tr = m00 + m11 + m22;
+                    float qw = 0.0f, qx = 0.0f, qy = 0.0f, qz = 0.0f;
+                    if (tr > 0.0f) {
+                        const float S = std::sqrt(tr + 1.0f) * 2.0f;
+                        qw = 0.25f * S;
+                        qx = (R[7] - R[5]) / S;
+                        qy = (R[2] - R[6]) / S;
+                        qz = (R[3] - R[1]) / S;
+                    } else if (m00 > m11 && m00 > m22) {
+                        const float S = std::sqrt(1.0f + m00 - m11 - m22) * 2.0f;
+                        qw = (R[7] - R[5]) / S;
+                        qx = 0.25f * S;
+                        qy = (R[1] + R[3]) / S;
+                        qz = (R[2] + R[6]) / S;
+                    } else if (m11 > m22) {
+                        const float S = std::sqrt(1.0f + m11 - m00 - m22) * 2.0f;
+                        qw = (R[2] - R[6]) / S;
+                        qx = (R[1] + R[3]) / S;
+                        qy = 0.25f * S;
+                        qz = (R[5] + R[7]) / S;
+                    } else {
+                        const float S = std::sqrt(1.0f + m22 - m00 - m11) * 2.0f;
+                        qw = (R[3] - R[1]) / S;
+                        qx = (R[2] + R[6]) / S;
+                        qy = (R[5] + R[7]) / S;
+                        qz = 0.25f * S;
+                    }
+                    const float inv_n = 1.0f / std::max(std::sqrt(qw * qw + qx * qx + qy * qy + qz * qz), 1e-12f);
+                    out[0] = qw * inv_n;
+                    out[1] = qx * inv_n;
+                    out[2] = qy * inv_n;
+                    out[3] = qz * inv_n;
+                };
+
                 // Aggregate node helper
                 struct AggregateNode {
                     std::array<float, 3> center{0.0f, 0.0f, 0.0f};
@@ -2116,16 +2321,19 @@ namespace lfs::io {
                         return node;
                     }
 
-                    std::array<float, 3> min_corner{
+                    // Compute per-child weights (area * opacity) and weighted mean center.
+                    std::vector<float> weights(count);
+                    float total_weight = 0.0f;
+                    std::array<double, 3> weighted_center_sum{0.0, 0.0, 0.0};
+                    std::array<double, 3> sh0_sum{0.0, 0.0, 0.0};
+                    std::array<float, 3> min_center{
                         std::numeric_limits<float>::infinity(),
                         std::numeric_limits<float>::infinity(),
                         std::numeric_limits<float>::infinity()};
-                    std::array<float, 3> max_corner{
+                    std::array<float, 3> max_center{
                         -std::numeric_limits<float>::infinity(),
                         -std::numeric_limits<float>::infinity(),
                         -std::numeric_limits<float>::infinity()};
-                    std::array<double, 3> sh0_sum{0.0, 0.0, 0.0};
-                    double opacity_sum = 0.0;
 
                     const size_t shn_row_width = static_cast<size_t>(std::max(level.sh_coeffs, 0)) * 3;
                     if (shn_row_width > 0) {
@@ -2134,35 +2342,144 @@ namespace lfs::io {
 
                     for (size_t i = 0; i < count; ++i) {
                         const size_t idx = start + i;
+                        float area = 1.0f;
                         for (size_t d = 0; d < 3; ++d) {
-                            const float c = level.means[idx * 3 + d];
-                            const float s = std::max(std::abs(level.scales[idx * 3 + d]), 1.0e-6f);
-                            min_corner[d] = std::min(min_corner[d], c - s);
-                            max_corner[d] = std::max(max_corner[d], c + s);
-                            sh0_sum[d] += static_cast<double>(level.sh0[idx * 3 + d]);
+                            area *= std::max(std::abs(level.scales[idx * 3 + d]), 1.0e-6f);
                         }
-                        opacity_sum += static_cast<double>(level.opacity[idx]);
+                        weights[i] = area * level.opacity[idx];
+                        total_weight += weights[i];
+                        for (size_t d = 0; d < 3; ++d) {
+                            const float coord = level.means[idx * 3 + d];
+                            min_center[d] = std::min(min_center[d], coord);
+                            max_center[d] = std::max(max_center[d], coord);
+                            weighted_center_sum[d] += static_cast<double>(weights[i] * level.means[idx * 3 + d]);
+                            sh0_sum[d] += static_cast<double>(weights[i] * level.sh0[idx * 3 + d]);
+                        }
 
                         if (shn_row_width > 0 && !level.shN.empty()) {
                             const size_t base = idx * shn_row_width;
                             for (size_t k = 0; k < shn_row_width; ++k) {
-                                node.shN[k] += level.shN[base + k];
+                                node.shN[k] += weights[i] * level.shN[base + k];
+                            }
+                        }
+                    }
+
+                    if (total_weight > 1.0e-30f) {
+                        const float inv_total_weight = 1.0f / total_weight;
+                        for (float& w : weights) w /= total_weight;
+                        for (size_t d = 0; d < 3; ++d) {
+                            node.center[d] = static_cast<float>(weighted_center_sum[d] / static_cast<double>(total_weight));
+                            sh0_sum[d] *= static_cast<double>(inv_total_weight);
+                        }
+                        for (float& v : node.shN) {
+                            v *= inv_total_weight;
+                        }
+                    } else {
+                        // Fallback to unweighted mean if all weights are zero
+                        for (size_t d = 0; d < 3; ++d) {
+                            float sum = 0.0f;
+                            for (size_t i = 0; i < count; ++i) {
+                                sum += level.means[(start + i) * 3 + d];
+                            }
+                            node.center[d] = sum / static_cast<float>(count);
+                            sh0_sum[d] /= static_cast<double>(count);
+                        }
+                        if (!node.shN.empty()) {
+                            const float inv_count = 1.0f / static_cast<float>(count);
+                            for (float& v : node.shN) {
+                                v *= inv_count;
                             }
                         }
                     }
 
                     for (size_t d = 0; d < 3; ++d) {
-                        node.center[d] = 0.5f * (min_corner[d] + max_corner[d]);
-                        node.scale[d] = std::max(0.5f * (max_corner[d] - min_corner[d]), 1.0e-6f);
-                        node.sh0[d] = static_cast<float>(sh0_sum[d] / static_cast<double>(count));
+                        node.sh0[d] = static_cast<float>(sh0_sum[d]);
                     }
-                    node.opacity = std::clamp(static_cast<float>(opacity_sum / static_cast<double>(count)), 0.0f, 1.0f);
 
-                    if (!node.shN.empty()) {
-                        const float inv_count = 1.0f / static_cast<float>(count);
-                        for (float& v : node.shN) {
-                            v *= inv_count;
+                    // Compute merged rotation and scale from weighted covariance matrix of children.
+                    {
+                        // Spark regularizes with an isotropic term derived from the merge
+                        // cell size, not from the child splat thickness. Using child scale
+                        // here leaves planar groups nearly singular and produces chunk-local
+                        // orientation shards when viewed from grazing angles.
+                        float max_extent = 0.0f;
+                        float max_child_diameter = 0.0f;
+                        for (size_t i = 0; i < count; ++i) {
+                            const size_t idx = start + i;
+                            for (size_t d = 0; d < 3; ++d) {
+                                max_extent = std::max(max_extent, max_center[d] - min_center[d]);
+                            }
+                            for (size_t d = 0; d < 3; ++d) {
+                                max_child_diameter = std::max(
+                                    max_child_diameter,
+                                    2.0f * std::abs(level.scales[idx * 3 + d]));
+                            }
                         }
+                        const float filter_size = std::max(max_extent, max_child_diameter);
+                        const float filter2 = (0.5f * std::max(filter_size, 1.0e-6f)) * (0.5f * std::max(filter_size, 1.0e-6f));
+
+                        std::array<float, 9> total_cov{};
+                        for (size_t i = 0; i < count; ++i) {
+                            const size_t idx = start + i;
+                            const float w = weights[i];
+                            const float qw = level.rotation[idx * 4 + 0];
+                            const float qx = level.rotation[idx * 4 + 1];
+                            const float qy = level.rotation[idx * 4 + 2];
+                            const float qz = level.rotation[idx * 4 + 3];
+                            std::array<float, 9> R{};
+                            quat_to_rotmat(qw, qx, qy, qz, R);
+                            std::array<float, 3> s2{};
+                            for (size_t d = 0; d < 3; ++d) {
+                                const float sd = std::max(std::abs(level.scales[idx * 3 + d]), 1.0e-6f);
+                                s2[d] = sd * sd;
+                            }
+                            std::array<float, 9> cov{};
+                            sigma_from_rot_var(R, s2[0], s2[1], s2[2], cov);
+                            // Add delta * delta^T where delta = child_center - weighted_mean_center
+                            float dx = level.means[idx * 3 + 0] - node.center[0];
+                            float dy = level.means[idx * 3 + 1] - node.center[1];
+                            float dz = level.means[idx * 3 + 2] - node.center[2];
+                            cov[0] += dx * dx + filter2;
+                            cov[1] += dx * dy;
+                            cov[2] += dx * dz;
+                            cov[3] += dx * dy;
+                            cov[4] += dy * dy + filter2;
+                            cov[5] += dy * dz;
+                            cov[6] += dx * dz;
+                            cov[7] += dy * dz;
+                            cov[8] += dz * dz + filter2;
+                            for (size_t k = 0; k < 9; ++k) {
+                                total_cov[k] += w * cov[k];
+                            }
+                        }
+
+                        auto [eigenvalues, eigenvectors] = eigen_symmetric_3x3_jacobi(total_cov);
+                        std::array<float, 3> evals = {
+                            std::max(eigenvalues[0], 1e-18f),
+                            std::max(eigenvalues[1], 1e-18f),
+                            std::max(eigenvalues[2], 1e-18f),
+                        };
+                        for (size_t d = 0; d < 3; ++d) {
+                            node.scale[d] = std::sqrt(evals[d]);
+                        }
+                        rotmat_to_quat(eigenvectors, node.rotation);
+
+                        // Energy-preserving opacity: total child weight divided by merged
+                        // ellipsoid area.  This can legitimately exceed 1.0 for dense clusters.
+                        constexpr float kEllipsoidAreaP = 1.6075f;
+                        auto ellipsoid_area = [&](const std::array<float, 3>& s) -> float {
+                            const float t1 = std::pow(s[0] * s[1], kEllipsoidAreaP);
+                            const float t2 = std::pow(s[0] * s[2], kEllipsoidAreaP);
+                            const float t3 = std::pow(s[1] * s[2], kEllipsoidAreaP);
+                            return 4.0f * static_cast<float>(M_PI) * std::pow((t1 + t2 + t3) / 3.0f, 1.0f / kEllipsoidAreaP);
+                        };
+                        const float merged_area = ellipsoid_area(node.scale);
+                        if (merged_area > 1.0e-30f) {
+                            node.opacity = total_weight / merged_area;
+                        } else {
+                            node.opacity = total_weight;
+                        }
+                        node.opacity = std::clamp(node.opacity, 0.000001f, 1000.0f);
                     }
 
                     return node;
@@ -2183,53 +2500,27 @@ namespace lfs::io {
                     }
                 };
 
-                auto make_upper_level = [&](const PackedSplatData& child_level) {
-                    PackedSplatData parent_level;
-                    parent_level.count = (child_level.count + kUpperLodFanout - 1) / kUpperLodFanout;
-                    parent_level.sh_degree = sh_degree;
-                    parent_level.sh_coeffs = child_level.sh_coeffs;
-                    parent_level.lod_tree = true;
-                    parent_level.means.reserve(parent_level.count * 3);
-                    parent_level.opacity.reserve(parent_level.count);
-                    parent_level.sh0.reserve(parent_level.count * 3);
-                    parent_level.scales.reserve(parent_level.count * 3);
-                    parent_level.rotation.reserve(parent_level.count * 4);
-                    if (parent_level.sh_coeffs > 0) {
-                        parent_level.shN.reserve(parent_level.count * static_cast<size_t>(parent_level.sh_coeffs) * 3);
+                if (levels.front().count != 1) {
+                    const size_t root_child_count = levels.front().count;
+                    if (root_child_count > static_cast<size_t>(std::numeric_limits<uint16_t>::max())) {
+                        LOG_WARN("RAD export: coarsest level still exceeds u16 root fanout, falling back to non-LOD");
+                        return std::nullopt;
                     }
-
-                    for (size_t g = 0; g < parent_level.count; ++g) {
-                        const size_t group_start = g * kUpperLodFanout;
-                        const size_t group_count = std::min(kUpperLodFanout, child_level.count - group_start);
-                        append_node_to_level(parent_level, aggregate_range(child_level, group_start, group_count));
-                    }
-                    return parent_level;
-                };
-
-                // Build a bounded-fanout hierarchy above the coarsest simplified level.
-                // The previous implementation connected the root to arbitrary 65k-wide
-                // row groups, which creates scene-sized blobs and weak paging boundaries.
-                std::vector<PackedSplatData> upper_levels;
-                const PackedSplatData* child_level = &levels.front();
-                while (true) {
-                    upper_levels.push_back(make_upper_level(*child_level));
-                    if (upper_levels.back().count == 1) {
-                        break;
-                    }
-                    child_level = &upper_levels.back();
+                    PackedSplatData root_level;
+                    root_level.count = 1;
+                    root_level.sh_degree = sh_degree;
+                    root_level.sh_coeffs = levels.front().sh_coeffs;
+                    root_level.lod_tree = true;
+                    append_node_to_level(root_level, aggregate_range(levels.front(), 0, levels.front().count));
+                    levels.insert(levels.begin(), std::move(root_level));
+                    child_counts.insert(child_counts.begin(), {static_cast<uint16_t>(root_child_count)});
+                    child_starts.insert(child_starts.begin(), {1u});
                 }
 
-                // Build final packed data with tree structure. Upper levels are stored
-                // root-first, followed by original LOD levels from coarsest to finest.
+                // Build final packed data with tree structure stored root-first,
+                // followed by progressively finer LOD levels.
                 const size_t finest_idx = levels.size() - 1;
                 size_t current_base = 0;
-                std::vector<size_t> upper_bases(upper_levels.size());
-                for (size_t out = 0; out < upper_levels.size(); ++out) {
-                    const size_t upper_idx = upper_levels.size() - 1 - out;
-                    upper_bases[upper_idx] = current_base;
-                    current_base += upper_levels[upper_idx].count;
-                }
-
                 std::vector<size_t> level_bases(levels.size());
                 for (size_t i = 0; i < levels.size(); ++i) {
                     level_bases[i] = current_base;
@@ -2265,20 +2556,7 @@ namespace lfs::io {
                     packed.shN.reserve(packed.count * static_cast<size_t>(packed.sh_coeffs) * 3);
                 }
 
-                // Add upper hierarchy root-first.
-                for (size_t out = 0; out < upper_levels.size(); ++out) {
-                    const size_t upper_idx = upper_levels.size() - 1 - out;
-                    append_rows(packed.means, upper_levels[upper_idx].means);
-                    packed.opacity.insert(packed.opacity.end(), upper_levels[upper_idx].opacity.begin(), upper_levels[upper_idx].opacity.end());
-                    append_rows(packed.sh0, upper_levels[upper_idx].sh0);
-                    append_rows(packed.scales, upper_levels[upper_idx].scales);
-                    append_rows(packed.rotation, upper_levels[upper_idx].rotation);
-                    if (packed.sh_coeffs > 0) {
-                        append_rows(packed.shN, upper_levels[upper_idx].shN);
-                    }
-                }
-
-                // Add all LOD levels (coarsest to finest)
+                // Add all LOD levels (coarsest/root to finest)
                 for (size_t i = 0; i < levels.size(); ++i) {
                     append_rows(packed.means, levels[i].means);
                     packed.opacity.insert(packed.opacity.end(), levels[i].opacity.begin(), levels[i].opacity.end());
@@ -2290,32 +2568,16 @@ namespace lfs::io {
                     }
                 }
 
-                // Set up child links
-                for (size_t upper_idx = 0; upper_idx < upper_levels.size(); ++upper_idx) {
-                    const bool points_to_coarsest = upper_idx == 0;
-                    const size_t child_base = points_to_coarsest ? level_bases[0] : upper_bases[upper_idx - 1];
-                    const size_t child_total = points_to_coarsest ? levels[0].count : upper_levels[upper_idx - 1].count;
-
-                    for (size_t j = 0; j < upper_levels[upper_idx].count; ++j) {
-                        const size_t group_start = j * kUpperLodFanout;
-                        const size_t group_count = std::min(kUpperLodFanout, child_total - group_start);
-                        const size_t idx = upper_bases[upper_idx] + j;
-                        packed.child_count[idx] = static_cast<uint16_t>(group_count);
-                        packed.child_start[idx] = static_cast<uint32_t>(child_base + group_start);
-                    }
-                }
-
                 // Level-to-level links
-                const uint32_t index_shift = static_cast<uint32_t>(level_bases[0]);
-
                 for (size_t i = 0; i < levels.size() - 1; ++i) {
-                    size_t coarse_level_idx = i;
-
-                    for (size_t j = 0; j < levels[coarse_level_idx].count; ++j) {
-                        const size_t idx = level_bases[coarse_level_idx] + j;
-                        packed.child_count[idx] = child_counts[coarse_level_idx][j];
-                        if (child_counts[coarse_level_idx][j] > 0) {
-                            packed.child_start[idx] = child_starts[coarse_level_idx][j] + index_shift;
+                    if (child_counts[i].empty()) {
+                        continue;
+                    }
+                    for (size_t j = 0; j < levels[i].count; ++j) {
+                        const size_t idx = level_bases[i] + j;
+                        packed.child_count[idx] = child_counts[i][j];
+                        if (child_counts[i][j] > 0) {
+                            packed.child_start[idx] = child_starts[i][j];
                         }
                     }
                 }
@@ -2959,11 +3221,29 @@ namespace lfs::io {
                     v = (v - 0.5f) / SH_C0;
                 }
 
-                // RAD stores activated opacity alpha in [0, 1]. Convert back to
-                // optimizer-domain logits expected by SplatData.
-                for (float& v : all_opacity) {
-                    const float a = std::clamp(v, 1.0e-6f, 1.0f - 1.0e-6f);
-                    v = std::log(a / (1.0f - a));
+                bool lod_opacity_encoded = false;
+                if (meta.splat_encoding.has_value()) {
+                    const auto& enc = meta.splat_encoding.value();
+                    if (enc.is_object()) {
+                        auto it = enc.find("lodOpacity");
+                        if (it != enc.end() && it->is_boolean()) {
+                            lod_opacity_encoded = it->get<bool>();
+                        }
+                    }
+                }
+                if (!lod_opacity_encoded) {
+                    // RAD stores activated opacity alpha in [0, 1]. Convert back to
+                    // optimizer-domain logits expected by SplatData.
+                    for (float& v : all_opacity) {
+                        const float a = std::clamp(v, 1.0e-6f, 1.0f - 1.0e-6f);
+                        v = std::log(a / (1.0f - a));
+                    }
+                } else {
+                    // Spark LOD opacity encoding stores display-space alpha directly and
+                    // can legitimately exceed 1.0 for dense merged nodes.
+                    for (float& v : all_opacity) {
+                        v = std::max(v, 0.0f);
+                    }
                 }
 
                 Tensor means_tensor = Tensor::from_vector(all_means, {N, 3}, Device::CPU);
@@ -3014,8 +3294,16 @@ namespace lfs::io {
                         const float sx = all_scales_linear[i * 3 + 0];
                         const float sy = all_scales_linear[i * 3 + 1];
                         const float sz = all_scales_linear[i * 3 + 2];
-                        tree->sizes.push_back(2.0f * std::max({sx, sy, sz}));
+                        float size = 2.0f * std::max({sx, sy, sz});
+                        if (lod_opacity_encoded) {
+                            const float lod_alpha = std::max(all_opacity[i], 0.0f);
+                            if (lod_alpha > 1.0f) {
+                                size *= std::sqrt(lod_alpha);
+                            }
+                        }
+                        tree->sizes.push_back(size);
                     }
+                    tree->lod_opacity_encoded = lod_opacity_encoded;
                     splat_data.lod_tree = std::move(tree);
                 }
 

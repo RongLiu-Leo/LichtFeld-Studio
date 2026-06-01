@@ -69,7 +69,7 @@ SLIDER_PROPS = [
     "ppisp_exposure", "ppisp_vignette_strength", "ppisp_gamma_multiplier",
     "ppisp_gamma_red", "ppisp_gamma_green", "ppisp_gamma_blue",
     "ppisp_crf_toe", "ppisp_crf_shoulder",
-    "lod_max_splats", "lod_pixel_scale_limit", "lod_render_scale",
+    "lod_max_splats", "lod_render_scale", "lod_cone_foveation", "lod_cone_inner_degrees", "lod_cone_outer_degrees",
 ]
 
 SCRUB_FIELD_DEFS = {
@@ -99,8 +99,10 @@ SCRUB_FIELD_DEFS = {
     "simplify_lod_base": ScrubFieldSpec(0.1, 10.0, 0.1, "%.1f"),
     "simplify_opacity_prune_threshold": ScrubFieldSpec(0.0, 1.0, 0.01, "%.2f"),
     "lod_max_splats": ScrubFieldSpec(100000.0, 5000000.0, 100000.0, "%.0f", data_type=int),
-    "lod_pixel_scale_limit": ScrubFieldSpec(0.00001, 0.01, 0.00001, "%.5f"),
     "lod_render_scale": ScrubFieldSpec(0.1, 2.0, 0.1, "%.1f"),
+    "lod_cone_foveation": ScrubFieldSpec(0.1, 2.0, 0.1, "%.1f"),
+    "lod_cone_inner_degrees": ScrubFieldSpec(0.0, 180.0, 1.0, "%.0f"),
+    "lod_cone_outer_degrees": ScrubFieldSpec(0.0, 180.0, 1.0, "%.0f"),
 }
 
 SELECT_PROPS = [
@@ -187,8 +189,10 @@ LOCALE_KEY = {
     "lod_enabled": "rendering_panel.lod_enabled",
     "lod_debug_mode": "rendering_panel.lod_debug_mode",
     "lod_max_splats": "rendering_panel.lod_max_splats",
-    "lod_pixel_scale_limit": "rendering_panel.lod_pixel_scale_limit",
     "lod_render_scale": "rendering_panel.lod_render_scale",
+    "lod_cone_foveation": "rendering_panel.lod_cone_foveation",
+    "lod_cone_inner_degrees": "rendering_panel.lod_cone_inner_degrees",
+    "lod_cone_outer_degrees": "rendering_panel.lod_cone_outer_degrees",
 }
 
 
@@ -502,10 +506,14 @@ class RenderingPanel(Panel):
                          lambda: lf.ui.tr("tooltip.lod_enabled") or "")
         model.bind_func("tooltip_lod_max_splats",
                          lambda: lf.ui.tr("tooltip.lod_max_splats") or "")
-        model.bind_func("tooltip_lod_pixel_scale_limit",
-                         lambda: lf.ui.tr("tooltip.lod_pixel_scale_limit") or "")
         model.bind_func("tooltip_lod_render_scale",
                          lambda: lf.ui.tr("tooltip.lod_render_scale") or "")
+        model.bind_func("tooltip_lod_cone_foveation",
+                         lambda: lf.ui.tr("tooltip.lod_cone_foveation") or "")
+        model.bind_func("tooltip_lod_cone_inner_degrees",
+                         lambda: lf.ui.tr("tooltip.lod_cone_inner_degrees") or "")
+        model.bind_func("tooltip_lod_cone_outer_degrees",
+                         lambda: lf.ui.tr("tooltip.lod_cone_outer_degrees") or "")
         model.bind_func("tooltip_lod_debug_mode",
                          lambda: lf.ui.tr("tooltip.lod_debug_mode") or "")
 

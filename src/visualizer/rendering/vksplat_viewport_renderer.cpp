@@ -2921,6 +2921,12 @@ namespace lfs::vis {
             uniforms.step = static_cast<std::uint32_t>(modelTransformCount(request.scene.model_transforms));
             uniforms.lod_enabled = request.lod_count > 0 ? 1u : 0u;
             uniforms.lod_count = static_cast<std::uint32_t>(request.lod_count);
+            if (uniforms.lod_enabled != 0u &&
+                splat_data.lod_tree &&
+                splat_data.lod_tree->lod_opacity_encoded) {
+                // Bit 2 (value 4): Spark LOD opacity encoding is active (opacity may exceed 1.0).
+                uniforms.lod_enabled |= 4u;
+            }
         }
 
         // Stage LOD indices on host; actual GPU upload happens inside the
@@ -2937,9 +2943,12 @@ namespace lfs::vis {
             buffers_.has_lod_indices = false;
         }
 
-        // lod_enabled: 0=off, 1=LOD on, 2=LOD on + debug coloring in shader.
-        if (uniforms.lod_enabled != 0u && request.lod_debug_mode) {
-            uniforms.lod_enabled = 2u;
+        // lod_enabled bit flags:
+        //   bit0 (1): LOD index indirection active
+        //   bit1 (2): chunk debug coloring active
+        //   bit2 (4): Spark LOD opacity encoding active
+        if ((uniforms.lod_enabled & 1u) != 0u && request.lod_debug_mode) {
+            uniforms.lod_enabled |= 2u;
         }
 
         if (uniforms.lod_enabled != 0u) {

@@ -45,6 +45,7 @@ Gaussian_3D load_gaussian_split(
     StructuredBuffer<float4> rotations,
     StructuredBuffer<float> scaling_raw,
     StructuredBuffer<float> opacity_raw,
+    uint lod_flags,
     uint active_sh,
     uint shN_layout_slots
 ) {
@@ -59,7 +60,15 @@ Gaussian_3D load_gaussian_split(
     float3 g_raw_scaling = read_t3_float3(g_idx, scaling_raw);
     g_raw_scaling = min(g_raw_scaling, float3(MAX_RAW_SCALE));
     float3 g_scales = exp(g_raw_scaling);
-    float g_opacities = sigmoid_activation(opacity_raw[g_idx]);
+    const bool lod_opacity_encoded = (lod_flags & 4u) != 0u;
+    float g_opacities = lod_opacity_encoded
+        ? max(opacity_raw[g_idx], 0.0f)
+        : sigmoid_activation(opacity_raw[g_idx]);
+    if (lod_opacity_encoded && g_opacities > 1.0f) {
+        const float inflate = sqrt(g_opacities);
+        g_scales *= inflate;
+        g_opacities /= (inflate * inflate);
+    }
 
     return { g_xyz_ws, g_sh_coeffs, g_rotations, g_scales, g_opacities };
 }
@@ -408,7 +417,8 @@ void main(
         return;
 
     // LOD indirection
-    if (uniforms.lod_enabled != 0) {
+    const bool lod_active = (uniforms.lod_enabled & 1u) != 0u;
+    if (lod_active) {
         g_idx = lod_indices[render_idx];
     }
     const uint out_idx = render_idx;
@@ -445,6 +455,7 @@ void main(
     Gaussian_3D gauss = load_gaussian_split(
         g_idx, xyz_ws, sh0, shN, rotations,
         scaling_raw, opacity_raw,
+        uniforms.lod_enabled,
         active_sh,
         uniforms.shN_layout_slots
       );
@@ -703,7 +714,7 @@ void main(
 
 #if EXPORT_MODE == EXPORT_MODE_VULKAN_FORWARD
 
-    if (uniforms.lod_enabled == 2) {
+    if ((uniforms.lod_enabled & 2u) != 0u) {
         const float3 debug_rgb = chunk_debug_color(uint(g_idx) >> 12u);
         splat.rgb = lerp(splat.rgb, debug_rgb, 0.80f);
     }

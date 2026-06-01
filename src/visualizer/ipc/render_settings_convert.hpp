@@ -87,6 +87,9 @@ namespace lfs::vis {
         p.lod_max_splats = static_cast<float>(s.lod_max_splats);
         p.lod_pixel_scale_limit = s.lod_pixel_scale_limit;
         p.lod_render_scale = s.lod_render_scale;
+        p.lod_cone_foveation = s.lod_cone_foveation;
+        p.lod_cone_inner_degrees = s.lod_cone_inner_degrees;
+        p.lod_cone_outer_degrees = s.lod_cone_outer_degrees;
         return p;
     }
 
@@ -169,6 +172,9 @@ namespace lfs::vis {
         s.lod_max_splats = static_cast<size_t>(p.lod_max_splats);
         s.lod_pixel_scale_limit = p.lod_pixel_scale_limit;
         s.lod_render_scale = p.lod_render_scale;
+        s.lod_cone_foveation = p.lod_cone_foveation;
+        s.lod_cone_inner_degrees = p.lod_cone_inner_degrees;
+        s.lod_cone_outer_degrees = p.lod_cone_outer_degrees;
     }
 
 } // namespace lfs::vis

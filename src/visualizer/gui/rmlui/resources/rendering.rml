@@ -218,18 +218,32 @@
           <span class="slider-value">{{lod_max_splats | format_float(0)}}</span>
         </div>
       </div>
-      <div class="setting-row setting-row--aligned" data-tooltip="tooltip_lod_pixel_scale_limit">
-        <span class="setting-row__label-col">{{label_lod_pixel_scale_limit}}</span>
-        <div class="setting-row__control-col setting-row__control-col--slider">
-          <input type="range" class="setting-slider" data-value="lod_pixel_scale_limit" min="0.00001" max="0.01" step="0.00001" />
-          <span class="slider-value">{{lod_pixel_scale_limit | format_float(5)}}</span>
-        </div>
-      </div>
       <div class="setting-row setting-row--aligned" data-tooltip="tooltip_lod_render_scale">
         <span class="setting-row__label-col">{{label_lod_render_scale}}</span>
         <div class="setting-row__control-col setting-row__control-col--slider">
           <input type="range" class="setting-slider" data-value="lod_render_scale" min="0.1" max="2.0" step="0.1" />
           <span class="slider-value">{{lod_render_scale | format_float(1)}}</span>
+        </div>
+      </div>
+      <div class="setting-row setting-row--aligned" data-tooltip="tooltip_lod_cone_foveation">
+        <span class="setting-row__label-col">{{label_lod_cone_foveation}}</span>
+        <div class="setting-row__control-col setting-row__control-col--slider">
+          <input type="range" class="setting-slider" data-value="lod_cone_foveation" min="0.1" max="2.0" step="0.1" />
+          <span class="slider-value">{{lod_cone_foveation | format_float(1)}}</span>
+        </div>
+      </div>
+      <div class="setting-row setting-row--aligned" data-tooltip="tooltip_lod_cone_inner_degrees">
+        <span class="setting-row__label-col">{{label_lod_cone_inner_degrees}}</span>
+        <div class="setting-row__control-col setting-row__control-col--slider">
+          <input type="range" class="setting-slider" data-value="lod_cone_inner_degrees" min="0" max="180" step="1" />
+          <span class="slider-value">{{lod_cone_inner_degrees | format_float(0)}}</span>
+        </div>
+      </div>
+      <div class="setting-row setting-row--aligned" data-tooltip="tooltip_lod_cone_outer_degrees">
+        <span class="setting-row__label-col">{{label_lod_cone_outer_degrees}}</span>
+        <div class="setting-row__control-col setting-row__control-col--slider">
+          <input type="range" class="setting-slider" data-value="lod_cone_outer_degrees" min="0" max="180" step="1" />
+          <span class="slider-value">{{lod_cone_outer_degrees | format_float(0)}}</span>
         </div>
       </div>
       <div class="setting-row setting-row--aligned" data-tooltip="tooltip_lod_debug_mode">

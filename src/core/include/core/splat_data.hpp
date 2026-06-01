@@ -32,6 +32,7 @@ namespace lfs::core {
         std::vector<uint8_t>  lod_level;
         std::vector<glm::vec3> centers;
         std::vector<float>     sizes;
+        bool                   lod_opacity_encoded = false;
 
         size_t total_nodes() const { return child_count.size(); }
         bool   has_tree() const  { return !child_count.empty(); }
