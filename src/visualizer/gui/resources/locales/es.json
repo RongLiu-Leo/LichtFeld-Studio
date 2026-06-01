@@ -226,8 +226,10 @@
   "tooltip": {
     "lod_enabled": "Habilitar renderizado jerárquico de nivel de detalle para archivos RAD",
     "lod_max_splats": "Número máximo de splats a renderizar por fotograma",
-    "lod_pixel_scale_limit": "Escala mínima de píxel en pantalla para que un splat sea visible",
     "lod_render_scale": "Multiplicador de resolución para los cálculos de LOD",
+    "lod_cone_foveation": "Factor de penalización periférica LOD (1.0 = sin penalización)",
+    "lod_cone_inner_degrees": "Ángulo interior del cono en grados (sin penalización dentro de este ángulo)",
+    "lod_cone_outer_degrees": "Ángulo exterior del cono en grados (penalización completa más allá de este ángulo)",
     "lod_debug_mode": "Colorear splats según su nivel de LOD para depuración"
   },
   "rendering_panel": {
@@ -235,9 +237,20 @@
     "section_lod": "LOD",
     "lod_enabled": "Habilitar LOD",
     "lod_max_splats": "Splats máximos",
-    "lod_pixel_scale_limit": "Límite de escala de píxel",
     "lod_render_scale": "Escala de render",
-    "lod_debug_mode": "Colores de depuración"
+    "lod_cone_foveation": "Foveación en cono",
+    "lod_cone_inner_degrees": "Ángulo interior del cono",
+    "lod_cone_outer_degrees": "Ángulo exterior del cono",
+    "lod_debug_mode": "Colores de depuración",
+    "section_simplify": "Simplificación de Splat",
+    "simplify_source": "Fuente",
+    "simplify_select_source": "Seleccione un nodo splat",
+    "simplify_target": "Objetivo",
+    "simplify_knn_k": "kNN K",
+    "simplify_merge_cap": "Límite de fusión",
+    "simplify_opacity_prune": "Poda de opacidad",
+    "simplify_original": "Original",
+    "simplify_output": "Salida"
   },
   "asset_manager": {
     "title": "Gestor de Activos",

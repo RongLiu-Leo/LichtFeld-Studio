@@ -252,10 +252,6 @@
           <input type="checkbox" data-checked="lod_debug_mode" />
         </label>
       </div>
-      <div class="lod-stats text-muted">
-        <span>Total: {{lod_total_splats}}</span>
-        <span>Selected: {{lod_selected_splats}}</span>
-      </div>
     </div>
   </div>
 
