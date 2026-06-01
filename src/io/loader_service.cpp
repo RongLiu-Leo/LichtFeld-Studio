@@ -105,7 +105,9 @@ namespace lfs::io {
                 if (deleted.is_valid()) {
                     migrated.deleted() = std::move(deleted);
                 }
+                auto lod_tree = std::move(model.lod_tree);
                 model = std::move(migrated);
+                model.lod_tree = std::move(lod_tree);
                 model.set_tensor_allocator(allocator);
                 lfs::core::Tensor::trim_memory_pool();
             } catch (const std::exception& e) {

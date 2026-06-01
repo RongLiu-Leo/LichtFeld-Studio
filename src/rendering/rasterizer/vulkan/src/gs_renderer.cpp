@@ -328,7 +328,7 @@ void VulkanGSRenderer::executeGenerateKeys(
     PerfTimer::Timer<PerfTimer::GenerateKeys> timer(this);
     DEVICE_GUARD;
 
-    const size_t num_elements = buffers.num_splats;
+    const size_t num_elements = static_cast<size_t>(uniforms.num_splats);
     // executeCalculateIndexBufferOffset has synchronously read the cumsum tail,
     // so num_indices is the exact tile-instance count for this frame.
     const size_t capacity = buffers.num_indices;
@@ -725,7 +725,7 @@ void VulkanGSRenderer::executeCalculateIndexBufferOffset(
     VulkanGSPipelineBuffers& buffers) {
     PerfTimer::Timer<PerfTimer::CalculateIndexBufferOffset> timer(this);
 
-    const size_t num_elements = buffers.num_splats;
+    const size_t num_elements = static_cast<size_t>(uniforms.num_splats);
     if (num_elements == 0) {
         buffers.num_indices = 0;
         return;
@@ -773,7 +773,7 @@ void VulkanGSRenderer::executePrepareTileSort(
         uint32_t sort_partition_size;
         uint32_t pad0;
     } prepare_uniforms{
-        static_cast<uint32_t>(buffers.num_splats),
+        uniforms.num_splats,
         static_cast<uint32_t>(
             std::min<std::size_t>(buffers.num_indices,
                                   static_cast<std::size_t>(std::numeric_limits<uint32_t>::max()))),
@@ -1242,7 +1242,7 @@ void VulkanGSRenderer::executeApplyDepthOrdering(
     PerfTimer::Timer<PerfTimer::ApplyDepthOrdering> timer(this);
     DEVICE_GUARD;
 
-    const size_t num_splats = buffers.num_splats;
+    const size_t num_splats = static_cast<size_t>(uniforms.num_splats);
     if (num_splats == 0)
         return;
 

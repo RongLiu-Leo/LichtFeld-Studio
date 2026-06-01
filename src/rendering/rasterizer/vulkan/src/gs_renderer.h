@@ -171,8 +171,8 @@ protected:
     void executePrepareTileSort(const VulkanGSRendererUniforms& uniforms,
                                 VulkanGSPipelineBuffers& buffers);
 
-    _ComputePipeline pipeline_projection_forward = _ComputePipeline(19);
-    _ComputePipeline pipeline_projection_forward_3dgut = _ComputePipeline(19);
+    _ComputePipeline pipeline_projection_forward = _ComputePipeline(20);
+    _ComputePipeline pipeline_projection_forward_3dgut = _ComputePipeline(20);
     _ComputePipeline pipeline_selection_mask = _ComputePipeline(9);
     _ComputePipeline pipeline_selection_polygon_rasterize = _ComputePipeline(2);
     _ComputePipeline pipeline_generate_keys = _ComputePipeline(7);
