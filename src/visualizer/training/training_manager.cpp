@@ -16,6 +16,7 @@
 #include "window/vulkan_context.hpp"
 #include "window/window_manager.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <cuda_runtime.h>
 #include <format>
@@ -63,6 +64,64 @@ namespace lfs::vis {
         setupEventHandlers();
         setupStateMachineCallbacks();
         LOG_DEBUG("TrainerManager created");
+    }
+
+    lfs::core::SplatTensorAllocator TrainerManager::createTrainingSplatTensorAllocator(
+        const lfs::core::param::TrainingParameters& params,
+        const std::size_t min_capacity) {
+        splat_storage_.reset();
+        lfs::core::SplatTensorAllocator tensor_allocator;
+
+        const std::size_t configured_capacity =
+            params.optimization.max_cap > 0
+                ? static_cast<std::size_t>(params.optimization.max_cap)
+                : 0;
+        const std::size_t exportable_capacity = std::max(configured_capacity, min_capacity);
+        const int sh_degree = params.optimization.sh_degree;
+
+        VulkanContext* vk_ctx = nullptr;
+        if (viewer_ && viewer_->getWindowManager()) {
+            vk_ctx = viewer_->getWindowManager()->getVulkanContext();
+        }
+        const bool vulkan_interop_available =
+            vk_ctx && vk_ctx->externalMemoryInteropEnabled();
+
+        if (vulkan_interop_available && exportable_capacity > 0) {
+            auto storage_result =
+                lfs::core::SplatExportableStorage::create(exportable_capacity, sh_degree);
+            if (storage_result) {
+                splat_storage_ = std::move(*storage_result);
+                auto interop_alloc_result =
+                    makeSplatExportableInteropAllocator(*vk_ctx, *splat_storage_);
+                if (interop_alloc_result) {
+                    tensor_allocator = std::move(*interop_alloc_result);
+                    LOG_INFO("Training tensors share one CUDA-exportable VMM block "
+                             "imported into Vulkan (capacity={}, sh_degree={}, "
+                             "block={} MiB) — zero-copy viewer interop",
+                             exportable_capacity,
+                             sh_degree,
+                             splat_storage_->block->size >> 20);
+                } else {
+                    LOG_WARN("Exportable-interop allocator failed ({}); dropping storage "
+                             "and falling back to legacy Vulkan-external allocator",
+                             interop_alloc_result.error());
+                    splat_storage_.reset();
+                }
+            } else {
+                LOG_WARN("SplatExportableStorage creation failed ({}); falling back to "
+                         "legacy Vulkan-external allocator",
+                         storage_result.error());
+            }
+        }
+
+        if (!tensor_allocator) {
+            tensor_allocator = makeVulkanTrainingTensorAllocator(viewer_);
+            if (tensor_allocator) {
+                LOG_INFO("Training model tensors will use Vulkan-external CUDA storage");
+            }
+        }
+
+        return tensor_allocator;
     }
 
     void TrainerManager::setupStateMachineCallbacks() {
@@ -252,15 +311,42 @@ namespace lfs::vis {
         }
 
         if (trainer_->isInitialized()) {
+            const auto& params = trainer_->getParams();
+            auto* model = scene_ ? scene_->getTrainingModel() : nullptr;
+            const std::size_t model_size = model ? static_cast<std::size_t>(model->size()) : 0;
+            auto tensor_allocator = scene_ ? createTrainingSplatTensorAllocator(params, model_size)
+                                           : lfs::core::SplatTensorAllocator{};
+            const bool force_reallocation = splat_storage_.has_value();
+            if (scene_ && tensor_allocator) {
+                trainer_->setSplatTensorAllocator(tensor_allocator);
+                if (model) {
+                    if (auto result = lfs::training::migrateTrainingModelToAllocator(
+                            params, *model, tensor_allocator, force_reallocation);
+                        !result) {
+                        LOG_ERROR("Failed to migrate initialized training model: {}", result.error());
+                        last_error_ = result.error();
+                        state::TrainingCompleted{
+                            .iteration = getCurrentIteration(),
+                            .final_loss = 0.0f,
+                            .elapsed_seconds = 0.0f,
+                            .success = false,
+                            .user_stopped = false,
+                            .error = last_error_}
+                            .emit();
+                        if (!state_machine_.transitionToFinished(FinishReason::Error)) {
+                            LOG_WARN("Failed to transition to Finished(Error)");
+                        }
+                        return false;
+                    }
+                }
+            }
             LOG_DEBUG("Resuming from iteration {}", trainer_->get_current_iteration());
         } else {
             const auto& params = trainer_->getParams();
 
             if (scene_) {
-                auto tensor_allocator = makeVulkanTrainingTensorAllocator(viewer_);
-                if (tensor_allocator) {
-                    LOG_INFO("Training model tensors will use Vulkan-external CUDA storage");
-                }
+                auto tensor_allocator = createTrainingSplatTensorAllocator(params);
+                trainer_->setSplatTensorAllocator(tensor_allocator);
                 if (auto result = lfs::training::initializeTrainingModel(
                         params, *scene_, std::move(tensor_allocator));
                     !result) {

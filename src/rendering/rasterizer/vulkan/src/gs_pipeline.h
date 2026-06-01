@@ -2,11 +2,14 @@
 
 #include <algorithm> // std::sort
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring> // memcpy
 #include <functional>
 #include <map>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <variant>
 #include <vector>
 #include <vk_mem_alloc.h>
@@ -23,6 +26,9 @@ union Uniform32_t {
 
 class VulkanGSPipeline {
 public:
+    using TimerCallback = std::function<void(const std::vector<std::pair<size_t, double>>&)>;
+    using CpuTimerCallback = std::function<void(std::string_view, double)>;
+
     VulkanGSPipeline();
     ~VulkanGSPipeline();
 
@@ -31,9 +37,11 @@ public:
                             VkDevice external_device,
                             VkQueue external_queue,
                             uint32_t external_queue_family_index,
-                            VmaAllocator external_allocator);
+                            VmaAllocator external_allocator,
+                            VkPipelineCache external_pipeline_cache = VK_NULL_HANDLE);
     void cleanup();
     void cleanupBuffers(VulkanGSPipelineBuffers& buffers);
+    void assignBufferLabels(VulkanGSPipelineBuffers& buffers);
 
     void createBuffer(size_t size, _VulkanBuffer& buffer);
     void destroyBuffer(_VulkanBuffer& buffer);
@@ -48,7 +56,11 @@ public:
     T readElement(const _VulkanBuffer& buffer, size_t index);
 
     void beginCommandBatch();
-    void endCommandBatch(bool use_fence = true);
+    void endCommandBatch(bool use_fence = true,
+                         VkSemaphore signal_semaphore = VK_NULL_HANDLE,
+                         std::uint64_t signal_value = 0);
+    void waitForPendingBatch();
+    [[nodiscard]] bool timelineValueComplete(VkSemaphore semaphore, std::uint64_t value) const;
     void addTimelineWait(VkSemaphore semaphore, std::uint64_t value, VkPipelineStageFlags stage_mask);
     bool isCommandBatchInProgress() const {
         return commandBatchInProgress;
@@ -58,7 +70,10 @@ public:
     }
     bool writeTimestamp(int delta);
     bool writeTimestampNoExcept(int delta);
+    void addTimerCallback(TimerCallback callback);
+    void setCpuTimerCallback(CpuTimerCallback callback);
 
+    size_t getCurrentAllocSize() const { return current_vram; }
     size_t getPeakAllocSize() const { return peak_vram; }
 
     enum BarrierMask {
@@ -81,7 +96,41 @@ protected:
     bool commandBatchInProgress = false;
     uint32_t timestampNumWritten = 0;
     uint32_t timestampStackDepth = 0;
-    std::vector<std::function<void(const std::vector<std::pair<size_t, double>>&)>> timerCallbacks;
+    std::vector<TimerCallback> timerCallbacks;
+    CpuTimerCallback cpuTimerCallback_;
+
+    class [[nodiscard]] CpuStageTimer {
+    public:
+        CpuStageTimer(VulkanGSPipeline* pipeline, std::string name)
+            : pipeline_(pipeline),
+              name_(std::move(name)),
+              start_(std::chrono::high_resolution_clock::now()) {}
+
+        CpuStageTimer(const CpuStageTimer&) = delete;
+        CpuStageTimer& operator=(const CpuStageTimer&) = delete;
+        CpuStageTimer(CpuStageTimer&& other) noexcept
+            : pipeline_(std::exchange(other.pipeline_, nullptr)),
+              name_(other.name_),
+              start_(other.start_) {}
+        CpuStageTimer& operator=(CpuStageTimer&&) = delete;
+
+        ~CpuStageTimer() {
+            if (!pipeline_ || !pipeline_->cpuTimerCallback_)
+                return;
+            const auto elapsed = std::chrono::high_resolution_clock::now() - start_;
+            const double ms = std::chrono::duration<double, std::milli>(elapsed).count();
+            pipeline_->cpuTimerCallback_(name_, ms);
+        }
+
+    private:
+        VulkanGSPipeline* pipeline_ = nullptr;
+        std::string name_;
+        std::chrono::time_point<std::chrono::high_resolution_clock> start_;
+    };
+
+    CpuStageTimer timeCpuStage(std::string name) {
+        return CpuStageTimer(this, std::move(name));
+    }
 
     void bufferMemoryBarrier(const std::vector<std::pair<_VulkanBuffer, BarrierMask>>& buffers, BarrierMask dstMask);
 
@@ -95,6 +144,19 @@ protected:
     };
     std::vector<PendingTimelineWait> pending_timeline_waits_;
 
+    static constexpr std::uint32_t kCommandBatchSlotCount = 3;
+    struct CommandBatchSlot {
+        VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+        VkQueryPool timestamp_query_pool = VK_NULL_HANDLE;
+        VkSemaphore pending_signal = VK_NULL_HANDLE;
+        std::uint64_t pending_signal_value = 0;
+        std::uint32_t pending_timestamp_count = 0;
+        std::vector<std::pair<int, int>> pending_timestamp_marks;
+    };
+    std::array<CommandBatchSlot, kCommandBatchSlotCount> command_batch_slots_{};
+    std::uint32_t next_command_batch_slot_ = 0;
+    std::uint32_t active_command_batch_slot_ = 0;
+
     // Vulkan objects
     VkInstance instance;
     VkPhysicalDevice physical_device;
@@ -105,6 +167,9 @@ protected:
     VkFence fence;
     VkQueryPool timestamp_query_pool;
     VmaAllocator allocator = VK_NULL_HANDLE;
+    // Persisted, on-disk pipeline cache owned by the host VulkanContext. Optional —
+    // VK_NULL_HANDLE simply skips the cache. Shared with the rest of the app's pipelines.
+    VkPipelineCache pipeline_cache = VK_NULL_HANDLE;
     PFN_vkCmdPushDescriptorSetKHR vk_cmd_push_descriptor_set_ = nullptr;
 
     struct DeviceInfo {
@@ -173,6 +238,8 @@ protected:
     void createCommandPool();
     void createFence();
     void createQueryPools();
+    void waitForPendingBatchSlot(CommandBatchSlot& slot);
+    void collectTimestampResults(CommandBatchSlot& slot, std::uint32_t timestamp_count);
     void createShaderModule(const std::vector<uint32_t>& spirv_code, VkShaderModule* pShaderModule);
 
     void createComputeDescriptorSetLayout(_ComputePipeline& pipeline);
@@ -199,6 +266,9 @@ private:
 class [[nodiscard]] DeviceGuard {
     VulkanGSPipeline* pipeline;
     bool cbip;
+    bool use_fence = true;
+    VkSemaphore signal_semaphore = VK_NULL_HANDLE;
+    std::uint64_t signal_value = 0;
     const char* debugInfo1 = nullptr;
     int debugInfo2 = -1;
 
@@ -216,10 +286,21 @@ public:
             }
         }
     }
+    DeviceGuard(VulkanGSPipeline* pipeline,
+                const bool use_fence,
+                const VkSemaphore signal_semaphore,
+                const std::uint64_t signal_value,
+                const char* debugInfo1 = nullptr,
+                const int debugInfo2 = -1)
+        : DeviceGuard(pipeline, debugInfo1, debugInfo2) {
+        this->use_fence = use_fence;
+        this->signal_semaphore = signal_semaphore;
+        this->signal_value = signal_value;
+    }
     ~DeviceGuard() noexcept(false) {
         // printf("DeviceGuard destructor\n");
         if (!cbip) {
-            pipeline->endCommandBatch();
+            pipeline->endCommandBatch(use_fence, signal_semaphore, signal_value);
             if (debugInfo1) {
                 printf("DeviceGuard freed: %s:%d\n", debugInfo1, debugInfo2);
             }

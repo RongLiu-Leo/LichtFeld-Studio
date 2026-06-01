@@ -232,7 +232,6 @@
     "type.splat": "Splat",
     "type.spz": "SPZ",
     "type.usd": "USD",
-    "type.video": "VIDEO",
     "unit.b": "B",
     "unit.gb": "GB",
     "unit.kb": "KB",
@@ -776,7 +775,15 @@
     "sequencer": "Sequencer",
     "ellipsoid": "Ellipsoid",
     "histogram": "Histogram",
-    "depth_map": "Mappa di profondita"
+    "depth_map": "Mappa di profondita",
+    "depth_mode_disable": "Disattiva modalità profondità",
+    "depth_mode_enable": "Attiva modalità profondità",
+    "delete_selection": "Elimina selezione",
+    "undo": "Annulla",
+    "redo": "Ripeti",
+    "invert_selection": "Inverti selezione",
+    "select_all": "Seleziona tutto",
+    "unselect": "Deseleziona"
   },
   "transform": {
     "node": "Nodo: %s",
@@ -790,8 +797,20 @@
     "uniform_scale": "Scala Uniforme",
     "use_gizmo": "Usa gizmo per trasformare",
     "reset_all": "Resetta Tutte le Trasformazioni",
+    "reset_all_short": "Resetta tutto",
     "reset_transform": "Resetta Trasformazione",
-    "nodes_selected": "%zu nodi selezionati"
+    "nodes_selected": "%zu nodi selezionati",
+    "bake_transform": "Applica trasformazione",
+    "tool": "Trasformazione",
+    "axis": "Asse",
+    "space_plain": "Spazio"
+  },
+  "selection": {
+    "operation_failed": "Operazione di selezione non riuscita",
+    "operation_failed_generic": "Operazione non riuscita.",
+    "update_depth_failed": "Impossibile aggiornare il filtro di profondità della selezione.",
+    "undo_failed": "Annullamento non riuscito.",
+    "redo_failed": "Ripetizione non riuscita."
   },
   "cropbox": {
     "title": "Scatola di Ritaglio",
@@ -1637,7 +1656,7 @@
     "no_marked_range": "No marked range",
     "gaussian_count": "{count} Gaussians",
     "range_value": "{min} to {max}",
-    "status_drag_delete": "Left-drag across the histogram to mark a range, then delete it.",
+    "status_drag_delete": "Left-drag to mark a range, then delete it  ·  Ctrl+scroll to zoom  ·  double-click to fit",
     "status_selection": "Marked range becomes the active Gaussian selection.",
     "summary": "{metric} distribution across {count} Gaussians",
     "bin_tooltip": "Bin {index}: {left} to {right} | {count} Gaussians",

@@ -10,11 +10,13 @@
 #include "core/mesh_data.hpp"
 #include "core/splat_data.hpp"
 #include "core/tensor.hpp"
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
@@ -128,6 +130,7 @@ namespace lfs::core {
 
     class LFS_CORE_API Scene {
     public:
+        using SelectionGroupCounts = std::array<size_t, 256>;
         using Node = SceneNode;
 
         struct SelectionStateSnapshot {
@@ -245,6 +248,9 @@ namespace lfs::core {
         [[nodiscard]] std::vector<RenderableEllipsoid> getVisibleEllipsoids() const;
 
         const lfs::core::SplatData* getCombinedModel() const;
+
+        void setCombinedModelAllocator(SplatTensorAllocator allocator);
+
         size_t consolidateNodeModels();
         [[nodiscard]] bool isConsolidated() const { return consolidated_; }
         [[nodiscard]] std::vector<bool> getNodeVisibilityMask() const;
@@ -285,6 +291,9 @@ namespace lfs::core {
         std::shared_ptr<lfs::core::Tensor> getSelectionMask() const;
         void setSelection(const std::vector<size_t>& selected_indices);
         void setSelectionMask(std::shared_ptr<lfs::core::Tensor> mask);
+        void setSelectionMaskWithGroupCounts(std::shared_ptr<lfs::core::Tensor> mask,
+                                             size_t selected_count,
+                                             const SelectionGroupCounts& group_counts);
         void clearSelection();
         bool hasSelection() const;
         [[nodiscard]] SelectionStateMetadata captureSelectionStateMetadata() const;
@@ -301,6 +310,7 @@ namespace lfs::core {
         [[nodiscard]] uint8_t getActiveSelectionGroup() const { return active_selection_group_; }
         [[nodiscard]] const std::vector<SelectionGroup>& getSelectionGroups() const { return selection_groups_; }
         [[nodiscard]] const SelectionGroup* getSelectionGroup(uint8_t id) const;
+        [[nodiscard]] bool selectionGroupCountsDirty() const { return selection_group_counts_dirty_; }
         void updateSelectionGroupCounts();
         void clearSelectionGroup(uint8_t id);
         void resetSelectionState();
@@ -328,6 +338,7 @@ namespace lfs::core {
 
         [[nodiscard]] lfs::core::SplatData* getTrainingModel();
         [[nodiscard]] const lfs::core::SplatData* getTrainingModel() const;
+        [[nodiscard]] bool isTrainingModelEffectivelyVisible() const;
         [[nodiscard]] size_t getTrainingModelGaussianCount() const;
         [[nodiscard]] size_t getVisibleGaussianCount() const;
         [[nodiscard]] std::unordered_map<NodeId, size_t> getActiveGaussianCountsByNode() const;
@@ -386,6 +397,9 @@ namespace lfs::core {
         mutable std::atomic<bool> model_cache_valid_{false};
         mutable const lfs::core::SplatData* single_node_model_ = nullptr;
 
+        mutable std::mutex combined_model_mutex_;
+        SplatTensorAllocator combined_model_allocator_;
+
         mutable std::vector<glm::mat4> cached_transforms_;
         mutable std::atomic<bool> transform_cache_valid_{false};
         mutable bool consolidated_ = false;
@@ -398,6 +412,7 @@ namespace lfs::core {
         std::vector<SelectionGroup> selection_groups_;
         uint8_t active_selection_group_ = 1;
         uint8_t next_group_id_ = 1;
+        bool selection_group_counts_dirty_ = true;
 
         void rebuildCacheIfNeeded() const;
         void rebuildModelCacheIfNeeded() const;
@@ -410,6 +425,8 @@ namespace lfs::core {
 
         SelectionGroup* findGroup(uint8_t id);
         const SelectionGroup* findGroup(uint8_t id) const;
+        void applySelectionGroupCounts(const SelectionGroupCounts& group_counts);
+        void clearSelectionGroupCounts();
 
         std::shared_ptr<lfs::core::PointCloud> initial_point_cloud_;
         lfs::core::Tensor scene_center_;

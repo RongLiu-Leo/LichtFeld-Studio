@@ -116,6 +116,7 @@ namespace lfs::vis::input {
         PIE_MENU,
         DEPTH_ADJUST_NEAR, // Deprecated: migrated to DEPTH_ADJUST_FAR on load
         CAMERA_RESET_HOME,
+        HISTOGRAM_ZOOM_MARKED,
 
     };
 
@@ -261,6 +262,7 @@ namespace lfs::vis::input {
         bool saveProfileToFile(const std::filesystem::path& path) const;
         std::vector<std::string> getAvailableProfiles() const;
         const std::string& getCurrentProfileName() const { return current_profile_name_; }
+        std::uint64_t getBindingsRevision() const { return bindings_revision_; }
 
         static std::filesystem::path getConfigDir();
 
@@ -322,6 +324,7 @@ namespace lfs::vis::input {
 
         std::string current_profile_name_;
         std::vector<Binding> bindings_;
+        std::uint64_t bindings_revision_ = 0;
 
         using KeyMapKey = std::tuple<ToolMode, int, int>;
         using MouseMapKey = std::tuple<ToolMode, MouseButton, int, bool>;

@@ -22,6 +22,7 @@ from .asset_manager_integration import (
 )
 from .import_panels import open_url_import_panel, open_watch_dirs_dialog
 from .types import Panel
+from .ui import RuntimeState
 
 _logger = logging.getLogger(__name__)
 
@@ -69,7 +70,7 @@ __lfs_panel_ids__ = ["lfs.asset_manager"]
 
 
 class AssetManagerPanel(Panel):
-    """Floating Asset Manager window for browsing splats, videos, and exports."""
+    """Floating Asset Manager window for browsing splats and exports."""
 
     SORT_MODES = ("name", "size", "type")
     LOADABLE_TYPES = {"ply_3dgs", "ply_pcl", "rad", "sog", "spz", "checkpoint", "dataset", "mesh", "usd"}
@@ -81,7 +82,7 @@ class AssetManagerPanel(Panel):
     template = "rmlui/asset_manager.rml"
     height_mode = lf.ui.PanelHeightMode.FILL
     size = (980, 620)
-    update_interval_ms = 500
+    update_policy = "dirty"
 
     # Storage path for asset manager data
     STORAGE_PATH = resolve_asset_manager_storage_path()
@@ -280,6 +281,9 @@ class AssetManagerPanel(Panel):
         self._library_mtime: float = 0.0
         self._updating_selection_details: bool = False
         self._pending_transform_applications: List[Dict[str, Any]] = []
+        self._reactive_unsubscribers = []
+        self._last_scene_generation: Optional[int] = None
+        self._last_language_generation: Optional[int] = None
 
         # New project menu state
         self._new_project_menu_open: bool = False
@@ -771,23 +775,30 @@ class AssetManagerPanel(Panel):
             elif self._selection_type == "project" and not self._selected_project_id:
                 self._selection_type = "none"
 
+    @staticmethod
+    def _asset_file_exists(asset: Dict[str, Any]) -> bool:
+        """Single source of truth for asset presence, shared by the list and
+        every count surface so sidebar badges never disagree with what renders."""
+        file_path = asset.get("absolute_path") or asset.get("path")
+        return bool(file_path) and os.path.exists(file_path)
+
     def _scene_asset_count(self, scene_id: str) -> int:
         if not self._asset_index or not hasattr(self._asset_index, "assets"):
             return 0
         return sum(
             1
             for asset in self._asset_index.assets.values()
-            if asset.get("scene_id") == scene_id
+            if asset.get("scene_id") == scene_id and self._asset_file_exists(asset)
         )
 
     def _project_asset_count(self, project_id: str) -> int:
-        """Count total assets in a project."""
+        """Count assets in a project whose backing file is present on disk."""
         if not self._asset_index or not hasattr(self._asset_index, "assets"):
             return 0
         return sum(
             1
             for asset in self._asset_index.assets.values()
-            if asset.get("project_id") == project_id
+            if asset.get("project_id") == project_id and self._asset_file_exists(asset)
         )
 
     def _ensure_default_project(self) -> None:
@@ -906,8 +917,7 @@ class AssetManagerPanel(Panel):
 
         assets = []
         for asset_id, asset in self._asset_index.assets.items():
-            file_path = asset.get("absolute_path") or asset.get("path")
-            if not file_path or not os.path.exists(file_path):
+            if not self._asset_file_exists(asset):
                 modified_at = asset.get("modified_at", "")
                 try:
                     ts = datetime.fromisoformat(modified_at.replace("Z", "+00:00")).replace(tzinfo=None)
@@ -1068,8 +1078,6 @@ class AssetManagerPanel(Panel):
             "sog": "asset-thumb-splat",
             "spz": "asset-thumb-splat",
             "checkpoint": "asset-thumb-checkpoint",
-            "mp4": "asset-thumb-video",
-            "mov": "asset-thumb-video",
             "dataset": "asset-thumb-dataset",
         }
         thumb_class = thumb_classes.get(asset_type, "asset-thumb-default")
@@ -1091,8 +1099,6 @@ class AssetManagerPanel(Panel):
             "dataset": tr("asset_manager.type.dataset"),
             "mesh": tr("asset_manager.type.mesh"),
             "usd": tr("asset_manager.type.usd"),
-            "mp4": tr("asset_manager.type.video"),
-            "mov": tr("asset_manager.type.video"),
         }
         type_label = type_labels.get(asset_type, asset_type.upper() if asset_type else "")
 
@@ -1191,7 +1197,11 @@ class AssetManagerPanel(Panel):
         if not self._asset_index or not hasattr(self._asset_index, "assets"):
             return self._get_default_filters()
 
-        assets = list(self._asset_index.assets.values())
+        assets = [
+            a
+            for a in self._asset_index.assets.values()
+            if self._asset_file_exists(a)
+        ]
 
         # Count by filter (Splat, PCL, Dataset, Checkpoint)
         # Splat: 3DGS PLY files (ply_3dgs), SOG files, and legacy PLY
@@ -1524,8 +1534,6 @@ class AssetManagerPanel(Panel):
             "dataset": tr("asset_manager.type.dataset"),
             "mesh": tr("asset_manager.type.mesh"),
             "usd": tr("asset_manager.type.usd"),
-            "mp4": tr("asset_manager.type.video"),
-            "mov": tr("asset_manager.type.video"),
         }
         return type_labels.get(asset_type, asset_type.upper() if asset_type else "")
 
@@ -1564,7 +1572,7 @@ class AssetManagerPanel(Panel):
         return sum(
             1
             for asset in self._asset_index.assets.values()
-            if asset.get("scene_id") == scene_id
+            if asset.get("scene_id") == scene_id and self._asset_file_exists(asset)
         )
 
     def get_selected_scene_created(self) -> str:
@@ -2699,6 +2707,7 @@ class AssetManagerPanel(Panel):
                 "pending_subtree_nodes": set(),
             }
         )
+        self._request_model_update()
 
     def _resolve_loaded_asset_root_name(self, scene, pending: Dict[str, Any]) -> Optional[str]:
         geometry_metadata = pending.get("geometry_metadata", {}) or {}
@@ -3488,17 +3497,40 @@ class AssetManagerPanel(Panel):
 
         # Initial refresh must dirty scalar bindings after catalog load.
         self.refresh_catalog()
+        self._last_scene_generation = RuntimeState.scene_generation.value
+        self._last_language_generation = RuntimeState.language_generation.value
+        self._subscribe_reactive_state()
 
     def on_scene_changed(self, doc):
         self._flush_pending_transform_applications()
         self._sync_runtime_scene_catalog(select_current=True)
+        self._last_scene_generation = RuntimeState.scene_generation.value
         self.refresh_catalog()
 
     def on_update(self, doc):
-        """Periodic update - check for missing files."""
+        """Dirty-policy update for catalog and deferred scene work."""
+        changed = False
+
+        language_generation = RuntimeState.language_generation.value
+        if language_generation != self._last_language_generation:
+            self._last_language_generation = language_generation
+            if self._handle:
+                self._handle.dirty_all()
+            changed = True
+
         if not self._asset_index:
-            return False
+            return changed
+
         self._flush_pending_transform_applications()
+        if self._pending_transform_applications:
+            self._request_model_update()
+
+        scene_generation = RuntimeState.scene_generation.value
+        if scene_generation != self._last_scene_generation:
+            self._last_scene_generation = scene_generation
+            self._sync_runtime_scene_catalog(select_current=True)
+            self.refresh_catalog(request_update=False)
+            changed = True
 
         try:
             library_path = self._asset_index.library_path
@@ -3509,8 +3541,8 @@ class AssetManagerPanel(Panel):
                     if self._sync_existing_asset_metadata() and library_path.exists():
                         current_mtime = library_path.stat().st_mtime
                     self._library_mtime = current_mtime
-                    self.refresh_catalog()
-                    return False
+                    self.refresh_catalog(request_update=False)
+                    changed = True
 
             if hasattr(self._asset_index, "mark_missing_files"):
                 previous_missing = sum(
@@ -3522,14 +3554,16 @@ class AssetManagerPanel(Panel):
                 if current_missing != previous_missing:
                     if library_path.exists():
                         self._library_mtime = library_path.stat().st_mtime
-                    self.refresh_catalog()
+                    self.refresh_catalog(request_update=False)
+                    changed = True
         except Exception:
             pass
 
-        return False
+        return changed
 
     def on_unmount(self, doc):
         """Save index on unmount."""
+        self._unsubscribe_reactive_state()
         clear_active_asset_manager_panel(self)
         if self._asset_index and hasattr(self._asset_index, "save"):
             try:
@@ -3540,6 +3574,31 @@ class AssetManagerPanel(Panel):
         doc.remove_data_model("asset_manager")
         self._handle = None
         self._doc = None
+
+    def _subscribe_reactive_state(self):
+        if self._reactive_unsubscribers:
+            return
+
+        native_signals = (
+            RuntimeState.scene_generation,
+            RuntimeState.language_generation,
+        )
+        self._reactive_unsubscribers = [
+            signal.subscribe(lambda _value: self._request_model_update())
+            for signal in native_signals
+        ]
+
+    def _unsubscribe_reactive_state(self):
+        for unsubscribe in self._reactive_unsubscribers:
+            try:
+                unsubscribe()
+            except Exception:
+                pass
+        self._reactive_unsubscribers = []
+
+    def _request_model_update(self):
+        if self._handle:
+            rml_widgets.request_model_update(self._handle)
 
     def _bind_dom_event_listeners(self, doc) -> None:
         """Bind stable DOM listeners for dynamic Asset Manager rows.
@@ -3996,12 +4055,14 @@ class AssetManagerPanel(Panel):
 
     # ── Helper Methods ─────────────────────────────────────────
 
-    def refresh_catalog(self):
+    def refresh_catalog(self, *, request_update: bool = True):
         """Refresh all catalog data in the UI."""
         self._reconcile_selection()
         self._update_all_record_lists()
         if self._handle:
             self._handle.dirty_all()
+            if request_update:
+                self._request_model_update()
 
     def refresh_catalog_scan(self, _handle=None, _ev=None, _args=None):
         """Rescan all known asset directories and refresh the catalog."""

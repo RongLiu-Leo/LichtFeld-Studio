@@ -604,7 +604,17 @@ namespace lfs::core {
         return (it != name_to_id_.end()) ? it->second : NULL_NODE;
     }
 
+    void Scene::setCombinedModelAllocator(SplatTensorAllocator allocator) {
+        std::lock_guard<std::mutex> lock(combined_model_mutex_);
+        combined_model_allocator_ = std::move(allocator);
+        model_cache_valid_.store(false, std::memory_order_release);
+    }
+
     void Scene::rebuildModelCacheIfNeeded() const {
+        if (model_cache_valid_.load(std::memory_order_acquire))
+            return;
+
+        std::lock_guard<std::mutex> lock(combined_model_mutex_);
         if (model_cache_valid_.load(std::memory_order_acquire))
             return;
 
@@ -712,17 +722,34 @@ namespace lfs::core {
         const size_t shN_swizzled_floats = lfs::core::sh_swizzled_float_count(stats.total_gaussians, dst_layout_rest);
 
         using lfs::core::Tensor;
-        Tensor means = Tensor::empty({static_cast<size_t>(stats.total_gaussians), 3}, device);
-        Tensor sh0 = Tensor::empty({static_cast<size_t>(stats.total_gaussians), static_cast<size_t>(SH0_COEFFS), 3}, device);
-        Tensor shN = shN_swizzled_floats > 0
-                         ? Tensor::zeros_direct(
-                               TensorShape({shN_swizzled_floats}),
-                               shN_swizzled_floats,
-                               lfs::core::Device::CUDA)
-                         : Tensor::zeros({0}, lfs::core::Device::CUDA);
-        Tensor opacity = Tensor::empty({static_cast<size_t>(stats.total_gaussians), 1}, device);
-        Tensor scaling = Tensor::empty({static_cast<size_t>(stats.total_gaussians), 3}, device);
-        Tensor rotation = Tensor::empty({static_cast<size_t>(stats.total_gaussians), 4}, device);
+        const size_t total = stats.total_gaussians;
+        const auto& alloc = combined_model_allocator_;
+        const auto alloc_param = [&](TensorShape shape, const size_t rows, const std::string_view name) -> Tensor {
+            return alloc ? alloc(std::move(shape), rows, lfs::core::DataType::Float32, name)
+                         : Tensor::empty(std::move(shape), device);
+        };
+        Tensor means = alloc_param(TensorShape({total, 3}), total, "SplatData.means");
+        Tensor sh0 = alloc_param(TensorShape({total, static_cast<size_t>(SH0_COEFFS), 3}), total, "SplatData.sh0");
+        // shN needs zeroing: copy_contiguous leaves the swizzled block-padding lanes untouched.
+        Tensor shN;
+        if (shN_swizzled_floats > 0) {
+            if (alloc) {
+                shN = alloc(TensorShape({shN_swizzled_floats}),
+                            shN_swizzled_floats,
+                            lfs::core::DataType::Float32,
+                            "SplatData.shN");
+                shN.zero_();
+            } else {
+                shN = Tensor::zeros_direct(TensorShape({shN_swizzled_floats}),
+                                           shN_swizzled_floats,
+                                           lfs::core::Device::CUDA);
+            }
+        } else {
+            shN = Tensor::zeros({0}, lfs::core::Device::CUDA);
+        }
+        Tensor opacity = alloc_param(TensorShape({total, 1}), total, "SplatData.opacity");
+        Tensor scaling = alloc_param(TensorShape({total, 3}), total, "SplatData.scaling");
+        Tensor rotation = alloc_param(TensorShape({total, 4}), total, "SplatData.rotation");
 
         const bool has_any_deleted = std::any_of(visible_nodes.begin(), visible_nodes.end(),
                                                  [](const SceneNode* node) { return node->model->has_deleted_mask(); });
@@ -799,6 +826,7 @@ namespace lfs::core {
             stats.total_scene_scale / visible_nodes.size(),
             lfs::core::SplatData::ShNLayout::Swizzled);
         cached_combined_->set_active_sh_degree(stats.max_active_sh_degree);
+        cached_combined_->set_tensor_allocator(combined_model_allocator_);
 
         if (has_any_deleted) {
             cached_combined_->deleted() = std::move(deleted);
@@ -1018,6 +1046,7 @@ namespace lfs::core {
                 selection_mask_.reset();
                 has_selection_ = false;
             }
+            selection_group_counts_dirty_ = true;
         }
         events::state::SelectionChanged{.has_selection = has_selection, .count = count}.emit();
         notifyMutation(MutationType::SELECTION_CHANGED);
@@ -1057,8 +1086,60 @@ namespace lfs::core {
             if (!has_selection_) {
                 selection_mask_.reset();
             }
+            selection_group_counts_dirty_ = true;
         }
         events::state::SelectionChanged{.has_selection = has_selection, .count = count}.emit();
+        notifyMutation(MutationType::SELECTION_CHANGED);
+    }
+
+    void Scene::setSelectionMaskWithGroupCounts(std::shared_ptr<lfs::core::Tensor> mask,
+                                                const size_t selected_count,
+                                                const SelectionGroupCounts& group_counts) {
+        size_t count = selected_count;
+        bool has_selection = false;
+        const size_t expected_size = currentSelectionCapacity();
+        if (mask && mask->is_valid() && mask->numel() > 0 &&
+            mask->numel() != expected_size) {
+            const auto* visible_model = getCombinedModel();
+            const auto visible_indices = getVisibleSelectionIndices();
+            if (visible_model && static_cast<size_t>(visible_model->size()) == mask->numel() &&
+                visible_indices && visible_indices->is_valid() && visible_indices->numel() == mask->numel()) {
+                auto expanded = lfs::core::Tensor::zeros({expected_size}, mask->device(), mask->dtype());
+                expanded.index_copy_(0, *visible_indices, *mask);
+                mask = std::make_shared<lfs::core::Tensor>(std::move(expanded));
+            } else {
+                LOG_WARN("Ignoring selection_mask with stale size: scene has {}, mask has {}",
+                         expected_size, mask->numel());
+                mask.reset();
+                count = 0;
+            }
+        }
+
+        {
+            std::unique_lock lock(selection_mutex_);
+            selection_mask_ = std::move(mask);
+            const bool valid =
+                selection_mask_ && selection_mask_->is_valid() && selection_mask_->numel() > 0;
+
+            has_selection_ = valid && count > 0;
+            has_selection = has_selection_;
+            if (!has_selection_) {
+                selection_mask_.reset();
+                count = 0;
+            }
+        }
+
+        if (has_selection) {
+            applySelectionGroupCounts(group_counts);
+        } else {
+            clearSelectionGroupCounts();
+        }
+        selection_group_counts_dirty_ = false;
+
+        events::state::SelectionChanged{
+            .has_selection = has_selection,
+            .count = static_cast<int>(std::min(count, static_cast<size_t>(std::numeric_limits<int>::max())))}
+            .emit();
         notifyMutation(MutationType::SELECTION_CHANGED);
     }
 
@@ -1068,6 +1149,8 @@ namespace lfs::core {
             selection_mask_.reset();
             has_selection_ = false;
         }
+        clearSelectionGroupCounts();
+        selection_group_counts_dirty_ = false;
         events::state::SelectionChanged{.has_selection = false, .count = 0}.emit();
         notifyMutation(MutationType::SELECTION_CHANGED);
     }
@@ -1120,6 +1203,7 @@ namespace lfs::core {
             if (has_selection_) {
                 count = static_cast<int>(selection_mask_->ne(0).to(core::DataType::Float32).sum_scalar());
             }
+            selection_group_counts_dirty_ = false;
         }
 
         selection_groups_ = snapshot.groups;
@@ -1204,6 +1288,18 @@ namespace lfs::core {
         return (it != selection_groups_.end()) ? &(*it) : nullptr;
     }
 
+    void Scene::applySelectionGroupCounts(const SelectionGroupCounts& group_counts) {
+        for (auto& group : selection_groups_) {
+            group.count = group_counts[group.id];
+        }
+    }
+
+    void Scene::clearSelectionGroupCounts() {
+        for (auto& group : selection_groups_) {
+            group.count = 0;
+        }
+    }
+
     uint8_t Scene::addSelectionGroup(const std::string& name, const glm::vec3& color) {
         if (next_group_id_ == 0) {
             LOG_WARN("Maximum selection groups reached");
@@ -1286,15 +1382,18 @@ namespace lfs::core {
     }
 
     void Scene::updateSelectionGroupCounts() {
-        for (auto& group : selection_groups_) {
-            group.count = 0;
+        if (!selection_group_counts_dirty_) {
+            return;
         }
+        clearSelectionGroupCounts();
 
         std::shared_ptr<lfs::core::Tensor> selection_mask;
         {
             std::shared_lock lock(selection_mutex_);
-            if (!selection_mask_ || !selection_mask_->is_valid())
+            if (!selection_mask_ || !selection_mask_->is_valid()) {
+                selection_group_counts_dirty_ = false;
                 return;
+            }
             selection_mask = selection_mask_;
         }
 
@@ -1308,6 +1407,7 @@ namespace lfs::core {
                 group->count++;
             }
         }
+        selection_group_counts_dirty_ = false;
     }
 
     void Scene::clearSelectionGroup(const uint8_t id) {
@@ -1343,6 +1443,7 @@ namespace lfs::core {
         if (auto* group = findGroup(id)) {
             group->count = 0;
         }
+        selection_group_counts_dirty_ = true;
         notifyMutation(MutationType::SELECTION_CHANGED);
     }
 
@@ -1355,6 +1456,7 @@ namespace lfs::core {
         }
         selection_groups_.clear();
         next_group_id_ = 1;
+        selection_group_counts_dirty_ = false;
         addSelectionGroup("Group 1", glm::vec3(0.0f));
         notifyMutation(MutationType::SELECTION_CHANGED);
     }
@@ -2654,7 +2756,7 @@ namespace lfs::core {
         if (name_it == name_to_id_.end())
             return nullptr;
         SceneNode* node = getNodeById(name_it->second);
-        if (!node || !isNodeEffectivelyVisible(node->id))
+        if (!node)
             return nullptr;
         return node->model.get();
     }
@@ -2663,9 +2765,17 @@ namespace lfs::core {
         if (training_model_node_.empty())
             return nullptr;
         const auto* node = getNode(training_model_node_);
-        if (!node || !isNodeEffectivelyVisible(node->id))
+        if (!node)
             return nullptr;
         return node->model.get();
+    }
+
+    bool Scene::isTrainingModelEffectivelyVisible() const {
+        if (training_model_node_.empty())
+            return false;
+
+        const auto* node = getNode(training_model_node_);
+        return node && node->model && isNodeEffectivelyVisible(node->id);
     }
 
     size_t Scene::getTrainingModelGaussianCount() const {
@@ -2673,7 +2783,7 @@ namespace lfs::core {
             return 0;
 
         const auto* node = getNode(training_model_node_);
-        if (!node || !node->model || !isNodeEffectivelyVisible(node->id))
+        if (!node || !node->model)
             return 0;
 
         // UI/status polling must not touch the live training SplatData while the

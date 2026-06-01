@@ -4,12 +4,14 @@
 
 #include "vksplat_viewport_renderer.hpp"
 
+#include "core/cuda/memory_arena.hpp"
 #include "core/cuda/sh_layout.cuh"
 #include "core/executable_path.hpp"
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
 #include "core/tensor.hpp"
 #include "core/tensor/internal/cuda_stream_context.hpp"
+#include "diagnostics/vram_profiler.hpp"
 #include "rendering/coordinate_conventions.hpp"
 #include "viewport/vksplat_compose.comp.spv.h"
 #include "vksplat_input_packer.hpp"
@@ -27,8 +29,10 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -64,6 +68,51 @@ namespace lfs::vis {
         private:
             Fn fn_;
             bool active_ = true;
+        };
+
+        class RasterizerArenaRenderGuard final {
+        public:
+            RasterizerArenaRenderGuard() {
+                arena_ = &lfs::core::GlobalArenaManager::instance().get_arena();
+                arena_->set_rendering_active(true);
+                render_pending_ = true;
+                try {
+                    auto frame_id = arena_->try_begin_frame(true);
+                    if (!frame_id) {
+                        throw std::runtime_error("rasterizer arena is busy");
+                    }
+                    frame_id_ = *frame_id;
+                    frame_active_ = true;
+                    arena_->set_rendering_active(false);
+                    render_pending_ = false;
+                } catch (...) {
+                    if (render_pending_) {
+                        arena_->set_rendering_active(false);
+                    }
+                    arena_ = nullptr;
+                    throw;
+                }
+            }
+
+            RasterizerArenaRenderGuard(const RasterizerArenaRenderGuard&) = delete;
+            RasterizerArenaRenderGuard& operator=(const RasterizerArenaRenderGuard&) = delete;
+            RasterizerArenaRenderGuard(RasterizerArenaRenderGuard&&) = delete;
+            RasterizerArenaRenderGuard& operator=(RasterizerArenaRenderGuard&&) = delete;
+
+            ~RasterizerArenaRenderGuard() {
+                if (!arena_) {
+                    return;
+                }
+                if (frame_active_) {
+                    arena_->end_frame(frame_id_, true);
+                }
+            }
+
+        private:
+            lfs::core::RasterizerMemoryArena* arena_ = nullptr;
+            std::uint64_t frame_id_ = 0;
+            bool frame_active_ = false;
+            bool render_pending_ = false;
         };
 
         [[nodiscard]] std::string vkError(const char* const operation, const VkResult result) {
@@ -106,12 +155,54 @@ namespace lfs::vis {
                                            : kVkSplatCameraModelPinhole;
         }
 
+        [[nodiscard]] const char* outputSlotDiagnosticName(const VksplatViewportRenderer::OutputSlot slot) {
+            switch (slot) {
+            case VksplatViewportRenderer::OutputSlot::Main:
+                return "main";
+            case VksplatViewportRenderer::OutputSlot::SplitLeft:
+                return "split_left";
+            case VksplatViewportRenderer::OutputSlot::SplitRight:
+                return "split_right";
+            case VksplatViewportRenderer::OutputSlot::Preview:
+                return "preview";
+            }
+            return "unknown";
+        }
+
         [[nodiscard]] std::uint32_t packedVksplatCameraModel(
             const lfs::rendering::FrameView& frame_view,
             const bool equirectangular,
             const bool gut) {
             return vksplatBaseCameraModel(frame_view, equirectangular) |
                    (gut ? (kVkSplatProjectionModeGut << kVkSplatProjectionModeShift) : 0u);
+        }
+
+        [[nodiscard]] std::uint32_t shLayoutSlotsForDegree(const int layout_sh_degree) {
+            if (layout_sh_degree <= 0) {
+                return 0;
+            }
+            return lfs::core::sh_float4_slots_for_rest(
+                lfs::core::sh_rest_coefficients_for_degree(layout_sh_degree));
+        }
+
+        [[nodiscard]] std::uint32_t renderShNLayoutSlots(
+            const int active_sh_degree,
+            const int input_layout_sh_degree) {
+            if (active_sh_degree <= 0) {
+                return 0;
+            }
+            return shLayoutSlotsForDegree(input_layout_sh_degree);
+        }
+
+        [[nodiscard]] int effectiveRenderShDegree(
+            const lfs::core::SplatData& splat_data,
+            const int requested_sh_degree) {
+            const int max_model_degree = std::min(3, splat_data.get_max_sh_degree());
+            const int active_model_degree = std::clamp(
+                splat_data.get_active_sh_degree(),
+                0,
+                max_model_degree);
+            return std::clamp(requested_sh_degree, 0, active_model_degree);
         }
 
         [[nodiscard]] std::filesystem::path resolveVkSplatSpirvRoot() {
@@ -155,6 +246,9 @@ namespace lfs::vis {
                 {"compute_tile_ranges", (root / "generated/compute_tile_ranges.spv").string()},
                 {"rasterize_forward", (root / "generated/rasterize_forward.spv").string()},
                 {"rasterize_forward_3dgut", (root / "generated/rasterize_forward_3dgut.spv").string()},
+                {"rasterize_forward_plain", (root / "generated/rasterize_forward_plain.spv").string()},
+                {"rasterize_forward_3dgut_plain",
+                 (root / "generated/rasterize_forward_3dgut_plain.spv").string()},
                 {"cumsum_single_pass", (root / "generated/cumsum_single_pass.spv").string()},
                 {"cumsum_block_scan", (root / "generated/cumsum_block_scan.spv").string()},
                 {"cumsum_scan_block_sums", (root / "generated/cumsum_scan_block_sums.spv").string()},
@@ -162,8 +256,15 @@ namespace lfs::vis {
                 {"radix_sort/upsweep", (root / "radix_sort/upsweep.spv").string()},
                 {"radix_sort/spine", (root / "radix_sort/spine.spv").string()},
                 {"radix_sort/downsweep", (root / "radix_sort/downsweep.spv").string()},
+                {"radix_sort/upsweep_indirect", (root / "radix_sort/upsweep_indirect.spv").string()},
+                {"radix_sort/spine_indirect", (root / "radix_sort/spine_indirect.spv").string()},
+                {"radix_sort/downsweep_indirect", (root / "radix_sort/downsweep_indirect.spv").string()},
                 {"seed_primitive_indices", (root / "generated/seed_primitive_indices.spv").string()},
                 {"apply_depth_ordering", (root / "generated/apply_depth_ordering.spv").string()},
+                {"visible_flags", (root / "generated/visible_flags.spv").string()},
+                {"prepare_visible_sort", (root / "generated/prepare_visible_sort.spv").string()},
+                {"prepare_tile_sort", (root / "generated/prepare_tile_sort.spv").string()},
+                {"compact_visible_primitives", (root / "generated/compact_visible_primitives.spv").string()},
             };
         }
 
@@ -194,14 +295,47 @@ namespace lfs::vis {
             return hasDeviceBuffer(buffer.deviceBuffer);
         }
 
+        template <typename T>
+        void releaseHostStorage(Buffer<T>& buffer) {
+            auto& host = static_cast<std::vector<T>&>(buffer);
+            if (!host.empty() || host.capacity() != 0) {
+                std::vector<T>{}.swap(host);
+            }
+        }
+
+        void releaseInputHostStorage(VulkanGSPipelineBuffers& buffers) {
+            releaseHostStorage(buffers.xyz_ws);
+            releaseHostStorage(buffers.sh0);
+            releaseHostStorage(buffers.shN);
+            releaseHostStorage(buffers.rotations);
+            releaseHostStorage(buffers.scaling_raw);
+            releaseHostStorage(buffers.opacity_raw);
+            releaseHostStorage(buffers.scales_opacs);
+            releaseHostStorage(buffers.sh_coeffs);
+        }
+
+        [[nodiscard]] double gib(const std::size_t bytes) {
+            return static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
+        }
+
+        template <typename T>
+        [[nodiscard]] std::size_t viewBytes(const Buffer<T>& buffer) {
+            return buffer.deviceBuffer.size;
+        }
+
         struct ScopedStagingBuffer {
             VmaAllocator allocator = VK_NULL_HANDLE;
             VkBuffer buffer = VK_NULL_HANDLE;
             VmaAllocation allocation = VK_NULL_HANDLE;
             VmaAllocationInfo allocation_info{};
+            std::string vram_scope;
+            std::string vram_label;
 
             ~ScopedStagingBuffer() {
                 if (allocator != VK_NULL_HANDLE && buffer != VK_NULL_HANDLE) {
+                    if (!vram_scope.empty() && !vram_label.empty()) {
+                        lfs::diagnostics::VramProfiler::instance().recordCurrentBytes(vram_scope, vram_label, 0);
+                    }
                     vmaDestroyBuffer(allocator, buffer, allocation);
                 }
             }
@@ -239,6 +373,23 @@ namespace lfs::vis {
                 cursor += alignUp(region_bytes[i], alignment);
             }
             return cursor;
+        }
+
+        [[nodiscard]] std::size_t growRegionCapacity(const std::size_t current,
+                                                     const std::size_t required,
+                                                     const std::size_t minimum) {
+            if (current >= required) {
+                return current;
+            }
+            const std::size_t target = std::max({required, minimum, std::size_t{4}});
+            const std::size_t slack =
+                target >= (1u << 20)
+                    ? std::max(target / 4, static_cast<std::size_t>(8u << 20))
+                    : std::max(target / 2, static_cast<std::size_t>(16u << 10));
+            if (target > std::numeric_limits<std::size_t>::max() - slack) {
+                return alignUp(target, 4);
+            }
+            return alignUp(target + slack, 4);
         }
 
         [[nodiscard]] _VulkanBuffer makeRegionView(const VulkanContext::ExternalBuffer& buffer,
@@ -283,14 +434,18 @@ namespace lfs::vis {
             VulkanContext::ExternalBuffer& buffer,
             lfs::rendering::CudaVulkanBufferInterop& interop,
             const std::size_t required_bytes,
-            const char* const debug_name,
-            const std::string_view label) {
+            const std::string_view diagnostic_scope,
+            const std::string_view diagnostic_label,
+            const std::string_view error_label) {
             if (required_bytes == 0) {
                 return std::unexpected(std::format("VkSplat {} slot '{}' requested zero-byte allocation",
-                                                   label,
-                                                   debug_name));
+                                                   error_label,
+                                                   diagnostic_label));
             }
-            if (buffer.buffer != VK_NULL_HANDLE && buffer.allocation_size >= required_bytes) {
+            const bool label_matches =
+                buffer.diagnostic_scope == diagnostic_scope &&
+                buffer.diagnostic_label.starts_with(std::string(diagnostic_label));
+            if (buffer.buffer != VK_NULL_HANDLE && buffer.size >= required_bytes && label_matches) {
                 return {};
             }
 
@@ -300,18 +455,22 @@ namespace lfs::vis {
             const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                              VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                                              VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-            if (!context.createExternalBuffer(static_cast<VkDeviceSize>(required_bytes), usage, buffer)) {
+            if (!context.createExternalBuffer(static_cast<VkDeviceSize>(required_bytes),
+                                              usage,
+                                              buffer,
+                                              diagnostic_scope,
+                                              diagnostic_label)) {
                 return std::unexpected(std::format("VkSplat external {} buffer '{}' allocation failed: {}",
-                                                   label,
-                                                   debug_name,
+                                                   error_label,
+                                                   diagnostic_label,
                                                    context.lastError()));
             }
             const auto native = context.releaseExternalBufferNativeHandle(buffer);
             if (!VulkanContext::externalNativeHandleValid(native)) {
                 context.destroyExternalBuffer(buffer);
                 return std::unexpected(std::format("VkSplat external {} buffer '{}' returned invalid native handle",
-                                                   label,
-                                                   debug_name));
+                                                   error_label,
+                                                   diagnostic_label));
             }
             lfs::rendering::CudaVulkanExternalBufferImport import{
                 .memory_handle = native,
@@ -323,12 +482,15 @@ namespace lfs::vis {
                 const std::string err = interop.lastError();
                 context.destroyExternalBuffer(buffer);
                 return std::unexpected(std::format("VkSplat external {} buffer '{}' CUDA import failed: {}",
-                                                   label,
-                                                   debug_name,
+                                                   error_label,
+                                                   diagnostic_label,
                                                    err));
             }
             return {};
         }
+
+        constexpr std::size_t kSharedScratchPageBytes = std::size_t{2} << 20;
+        constexpr std::size_t kSharedScratchMinBytes = std::size_t{384} << 20;
 
         enum InputRegion : std::size_t {
             InputXyzWs = 0,
@@ -400,27 +562,15 @@ namespace lfs::vis {
             return tensor;
         }
 
-        [[nodiscard]] std::expected<Tensor, std::string> makeSelectionColorTableTensor(
-            const lfs::rendering::GaussianOverlayState& overlay) {
-            try {
-                Tensor cpu = Tensor::empty(
-                    {lfs::rendering::kSelectionColorTableCount, std::size_t{4}},
-                    Device::CPU,
-                    DataType::Float32);
-                float* const dst = cpu.ptr<float>();
-                if (!dst) {
-                    return std::unexpected("VkSplat selection color table allocation returned a null pointer");
-                }
-                for (std::size_t i = 0; i < lfs::rendering::kSelectionColorTableCount; ++i) {
-                    const glm::vec4 color = overlay.selection_colors[i];
-                    dst[i * 4 + 0] = color.r;
-                    dst[i * 4 + 1] = color.g;
-                    dst[i * 4 + 2] = color.b;
-                    dst[i * 4 + 3] = color.a;
-                }
-                return cpu.to(Device::CUDA).contiguous();
-            } catch (const std::exception& e) {
-                return std::unexpected(std::format("VkSplat failed to stage selection color table: {}", e.what()));
+        void stageSelectionColorTableCpu(std::vector<float>& dst,
+                                         const lfs::rendering::GaussianOverlayState& overlay) {
+            dst.resize(lfs::rendering::kSelectionColorTableCount * 4u);
+            for (std::size_t i = 0; i < lfs::rendering::kSelectionColorTableCount; ++i) {
+                const glm::vec4 color = overlay.selection_colors[i];
+                dst[i * 4u + 0u] = color.r;
+                dst[i * 4u + 1u] = color.g;
+                dst[i * 4u + 2u] = color.b;
+                dst[i * 4u + 3u] = color.a;
             }
         }
 
@@ -441,7 +591,8 @@ namespace lfs::vis {
             MarkerFlags = 22,
             SelectionCursor = 23,
             SelectionFlags = 24,
-            ParamCount = 25,
+            VisibilityFlags = 25,
+            ParamCount = 26,
         };
 
         [[nodiscard]] bool hasTransformIndices(const std::shared_ptr<Tensor>& tensor,
@@ -472,67 +623,114 @@ namespace lfs::vis {
             }
         }
 
-        [[nodiscard]] std::expected<Tensor, std::string> makeNodeMaskTensor(const std::vector<bool>& mask) {
-            try {
-                const std::size_t count = std::max<std::size_t>(mask.size(), 1);
-                Tensor cpu = Tensor::zeros({count}, Device::CPU, DataType::UInt8);
-                auto* const dst = cpu.ptr<std::uint8_t>();
-                if (!dst) {
-                    return std::unexpected("VkSplat node mask allocation returned a null pointer");
-                }
-                for (std::size_t i = 0; i < mask.size(); ++i) {
-                    dst[i] = mask[i] ? 1u : 0u;
-                }
-                return cpu.to(Device::CUDA).contiguous();
-            } catch (const std::exception& e) {
-                return std::unexpected(std::format("VkSplat failed to stage node mask: {}", e.what()));
+        void stageNodeMaskCpu(std::vector<std::uint8_t>& dst,
+                              const std::vector<bool>& mask,
+                              const std::size_t byte_count) {
+            dst.assign(byte_count, 0u);
+            const std::size_t count = std::min(mask.size(), byte_count);
+            for (std::size_t i = 0; i < count; ++i) {
+                dst[i] = mask[i] ? 1u : 0u;
             }
         }
 
-        [[nodiscard]] std::expected<Tensor, std::string> makeSelectionPrimitiveTensor(
-            const std::vector<glm::vec4>& primitives) {
-            try {
-                const std::size_t count = std::max<std::size_t>(primitives.size(), 1u);
-                Tensor cpu = Tensor::empty({count, std::size_t{4}},
-                                           Device::CPU,
-                                           DataType::Float32);
-                float* const dst = cpu.ptr<float>();
-                if (!dst) {
-                    return std::unexpected("VkSplat selection primitive allocation returned a null pointer");
-                }
-                std::memset(dst, 0, count * 4 * sizeof(float));
-                for (std::size_t i = 0; i < primitives.size(); ++i) {
-                    dst[i * 4 + 0] = primitives[i].x;
-                    dst[i * 4 + 1] = primitives[i].y;
-                    dst[i * 4 + 2] = primitives[i].z;
-                    dst[i * 4 + 3] = primitives[i].w;
-                }
-                return cpu.to(Device::CUDA).contiguous();
-            } catch (const std::exception& e) {
-                return std::unexpected(std::format("VkSplat failed to stage selection primitives: {}", e.what()));
+        void stageSelectionPrimitivesCpu(std::vector<float>& dst,
+                                         const std::vector<glm::vec4>& primitives) {
+            const std::size_t count = std::max<std::size_t>(primitives.size(), 1u);
+            dst.resize(count * 4u);
+            std::fill(dst.begin(), dst.end(), 0.0f);
+            for (std::size_t i = 0; i < primitives.size(); ++i) {
+                dst[i * 4u + 0u] = primitives[i].x;
+                dst[i * 4u + 1u] = primitives[i].y;
+                dst[i * 4u + 2u] = primitives[i].z;
+                dst[i * 4u + 3u] = primitives[i].w;
             }
         }
 
-        [[nodiscard]] std::expected<Tensor, std::string> makeSelectionPolygonVerticesTensor(
-            const std::vector<glm::vec2>& vertices) {
-            try {
-                const std::size_t count = std::max<std::size_t>(vertices.size(), 1u);
-                Tensor cpu = Tensor::empty({count, std::size_t{2}},
-                                           Device::CPU,
-                                           DataType::Float32);
-                float* const dst = cpu.ptr<float>();
-                if (!dst) {
-                    return std::unexpected("VkSplat polygon vertex allocation returned a null pointer");
-                }
-                std::memset(dst, 0, count * 2 * sizeof(float));
-                for (std::size_t i = 0; i < vertices.size(); ++i) {
-                    dst[i * 2 + 0] = vertices[i].x;
-                    dst[i * 2 + 1] = vertices[i].y;
-                }
-                return cpu.to(Device::CUDA).contiguous();
-            } catch (const std::exception& e) {
-                return std::unexpected(std::format("VkSplat failed to stage polygon vertices: {}", e.what()));
+        void stageSelectionPolygonVerticesCpu(std::vector<float>& dst,
+                                              const std::vector<glm::vec2>& vertices) {
+            const std::size_t count = std::max<std::size_t>(vertices.size(), 1u);
+            dst.resize(count * 2u);
+            std::fill(dst.begin(), dst.end(), 0.0f);
+            for (std::size_t i = 0; i < vertices.size(); ++i) {
+                dst[i * 2u + 0u] = vertices[i].x;
+                dst[i * 2u + 1u] = vertices[i].y;
             }
+        }
+
+        [[nodiscard]] std::expected<void, std::string> copyHostBytesToInteropRegion(
+            const lfs::rendering::CudaVulkanBufferInterop& interop,
+            const void* src,
+            const std::size_t src_byte_count,
+            const std::size_t byte_count,
+            const std::size_t dst_offset,
+            const cudaStream_t stream,
+            const std::string_view label) {
+            if (byte_count == 0 || src_byte_count < byte_count || src == nullptr) {
+                return std::unexpected(std::format(
+                    "VkSplat {} upload requested {} bytes from {} bytes",
+                    label,
+                    byte_count,
+                    src_byte_count));
+            }
+            if (dst_offset > interop.size() || byte_count > interop.size() - dst_offset) {
+                return std::unexpected(std::format(
+                    "VkSplat {} upload range [{}, {}+{}) exceeds mapped query buffer {}",
+                    label,
+                    dst_offset,
+                    dst_offset,
+                    byte_count,
+                    interop.size()));
+            }
+            auto* const base = static_cast<std::uint8_t*>(interop.devicePointer());
+            if (base == nullptr) {
+                return std::unexpected(std::format(
+                    "VkSplat {} upload requires a mapped CUDA/Vulkan buffer",
+                    label));
+            }
+            const cudaError_t status = cudaMemcpyAsync(base + dst_offset,
+                                                       src,
+                                                       byte_count,
+                                                       cudaMemcpyHostToDevice,
+                                                       stream);
+            if (status != cudaSuccess) {
+                return std::unexpected(std::format("VkSplat {} H2D upload failed: {} ({})",
+                                                   label,
+                                                   cudaGetErrorName(status),
+                                                   cudaGetErrorString(status)));
+            }
+            return {};
+        }
+
+        [[nodiscard]] std::expected<void, std::string> copyHostFloatsToInteropRegion(
+            const lfs::rendering::CudaVulkanBufferInterop& interop,
+            const std::vector<float>& src,
+            const std::size_t byte_count,
+            const std::size_t dst_offset,
+            const cudaStream_t stream,
+            const std::string_view label) {
+            return copyHostBytesToInteropRegion(interop,
+                                                src.data(),
+                                                src.size() * sizeof(float),
+                                                byte_count,
+                                                dst_offset,
+                                                stream,
+                                                label);
+        }
+
+        [[nodiscard]] std::expected<void, std::string> copyHostBytesToInteropRegion(
+            const lfs::rendering::CudaVulkanBufferInterop& interop,
+            const std::vector<std::uint8_t>& src,
+            const std::size_t byte_count,
+            const std::size_t dst_offset,
+            const cudaStream_t stream,
+            const std::string_view label) {
+            return copyHostBytesToInteropRegion(interop,
+                                                src.data(),
+                                                src.size(),
+                                                byte_count,
+                                                dst_offset,
+                                                stream,
+                                                label);
         }
 
         struct PolygonAabb {
@@ -577,25 +775,18 @@ namespace lfs::vis {
             return transforms && !transforms->empty() ? transforms->size() : std::size_t{1};
         }
 
-        // CPU-only build of the model-transform staging tensor. Mirrors the
-        // overlay_params split: H2D is paid only when the bytes differ from
-        // the cached copy, which avoids the per-frame NULL-stream sync tax.
-        [[nodiscard]] std::expected<Tensor, std::string> buildModelTransformsCpuTensor(
+        // CPU-only build of the model-transform upload payload. H2D is paid
+        // only when the bytes differ from the cached copy.
+        [[nodiscard]] std::expected<std::vector<float>, std::string> buildModelTransformsCpuFloats(
             const std::vector<glm::mat4>* const transforms) {
             try {
                 const std::size_t count = modelTransformCount(transforms);
-                Tensor cpu = Tensor::empty({count * std::size_t{4}, std::size_t{4}},
-                                           Device::CPU,
-                                           DataType::Float32);
-                float* const dst = cpu.ptr<float>();
-                if (!dst) {
-                    return std::unexpected("VkSplat model-transform allocation returned a null pointer");
-                }
+                std::vector<float> cpu(count * 16u, 0.0f);
                 for (std::size_t i = 0; i < count; ++i) {
                     const glm::mat4 transform =
                         transforms && i < transforms->size() ? (*transforms)[i] : glm::mat4(1.0f);
                     const auto rows = rowMajorMat4(transform);
-                    std::memcpy(dst + i * 16, rows.data(), rows.size() * sizeof(float));
+                    std::memcpy(cpu.data() + i * 16u, rows.data(), rows.size() * sizeof(float));
                 }
                 return cpu;
             } catch (const std::exception& e) {
@@ -622,23 +813,17 @@ namespace lfs::vis {
         }
 
         // Builds the overlay parameter table on CPU only. The H2D transfer is
-        // performed at the call site, conditionally on an output-bytes diff
-        // against a cached copy, because `.to(Device::CUDA)` was costing
-        // ~6 ms/frame for this 400-byte tensor — almost entirely sync overhead.
-        [[nodiscard]] std::expected<Tensor, std::string> buildOverlayParamsCpuTensor(
+        // performed at the call site, conditionally on an output-bytes diff.
+        [[nodiscard]] std::expected<std::vector<float>, std::string> buildOverlayParamsCpuFloats(
             const lfs::rendering::ViewportRenderRequest& request,
             const bool selection_enabled,
             const bool preview_enabled,
             const bool transform_indices_enabled,
-            const std::size_t node_mask_count) {
+            const std::size_t node_mask_count,
+            const bool node_visibility_cull) {
             try {
-                Tensor cpu = Tensor::zeros({static_cast<std::size_t>(ParamCount), std::size_t{4}},
-                                           Device::CPU,
-                                           DataType::Float32);
-                float* const dst = cpu.ptr<float>();
-                if (!dst) {
-                    return std::unexpected("VkSplat overlay parameter allocation returned a null pointer");
-                }
+                std::vector<float> cpu(static_cast<std::size_t>(ParamCount) * 4u, 0.0f);
+                float* const dst = cpu.data();
 
                 if (request.filters.crop_region) {
                     const auto& crop = *request.filters.crop_region;
@@ -677,6 +862,9 @@ namespace lfs::vis {
                     writeMat4Rows(dst, ViewTransform, request.filters.view_volume->transform);
                 }
 
+                writeVec4(dst,
+                          VisibilityFlags,
+                          glm::vec4(node_visibility_cull ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f));
                 writeVec4(dst,
                           EmphasisFlags,
                           glm::vec4(request.overlay.emphasis.dim_non_emphasized ? 1.0f : 0.0f,
@@ -820,7 +1008,8 @@ namespace lfs::vis {
             const std::uint32_t shN_layout_slots,
             const std::size_t num_splats,
             const bool equirectangular,
-            const bool gut) {
+            const bool gut,
+            const bool mip_filter) {
             (void)scene;
             uniforms = {};
             uniforms.image_width = static_cast<std::uint32_t>(frame_view.size.x);
@@ -831,6 +1020,7 @@ namespace lfs::vis {
             uniforms.active_sh = static_cast<std::uint32_t>(active_sh_degree);
             uniforms.shN_layout_slots = shN_layout_slots;
             uniforms.camera_model = packedVksplatCameraModel(frame_view, equirectangular, gut);
+            uniforms.mip_filter = mip_filter ? 1u : 0u;
 
             if (frame_view.orthographic) {
                 const float ortho_scale =
@@ -926,9 +1116,22 @@ namespace lfs::vis {
     }
 
     void VksplatViewportRenderer::reset() {
+        std::lock_guard<std::mutex> readback_lock(readback_mutex_);
         if (context_ && context_->device() != VK_NULL_HANDLE) {
-            vkDeviceWaitIdle(context_->device());
+            const VkDevice device = context_->device();
+            vkDeviceWaitIdle(device);
+            if (readback_fence_ != VK_NULL_HANDLE) {
+                vkDestroyFence(device, readback_fence_, nullptr);
+                readback_fence_ = VK_NULL_HANDLE;
+            }
+            if (readback_pool_ != VK_NULL_HANDLE) {
+                vkDestroyCommandPool(device, readback_pool_, nullptr);
+                readback_pool_ = VK_NULL_HANDLE;
+                readback_cmd_ = VK_NULL_HANDLE;
+            }
         }
+        releaseSharedScratchArena();
+        drainRetiredScratchBuffers(true);
         // Detach our managed VkBuffers from buffers_ before the renderer's
         // cleanupBuffers runs so it does not vkDestroyBuffer them out from
         // under us.
@@ -938,6 +1141,13 @@ namespace lfs::vis {
             renderer_.cleanup();
         }
         for (auto& slot : cuda_inputs_) {
+            slot.interop.reset();
+            if (context_) {
+                context_->destroyExternalBuffer(slot.buffer);
+            }
+            slot = {};
+        }
+        for (auto& slot : cuda_opacity_copies_) {
             slot.interop.reset();
             if (context_) {
                 context_->destroyExternalBuffer(slot.buffer);
@@ -975,22 +1185,40 @@ namespace lfs::vis {
             timeline.vk_semaphore = {};
             timeline.value = 0;
         }
+        selection_query_timeline_.cuda_semaphore.reset();
         if (context_) {
-            for (auto& slot : output_slots_) {
-                if (slot.image.image != VK_NULL_HANDLE) {
-                    context_->imageBarriers().forgetImage(slot.image.image);
+            context_->destroyExternalSemaphore(selection_query_timeline_.vk_semaphore);
+        }
+        selection_query_timeline_.vk_semaphore = {};
+        selection_query_timeline_.value = 0;
+        if (context_) {
+            for (auto& logical_slot : output_slots_) {
+                for (auto& slot : logical_slot) {
+                    if (slot.image.image != VK_NULL_HANDLE) {
+                        context_->imageBarriers().forgetImage(slot.image.image);
+                    }
+                    if (slot.depth_image.image != VK_NULL_HANDLE) {
+                        context_->imageBarriers().forgetImage(slot.depth_image.image);
+                    }
+                    context_->destroyExternalImage(slot.image);
+                    context_->destroyExternalImage(slot.depth_image);
+                    slot = {};
                 }
-                if (slot.depth_image.image != VK_NULL_HANDLE) {
-                    context_->imageBarriers().forgetImage(slot.depth_image.image);
-                }
-                context_->destroyExternalImage(slot.image);
-                context_->destroyExternalImage(slot.depth_image);
-                slot = {};
             }
             if (compose_) {
                 compose_->destroy(context_->device());
             }
+            if (render_complete_timeline_ != VK_NULL_HANDLE) {
+                vkDestroySemaphore(context_->device(), render_complete_timeline_, nullptr);
+            }
         }
+        render_complete_timeline_ = VK_NULL_HANDLE;
+        render_complete_value_ = 0;
+        latest_output_ring_slot_ = {};
+        output_generations_ = {};
+        ring_completion_values_ = {};
+        next_ring_slot_ = 0;
+        current_input_sh_degree_ = -1;
         compose_.reset();
         buffers_ = {};
         if (overlay_upload_stream_ != nullptr) {
@@ -1040,10 +1268,7 @@ namespace lfs::vis {
         buffers_.scales_opacs.deviceBuffer = {};
         buffers_.sh_coeffs.deviceBuffer = {};
 
-        // Only the deviceBuffer side of Buffer<float> is consumed downstream;
-        // resizing the std::vector base would zero-init multi-GB of host memory.
-        buffers_.scales_opacs.clear();
-        buffers_.sh_coeffs.clear();
+        releaseInputHostStorage(buffers_);
 
         buffers_.num_splats = num_splats;
         if (reset_cached_raster_state) {
@@ -1120,17 +1345,548 @@ namespace lfs::vis {
         ring_uploaded_[ring_slot] = {};
     }
 
+    void VksplatViewportRenderer::releaseOpacityCopySlot(VulkanContext& context, const std::size_t ring_slot) {
+        assert(ring_slot < cuda_opacity_copies_.size());
+        auto& slot = cuda_opacity_copies_[ring_slot];
+        const VkBuffer released_buffer = slot.buffer.buffer;
+
+        if (released_buffer != VK_NULL_HANDLE &&
+            buffers_.opacity_raw.deviceBuffer.buffer == released_buffer &&
+            buffers_.opacity_raw.deviceBuffer.allocation == VK_NULL_HANDLE) {
+            buffers_.opacity_raw.deviceBuffer = {};
+        }
+
+        slot.interop.reset();
+        context.destroyExternalBuffer(slot.buffer);
+        slot = {};
+    }
+
+    std::size_t VksplatViewportRenderer::estimateSharedScratchBytes(
+        const std::size_t num_splats,
+        const std::size_t sort_capacity,
+        const std::size_t num_pixels,
+        const std::size_t num_tiles) const {
+        std::size_t cursor = 0;
+        const auto add = [&](const std::size_t bytes) {
+            cursor = alignUp(cursor, kRegionAlignment);
+            cursor += alignUp(std::max<std::size_t>(bytes, 4), kRegionAlignment);
+        };
+        const auto add_count = [&](const std::size_t count, const std::size_t elem_size) {
+            add(count * elem_size);
+        };
+
+        add_count(num_splats, sizeof(std::uint32_t));                                                            // primitive_depth_keys
+        add_count(num_splats, sizeof(std::int32_t));                                                             // tiles_touched
+        add_count(num_splats, sizeof(std::int64_t));                                                             // rect_tile_space
+        add_count(num_splats, sizeof(std::int32_t));                                                             // radii
+        add_count(2 * num_splats, sizeof(float));                                                                // xy_vs
+        add_count(num_splats, sizeof(float));                                                                    // depths
+        add_count(4 * num_splats, sizeof(float));                                                                // inv_cov_vs_opacity
+        add_count(3 * num_splats, sizeof(float));                                                                // rgb
+        add_count(num_splats, sizeof(std::int32_t));                                                             // overlay_flags
+        add_count(num_splats, sizeof(std::int32_t));                                                             // primitive_sort_indices
+        add_count(num_splats, sizeof(std::int32_t));                                                             // tiles_touched_depth_ordered
+        add_count(num_splats, sizeof(std::int32_t));                                                             // visible_flags
+        add_count(num_splats, sizeof(std::int32_t));                                                             // visible_prefix
+        add_count(1, sizeof(std::uint32_t));                                                                     // visible_count
+        add_count(3, sizeof(std::uint32_t));                                                                     // visible_sort_dispatch_args
+        add_count(num_splats, sizeof(std::int32_t));                                                             // index_buffer_offset
+        add_count(sort_capacity, sizeof(sortingKey_t));                                                          // sorting_keys_1
+        add_count(sort_capacity, sizeof(sortingKey_t));                                                          // sorting_keys_2
+        add_count(sort_capacity, sizeof(std::int32_t));                                                          // sorting_gauss_idx_1
+        add_count(sort_capacity, sizeof(std::int32_t));                                                          // sorting_gauss_idx_2
+        add_count(1, sizeof(std::uint32_t));                                                                     // tile_sort_count
+        add_count(3, sizeof(std::uint32_t));                                                                     // tile_sort_dispatch_args
+        add_count(num_tiles + 1, sizeof(std::int32_t));                                                          // tile_ranges
+        add_count(4 * num_pixels, sizeof(float));                                                                // pixel_state
+        add_count(num_pixels, sizeof(float));                                                                    // pixel_depth
+        add_count(num_pixels, sizeof(std::int32_t));                                                             // n_contributors
+        add_count(_CEIL_DIV(num_splats, std::size_t{1024}), sizeof(std::int32_t));                               // _cumsum_blockSums
+        add_count(_CEIL_DIV(_CEIL_DIV(num_splats, std::size_t{1024}), std::size_t{1024}), sizeof(std::int32_t)); // _cumsum_blockSums2
+        add_count(8 * 256, sizeof(std::int32_t));                                                                // _sorting_histogram
+        add_count(_CEIL_DIV(sort_capacity, std::size_t{512 * 8}) * 256, sizeof(std::int32_t));                   // _sorting_histogram_cumsum
+        return alignUp(cursor, kRegionAlignment);
+    }
+
+    std::expected<void, std::string> VksplatViewportRenderer::ensureSharedScratchArena(
+        VulkanContext& context,
+        const std::size_t required_bytes) {
+        if (required_bytes == 0) {
+            return std::unexpected("VkSplat shared scratch requested zero bytes");
+        }
+        if (!context.externalMemoryInteropEnabled()) {
+            return std::unexpected("VkSplat shared scratch requires CUDA/Vulkan external-memory interop");
+        }
+
+        const std::size_t target_bytes = alignUp(
+            std::max(required_bytes + required_bytes / 8, kSharedScratchMinBytes),
+            kSharedScratchPageBytes);
+        int device = 0;
+        if (const cudaError_t err = cudaGetDevice(&device); err != cudaSuccess) {
+            return std::unexpected(std::format("VkSplat shared scratch cudaGetDevice failed: {} ({})",
+                                               cudaGetErrorName(err),
+                                               cudaGetErrorString(err)));
+        }
+
+        constexpr VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                             VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                             VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                             VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+
+        // The per-region rows are published by bindSharedScratchBuffers (the single
+        // source of truth for the breakdown); here we only refresh the capacity gauge.
+        const auto publish_capacity = [this]() {
+            lfs::diagnostics::VramProfiler::instance().setGauge(
+                "vram.audit.shared_scratch.capacity", static_cast<double>(shared_scratch_.bytes));
+        };
+
+        // Grow callback handed to the arena: when training's scratch demand
+        // outgrows the committed capacity, the arena invokes this (on the training
+        // thread) to grow the exportable block in place under its stable base
+        // address — contents preserved — and returns the new committed size. The
+        // render re-imports the larger range into Vulkan on its next frame.
+        const auto make_grow_fn = [](std::shared_ptr<lfs::core::ExportableBlock> block) {
+            return [block = std::move(block)](std::size_t need) -> std::size_t {
+                const std::size_t want =
+                    need > (std::numeric_limits<std::size_t>::max() / 2) ? need : need + need / 2;
+                auto grew = lfs::core::growExportableDeviceBlock(block, want);
+                if (!grew) {
+                    return std::size_t{0};
+                }
+                return block->size;
+            };
+        };
+
+        const auto try_install_existing = [&]() -> bool {
+            if (!shared_scratch_.block) {
+                return false;
+            }
+            lfs::core::RasterizerMemoryArena::ExternalBacking backing{
+                .device_ptr = shared_scratch_.block->device_ptr,
+                .size = shared_scratch_.block->size,
+                .device = device,
+                .owner = std::shared_ptr<void>(shared_scratch_.block),
+                .label = "vksplat.shared_scratch",
+                .grow = make_grow_fn(shared_scratch_.block),
+            };
+            return lfs::core::GlobalArenaManager::instance().try_install_external_backing(std::move(backing));
+        };
+
+        // NOTE: if the training thread grew the block in place (new export handle),
+        // the Vulkan re-import is NOT done here — doing it on the render thread
+        // without holding the arena frame would race training's grow. It is done
+        // in reimportSharedScratchIfGrown() once the render owns the arena frame
+        // (which excludes training), so the block is stable when we read it.
+
+        // Fast path: an installed block already large enough for this frame.
+        if (shared_scratch_.block && shared_scratch_.bytes >= required_bytes &&
+            shared_scratch_.imported_buffer.buffer != VK_NULL_HANDLE) {
+            if (shared_scratch_.installed_in_training_arena || try_install_existing()) {
+                shared_scratch_.installed_in_training_arena = true;
+                publish_capacity();
+                return {};
+            }
+            return std::unexpected("VkSplat shared scratch training rasterizer arena is busy");
+        }
+
+        // Grow path: a block exists but is too small. Grow the committed physical
+        // IN PLACE under the stable virtual address so training's arena base
+        // pointer never changes (no use-after-free), then re-import the larger
+        // range into Vulkan. The arena drains all frames + the device before the
+        // commit callback runs, so the unmap/recommit is race-free.
+        if (shared_scratch_.block && shared_scratch_.installed_in_training_arena &&
+            shared_scratch_.imported_buffer.buffer != VK_NULL_HANDLE) {
+            void* const device_ptr = shared_scratch_.block->device_ptr;
+            std::string commit_error;
+            const auto commit = [&](std::size_t new_size) -> bool {
+                auto grew = lfs::core::growExportableDeviceBlock(shared_scratch_.block, new_size);
+                if (!grew) {
+                    commit_error = grew.error();
+                    return false;
+                }
+                if (*grew) {
+                    VulkanContext::ExternalBuffer reimported{};
+                    if (!context.importExternalBuffer(shared_scratch_.block->handle.native,
+                                                      static_cast<VkDeviceSize>(shared_scratch_.block->size),
+                                                      usage,
+                                                      reimported,
+                                                      "shared.scratch",
+                                                      "cuda_vulkan_arena")) {
+                        commit_error = context.lastError();
+                        return false;
+                    }
+                    detachSharedScratchBuffers();
+                    retireSharedScratchBuffer(std::move(shared_scratch_.imported_buffer));
+                    shared_scratch_.imported_buffer = reimported;
+                    shared_scratch_.bytes = shared_scratch_.block->size;
+                    ++shared_scratch_.generation;
+                }
+                return true;
+            };
+            if (!lfs::core::GlobalArenaManager::instance().grow_external_backing(device_ptr, target_bytes, commit)) {
+                return std::unexpected(commit_error.empty()
+                                           ? std::string("VkSplat shared scratch training rasterizer arena is busy")
+                                           : std::format("VkSplat shared scratch grow failed: {}", commit_error));
+            }
+            shared_scratch_.installed_in_training_arena = true;
+            publish_capacity();
+            LOG_INFO("VkSplat shared scratch arena grew to {} MiB (stable address)",
+                     shared_scratch_.bytes >> 20);
+            return {};
+        }
+
+        // First allocation: reserve a large virtual range (free) so the block can
+        // grow in place up to whatever the densifying model needs, but commit only
+        // the current target. The reservation is bounded by total device memory.
+        std::size_t reserve_bytes = target_bytes;
+        {
+            std::size_t free_mem = 0, total_mem = 0;
+            if (cudaMemGetInfo(&free_mem, &total_mem) == cudaSuccess && total_mem > reserve_bytes) {
+                reserve_bytes = total_mem;
+            }
+        }
+
+        auto block_result = lfs::core::allocateExportableDeviceBlock(target_bytes, device, false, reserve_bytes);
+        if (!block_result) {
+            return std::unexpected(std::format("VkSplat shared scratch CUDA allocation failed: {}",
+                                               block_result.error()));
+        }
+
+        VulkanContext::ExternalBuffer imported{};
+        if (!context.importExternalBuffer((*block_result)->handle.native,
+                                          static_cast<VkDeviceSize>((*block_result)->size),
+                                          usage,
+                                          imported,
+                                          "shared.scratch",
+                                          "cuda_vulkan_arena")) {
+            return std::unexpected(std::format("VkSplat shared scratch Vulkan import failed: {}",
+                                               context.lastError()));
+        }
+
+        lfs::core::RasterizerMemoryArena::ExternalBacking backing{
+            .device_ptr = (*block_result)->device_ptr,
+            .size = (*block_result)->size,
+            .device = device,
+            .owner = std::shared_ptr<void>(*block_result),
+            .label = "vksplat.shared_scratch",
+            .grow = make_grow_fn(*block_result),
+        };
+        if (!lfs::core::GlobalArenaManager::instance().try_install_external_backing(std::move(backing))) {
+            context.destroyExternalBuffer(imported);
+            return std::unexpected("VkSplat shared scratch training rasterizer arena is busy");
+        }
+
+        releaseSharedScratchImportOnly();
+        shared_scratch_.block = std::move(*block_result);
+        shared_scratch_.imported_buffer = imported;
+        shared_scratch_.bytes = shared_scratch_.block->size;
+        shared_scratch_.installed_in_training_arena = true;
+        ++shared_scratch_.generation;
+
+        publish_capacity();
+
+        LOG_INFO("VkSplat shared scratch arena: {} MiB committed, {} MiB reserved (grows in place)",
+                 shared_scratch_.bytes >> 20,
+                 reserve_bytes >> 20);
+        return {};
+    }
+
+    std::expected<void, std::string>
+    VksplatViewportRenderer::reimportSharedScratchIfGrown(VulkanContext& context) {
+        if (!shared_scratch_.block || shared_scratch_.imported_buffer.buffer == VK_NULL_HANDLE) {
+            return {};
+        }
+        if (shared_scratch_.bytes == shared_scratch_.block->size) {
+            return {}; // not grown since last import
+        }
+        // Precondition: caller owns the arena render-frame, so training cannot grow
+        // the block concurrently — block->size and block->handle are stable here.
+        constexpr VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                             VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                             VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                             VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+        VulkanContext::ExternalBuffer reimported{};
+        if (!context.importExternalBuffer(shared_scratch_.block->handle.native,
+                                          static_cast<VkDeviceSize>(shared_scratch_.block->size),
+                                          usage,
+                                          reimported,
+                                          "shared.scratch",
+                                          "cuda_vulkan_arena")) {
+            return std::unexpected(std::format("VkSplat shared scratch re-import after grow failed: {}",
+                                               context.lastError()));
+        }
+        detachSharedScratchBuffers();
+        retireSharedScratchBuffer(std::move(shared_scratch_.imported_buffer));
+        shared_scratch_.imported_buffer = reimported;
+        shared_scratch_.bytes = shared_scratch_.block->size;
+        ++shared_scratch_.generation;
+        lfs::diagnostics::VramProfiler::instance().setGauge(
+            "vram.audit.shared_scratch.capacity", static_cast<double>(shared_scratch_.bytes));
+        LOG_INFO("VkSplat shared scratch re-imported after in-place grow: {} MiB", shared_scratch_.bytes >> 20);
+        return {};
+    }
+
+    void VksplatViewportRenderer::bindSharedScratchBuffers(
+        const std::size_t num_splats,
+        const std::size_t sort_capacity,
+        const std::size_t num_pixels,
+        const std::size_t num_tiles) {
+        if (shared_scratch_.imported_buffer.buffer == VK_NULL_HANDLE) {
+            return;
+        }
+
+        std::size_t cursor = 0;
+        const auto bind_bytes = [&](auto& typed_buffer, const std::size_t bytes) {
+            auto& dev = typed_buffer.deviceBuffer;
+            const char* const label = dev.label;
+            renderer_.destroyBuffer(dev);
+            cursor = alignUp(cursor, kRegionAlignment);
+            const std::size_t capacity = alignUp(std::max<std::size_t>(bytes, 4), kRegionAlignment);
+            dev = makeResizableRegionView(shared_scratch_.imported_buffer, cursor, capacity);
+            dev.label = label;
+            cursor += capacity;
+        };
+        const auto bind_count = [&](auto& typed_buffer, const std::size_t count) {
+            using Value = typename std::remove_reference_t<decltype(typed_buffer)>::value_type;
+            bind_bytes(typed_buffer, count * sizeof(Value));
+        };
+
+        bind_count(buffers_.primitive_depth_keys, num_splats);
+        bind_count(buffers_.tiles_touched, num_splats);
+        bind_count(buffers_.rect_tile_space, num_splats);
+        bind_count(buffers_.radii, num_splats);
+        bind_count(buffers_.xy_vs, 2 * num_splats);
+        bind_count(buffers_.depths, num_splats);
+        bind_count(buffers_.inv_cov_vs_opacity, 4 * num_splats);
+        bind_count(buffers_.rgb, 3 * num_splats);
+        bind_count(buffers_.overlay_flags, num_splats);
+        bind_count(buffers_.primitive_sort_indices, num_splats);
+        bind_count(buffers_.tiles_touched_depth_ordered, num_splats);
+        bind_count(buffers_.visible_flags, num_splats);
+        bind_count(buffers_.visible_prefix, num_splats);
+        bind_count(buffers_.visible_count, 1);
+        bind_count(buffers_.visible_sort_dispatch_args, 3);
+        bind_count(buffers_.index_buffer_offset, num_splats);
+        const std::size_t per_splat_end = cursor;
+        bind_count(buffers_.sorting_keys_1, sort_capacity);
+        bind_count(buffers_.sorting_keys_2, sort_capacity);
+        bind_count(buffers_.sorting_gauss_idx_1, sort_capacity);
+        bind_count(buffers_.sorting_gauss_idx_2, sort_capacity);
+        const std::size_t sort_end = cursor;
+        bind_count(buffers_.tile_sort_count, 1);
+        bind_count(buffers_.tile_sort_dispatch_args, 3);
+        bind_count(buffers_.tile_ranges, num_tiles + 1);
+        const std::size_t tiles_end = cursor;
+        bind_count(buffers_.pixel_state, 4 * num_pixels);
+        bind_count(buffers_.pixel_depth, num_pixels);
+        bind_count(buffers_.n_contributors, num_pixels);
+        const std::size_t pixel_end = cursor;
+        bind_count(buffers_._cumsum_blockSums, _CEIL_DIV(num_splats, std::size_t{1024}));
+        bind_count(buffers_._cumsum_blockSums2, _CEIL_DIV(_CEIL_DIV(num_splats, std::size_t{1024}), std::size_t{1024}));
+        bind_count(buffers_._sorting_histogram, 8 * 256);
+        bind_count(buffers_._sorting_histogram_cumsum,
+                   _CEIL_DIV(sort_capacity, std::size_t{512 * 8}) * 256);
+
+        // Attribute the committed arena exactly: each region's span comes straight from
+        // the bind cursor, and reserve_unbound is the committed-but-unbound remainder.
+        // Their sum equals shared_scratch_.bytes (the real committed VMM footprint), so
+        // the HUD breaks the single "shared" row into its true components with no estimate.
+        auto& profiler = lfs::diagnostics::VramProfiler::instance();
+        const auto record_region = [&](const char* region, const std::size_t bytes) {
+            profiler.recordCurrentBytes("shared.scratch", region, bytes);
+        };
+        record_region("per_splat", per_splat_end);
+        record_region("sort_buffers", sort_end - per_splat_end);
+        record_region("tiles", tiles_end - sort_end);
+        record_region("pixel", pixel_end - tiles_end);
+        record_region("scan", cursor - pixel_end);
+        record_region("reserve_unbound",
+                      shared_scratch_.bytes > cursor ? shared_scratch_.bytes - cursor : 0);
+        profiler.setGauge("vram.audit.shared_scratch.vksplat_view_bytes", static_cast<double>(cursor));
+    }
+
+    void VksplatViewportRenderer::releasePrivateScratchBuffers() {
+        std::size_t released_bytes = 0;
+        const auto release = [&](auto& typed_buffer) {
+            auto& dev = typed_buffer.deviceBuffer;
+            if (dev.buffer == VK_NULL_HANDLE || dev.allocation == VK_NULL_HANDLE) {
+                return;
+            }
+            released_bytes += dev.allocSize;
+            renderer_.destroyBuffer(dev);
+            typed_buffer.clear();
+            typed_buffer.shrink_to_fit();
+        };
+
+#define RELEASE_PRIVATE_SCRATCH(name) release(buffers_.name)
+        RELEASE_PRIVATE_SCRATCH(tiles_touched);
+        RELEASE_PRIVATE_SCRATCH(rect_tile_space);
+        RELEASE_PRIVATE_SCRATCH(radii);
+        RELEASE_PRIVATE_SCRATCH(xy_vs);
+        RELEASE_PRIVATE_SCRATCH(depths);
+        RELEASE_PRIVATE_SCRATCH(inv_cov_vs_opacity);
+        RELEASE_PRIVATE_SCRATCH(rgb);
+        RELEASE_PRIVATE_SCRATCH(overlay_flags);
+        RELEASE_PRIVATE_SCRATCH(primitive_depth_keys);
+        RELEASE_PRIVATE_SCRATCH(primitive_sort_indices);
+        RELEASE_PRIVATE_SCRATCH(tiles_touched_depth_ordered);
+        RELEASE_PRIVATE_SCRATCH(visible_flags);
+        RELEASE_PRIVATE_SCRATCH(visible_prefix);
+        RELEASE_PRIVATE_SCRATCH(visible_count);
+        RELEASE_PRIVATE_SCRATCH(visible_sort_dispatch_args);
+        RELEASE_PRIVATE_SCRATCH(index_buffer_offset);
+        RELEASE_PRIVATE_SCRATCH(sorting_keys_1);
+        RELEASE_PRIVATE_SCRATCH(sorting_keys_2);
+        RELEASE_PRIVATE_SCRATCH(sorting_gauss_idx_1);
+        RELEASE_PRIVATE_SCRATCH(sorting_gauss_idx_2);
+        RELEASE_PRIVATE_SCRATCH(tile_sort_count);
+        RELEASE_PRIVATE_SCRATCH(tile_sort_dispatch_args);
+        RELEASE_PRIVATE_SCRATCH(tile_ranges);
+        RELEASE_PRIVATE_SCRATCH(pixel_state);
+        RELEASE_PRIVATE_SCRATCH(pixel_depth);
+        RELEASE_PRIVATE_SCRATCH(n_contributors);
+        RELEASE_PRIVATE_SCRATCH(_cumsum_blockSums);
+        RELEASE_PRIVATE_SCRATCH(_cumsum_blockSums2);
+        RELEASE_PRIVATE_SCRATCH(_sorting_histogram);
+        RELEASE_PRIVATE_SCRATCH(_sorting_histogram_cumsum);
+#undef RELEASE_PRIVATE_SCRATCH
+
+        if (released_bytes != 0) {
+            buffers_.num_indices = 0;
+            buffers_.is_unsorted_1 = true;
+            LOG_PERF("vksplat.memory.release_private_scratch bytes={}MiB reason=live_training_shared_scratch",
+                     released_bytes >> 20);
+        }
+    }
+
+    void VksplatViewportRenderer::detachSharedScratchBuffers() {
+        const VkBuffer shared_buffer = shared_scratch_.imported_buffer.buffer;
+        if (shared_buffer == VK_NULL_HANDLE) {
+            return;
+        }
+        const auto detach = [shared_buffer](_VulkanBuffer& dev) {
+            if (dev.buffer != shared_buffer || dev.allocation != VK_NULL_HANDLE) {
+                return;
+            }
+            const char* const label = dev.label;
+            dev = {};
+            dev.label = label;
+        };
+
+#define DETACH_SHARED(name) detach(buffers_.name.deviceBuffer)
+        DETACH_SHARED(tiles_touched);
+        DETACH_SHARED(rect_tile_space);
+        DETACH_SHARED(radii);
+        DETACH_SHARED(xy_vs);
+        DETACH_SHARED(depths);
+        DETACH_SHARED(inv_cov_vs_opacity);
+        DETACH_SHARED(rgb);
+        DETACH_SHARED(overlay_flags);
+        DETACH_SHARED(primitive_depth_keys);
+        DETACH_SHARED(primitive_sort_indices);
+        DETACH_SHARED(tiles_touched_depth_ordered);
+        DETACH_SHARED(visible_flags);
+        DETACH_SHARED(visible_prefix);
+        DETACH_SHARED(visible_count);
+        DETACH_SHARED(visible_sort_dispatch_args);
+        DETACH_SHARED(index_buffer_offset);
+        DETACH_SHARED(sorting_keys_1);
+        DETACH_SHARED(sorting_keys_2);
+        DETACH_SHARED(sorting_gauss_idx_1);
+        DETACH_SHARED(sorting_gauss_idx_2);
+        DETACH_SHARED(tile_sort_count);
+        DETACH_SHARED(tile_sort_dispatch_args);
+        DETACH_SHARED(tile_ranges);
+        DETACH_SHARED(pixel_state);
+        DETACH_SHARED(pixel_depth);
+        DETACH_SHARED(n_contributors);
+        DETACH_SHARED(_cumsum_blockSums);
+        DETACH_SHARED(_cumsum_blockSums2);
+        DETACH_SHARED(_sorting_histogram);
+        DETACH_SHARED(_sorting_histogram_cumsum);
+#undef DETACH_SHARED
+
+        buffers_.num_indices = 0;
+        buffers_.is_unsorted_1 = true;
+    }
+
+    void VksplatViewportRenderer::releaseSharedScratchImportOnly() {
+        detachSharedScratchBuffers();
+        if (context_ != nullptr && shared_scratch_.imported_buffer.buffer != VK_NULL_HANDLE) {
+            context_->destroyExternalBuffer(shared_scratch_.imported_buffer);
+        }
+        if (shared_scratch_.bytes != 0) {
+            lfs::diagnostics::VramProfiler::instance().clearScope("shared.scratch");
+            lfs::diagnostics::VramProfiler::instance().setGauge("vram.audit.shared_scratch.capacity", 0.0);
+            lfs::diagnostics::VramProfiler::instance().setGauge("vram.audit.shared_scratch.vksplat_view_bytes", 0.0);
+        }
+        shared_scratch_ = {};
+    }
+
+    void VksplatViewportRenderer::releaseSharedScratchArena() {
+        if (shared_scratch_.installed_in_training_arena && shared_scratch_.block) {
+            lfs::core::GlobalArenaManager::instance().clear_external_backing(shared_scratch_.block->device_ptr);
+        }
+        releaseSharedScratchImportOnly();
+    }
+
+    void VksplatViewportRenderer::retireSharedScratchBuffer(VulkanContext::ExternalBuffer&& old) {
+        if (old.buffer == VK_NULL_HANDLE || context_ == nullptr) {
+            if (context_ != nullptr) {
+                context_->destroyExternalBuffer(old);
+            }
+            old = {};
+            return;
+        }
+        // render_complete_value_ is the value the most recently submitted batch
+        // signals; that batch is the last one that could reference this buffer
+        // (the current frame rebinds to the new import before recording). When no
+        // frame has been submitted, the buffer was never seen by the GPU.
+        if (render_complete_timeline_ == VK_NULL_HANDLE || render_complete_value_ == 0) {
+            context_->destroyExternalBuffer(old);
+            old = {};
+            return;
+        }
+        retired_scratch_buffers_.emplace_back(render_complete_value_, std::move(old));
+        old = {};
+    }
+
+    void VksplatViewportRenderer::drainRetiredScratchBuffers(bool force) {
+        if (context_ == nullptr || retired_scratch_buffers_.empty()) {
+            return;
+        }
+        auto retired = [&](std::uint64_t value) {
+            if (force || value == 0 || render_complete_timeline_ == VK_NULL_HANDLE) {
+                return true;
+            }
+            try {
+                return renderer_.timelineValueComplete(render_complete_timeline_, value);
+            } catch (const std::exception&) {
+                return false;
+            }
+        };
+        auto it = retired_scratch_buffers_.begin();
+        while (it != retired_scratch_buffers_.end()) {
+            if (retired(it->first)) {
+                context_->destroyExternalBuffer(it->second);
+                it = retired_scratch_buffers_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
     std::expected<VksplatViewportRenderer::OverlayBindingViews, std::string>
-    VksplatViewportRenderer::uploadSelectionOverlay(
+    VksplatViewportRenderer::uploadOverlayBindings(
         VulkanContext& context,
         const lfs::rendering::ViewportRenderRequest& request,
         const std::size_t num_splats,
         const std::size_t ring_slot) {
         if (num_splats == 0) {
-            return std::unexpected("VkSplat selection overlay cannot bind an empty model");
+            return std::unexpected("VkSplat overlay bindings cannot bind an empty model");
         }
         if (!context.externalMemoryInteropEnabled()) {
-            return std::unexpected("VkSplat selection overlay requires CUDA/Vulkan external-memory interop");
+            return std::unexpected("VkSplat overlay bindings require CUDA/Vulkan external-memory interop");
         }
         assert(ring_slot < cuda_overlays_.size());
         // NOTE: Tried running this whole function on a dedicated non-blocking
@@ -1155,7 +1911,51 @@ namespace lfs::vis {
             hasOverlayTensor(request.overlay.emphasis.transient_mask.mask, num_splats);
         const bool transform_indices_enabled = hasTransformIndices(request.scene.transform_indices, num_splats);
 
-        const std::size_t mask_region_bytes = alignUp(std::max<std::size_t>(num_splats, 1), 4);
+        // Compare/split view restricts which scene nodes a panel may draw via
+        // request.scene.node_visibility_mask. The forward path reuses the per-node
+        // node_mask buffer (indexed by transform_indices, same as emphasis) to
+        // hard-cull hidden nodes, mirroring the selection-query path. Visibility
+        // culling and emphasis dimming are mutually exclusive in practice (compare
+        // mode clears emphasis), so the restricting mask owns the shared buffer.
+        const auto& node_visibility_mask = request.scene.node_visibility_mask;
+        const bool node_visibility_restricts =
+            transform_indices_enabled &&
+            std::any_of(node_visibility_mask.begin(), node_visibility_mask.end(),
+                        [](const bool visible) { return !visible; });
+        const std::vector<bool>& forward_node_mask_source =
+            node_visibility_restricts ? node_visibility_mask
+                                      : request.overlay.emphasis.emphasized_node_mask;
+
+        // Whether the forward rasterizer must run the overlay/selection path.
+        // When nothing draws an overlay, the host dispatches the *_plain shader
+        // variant, which strips that work from the per-pixel inner loop — the
+        // dominant cost when zoomed out. Conservative: any uncertainty keeps the
+        // full path (correctness over speed).
+        const auto& emphasis = request.overlay.emphasis;
+        const bool overlays_active =
+            selection_enabled ||
+            preview_enabled ||
+            node_visibility_restricts ||
+            !emphasis.emphasized_node_mask.empty() ||
+            request.filters.crop_region.has_value() ||
+            request.filters.ellipsoid_region.has_value() ||
+            request.filters.view_volume.has_value() ||
+            emphasis.dim_non_emphasized ||
+            emphasis.flash_intensity > 0.0f ||
+            emphasis.focused_gaussian_id >= 0 ||
+            request.overlay.cursor.enabled ||
+            request.overlay.markers.show_rings ||
+            request.overlay.markers.show_center_markers;
+
+        // Only reserve the per-gaussian mask regions when their feature is active.
+        // The compose shader reads selection_mask/preview_mask solely under the
+        // matching selection flag (alphablend_shader.slang), and the C++ upload is
+        // likewise gated below — so when nothing is selected these collapse to a few
+        // bytes instead of num_splats × ring-slots (~30 MiB at 5M splats).
+        const std::size_t selection_mask_region_bytes =
+            alignUp(selection_enabled ? num_splats : std::size_t{1}, 4);
+        const std::size_t preview_mask_region_bytes =
+            alignUp(preview_enabled ? num_splats : std::size_t{1}, 4);
         const std::size_t color_region_bytes =
             lfs::rendering::kSelectionColorTableCount * 4 * sizeof(float);
         const std::size_t transform_region_bytes =
@@ -1163,14 +1963,14 @@ namespace lfs::vis {
                                                             : sizeof(std::int32_t),
                                   sizeof(std::int32_t));
         const std::size_t node_mask_region_bytes =
-            alignUp(std::max<std::size_t>(request.overlay.emphasis.emphasized_node_mask.size(), 1), 4);
+            alignUp(std::max<std::size_t>(forward_node_mask_source.size(), 1), 4);
         const std::size_t overlay_params_region_bytes =
             static_cast<std::size_t>(ParamCount) * 4 * sizeof(float);
         const std::size_t model_transforms_region_bytes =
             modelTransformCount(request.scene.model_transforms) * 16 * sizeof(float);
         std::array<std::size_t, kOverlayRegionCount> region_bytes{};
-        region_bytes[OverlaySelectionMask] = mask_region_bytes;
-        region_bytes[OverlayPreviewMask] = mask_region_bytes;
+        region_bytes[OverlaySelectionMask] = selection_mask_region_bytes;
+        region_bytes[OverlayPreviewMask] = preview_mask_region_bytes;
         region_bytes[OverlaySelectionColors] = color_region_bytes;
         region_bytes[OverlayTransformIndices] = transform_region_bytes;
         region_bytes[OverlayNodeMask] = node_mask_region_bytes;
@@ -1178,26 +1978,48 @@ namespace lfs::vis {
         region_bytes[OverlayModelTransforms] = model_transforms_region_bytes;
         std::array<std::size_t, kOverlayRegionCount> region_offset{};
         const std::size_t total_bytes = layoutRegions(region_bytes, region_offset, kRegionAlignment);
+        const bool overlay_buffer_reallocated =
+            slot.buffer.buffer == VK_NULL_HANDLE || slot.buffer.size < total_bytes;
+        const auto previous_region_offset = slot.region_offset;
+        const auto previous_region_bytes = slot.region_bytes;
 
         {
-            LOG_TIMER("uploadSelectionOverlay.ensure_buffer");
+            LOG_TIMER("uploadOverlayBindings.ensure_buffer");
             if (auto ok = ensureCudaInteropBuffer(context,
                                                   slot.buffer,
                                                   slot.interop,
                                                   total_bytes,
-                                                  "vksplat_selection_overlay",
-                                                  "selection overlay");
+                                                  "vulkan.vksplat.overlay_bindings",
+                                                  std::format("ring{}.overlay_bindings", ring_slot),
+                                                  "overlay bindings");
                 !ok) {
                 return std::unexpected(ok.error());
             }
         }
         slot.region_offset = region_offset;
         slot.region_bytes = region_bytes;
+        const auto region_storage_changed = [&](const std::size_t region) {
+            return overlay_buffer_reallocated ||
+                   previous_region_offset[region] != region_offset[region] ||
+                   previous_region_bytes[region] != region_bytes[region];
+        };
+        if (region_storage_changed(OverlaySelectionColors)) {
+            slot.color_table_uploaded = false;
+        }
+        if (region_storage_changed(OverlayNodeMask)) {
+            slot.node_mask_uploaded = false;
+        }
+        if (region_storage_changed(OverlayParams)) {
+            slot.overlay_params_uploaded = false;
+        }
+        if (region_storage_changed(OverlayModelTransforms)) {
+            slot.model_transforms_uploaded = false;
+        }
 
         {
-            LOG_TIMER("uploadSelectionOverlay.prepare_sources");
+            LOG_TIMER("uploadOverlayBindings.prepare_sources");
             if (selection_enabled) {
-                LOG_TIMER("uploadSelectionOverlay.prepare_sources.selection_mask");
+                LOG_TIMER("uploadOverlayBindings.prepare_sources.selection_mask");
                 auto prepared = prepareOverlayMaskTensor(*request.overlay.emphasis.mask, num_splats, "selection");
                 if (!prepared) {
                     return std::unexpected(prepared.error());
@@ -1207,7 +2029,7 @@ namespace lfs::vis {
                 slot.selection_source = {};
             }
             if (preview_enabled) {
-                LOG_TIMER("uploadSelectionOverlay.prepare_sources.preview_mask");
+                LOG_TIMER("uploadOverlayBindings.prepare_sources.preview_mask");
                 auto prepared = prepareOverlayMaskTensor(*request.overlay.emphasis.transient_mask.mask,
                                                          num_splats,
                                                          "preview selection");
@@ -1220,22 +2042,19 @@ namespace lfs::vis {
             }
             // Palette is constant across most lasso-drag frames; rebuilding the
             // 1 KB CUDA tensor cost ~5 ms (CPU alloc + H2D + sync). Skip on hit.
-            // GPU-side region stays correct because we always re-copy below from
-            // the cached tensor; only the staging is gated.
+            // GPU-side region is refreshed only when the bytes or target storage
+            // changed.
             const bool color_table_cache_hit =
-                slot.color_table_source.is_valid() &&
+                !slot.color_table_upload_cpu.empty() &&
                 slot.cached_color_palette == request.overlay.selection_colors;
             if (!color_table_cache_hit) {
-                LOG_TIMER("uploadSelectionOverlay.prepare_sources.color_table");
-                auto color_table = makeSelectionColorTableTensor(request.overlay);
-                if (!color_table) {
-                    return std::unexpected(color_table.error());
-                }
-                slot.color_table_source = std::move(*color_table);
+                LOG_TIMER("uploadOverlayBindings.prepare_sources.color_table");
+                stageSelectionColorTableCpu(slot.color_table_upload_cpu, request.overlay);
                 slot.cached_color_palette = request.overlay.selection_colors;
+                slot.color_table_uploaded = false;
             }
             {
-                LOG_TIMER("uploadSelectionOverlay.prepare_sources.transform_indices");
+                LOG_TIMER("uploadOverlayBindings.prepare_sources.transform_indices");
                 auto transform_indices = prepareTransformIndicesTensor(request.scene.transform_indices, num_splats);
                 if (!transform_indices) {
                     return std::unexpected(transform_indices.error());
@@ -1247,65 +2066,52 @@ namespace lfs::vis {
             // a lasso drag it is constant, but rebuilding the staging tensor +
             // H2D copy was costing ~6.5 ms/frame.
             const bool node_mask_cache_hit =
-                slot.node_mask_source.is_valid() &&
-                slot.cached_emphasized_node_mask == request.overlay.emphasis.emphasized_node_mask;
+                !slot.node_mask_upload_cpu.empty() &&
+                slot.cached_emphasized_node_mask == forward_node_mask_source;
             if (!node_mask_cache_hit) {
-                LOG_TIMER("uploadSelectionOverlay.prepare_sources.node_mask");
-                auto node_mask = makeNodeMaskTensor(request.overlay.emphasis.emphasized_node_mask);
-                if (!node_mask) {
-                    return std::unexpected(node_mask.error());
-                }
-                slot.node_mask_source = std::move(*node_mask);
-                slot.cached_emphasized_node_mask = request.overlay.emphasis.emphasized_node_mask;
+                LOG_TIMER("uploadOverlayBindings.prepare_sources.node_mask");
+                stageNodeMaskCpu(slot.node_mask_upload_cpu,
+                                 forward_node_mask_source,
+                                 slot.region_bytes[OverlayNodeMask]);
+                slot.cached_emphasized_node_mask = forward_node_mask_source;
+                slot.node_mask_uploaded = false;
             }
             {
                 // Output-bytes fingerprint cache. The CPU build is sub-µs; the
-                // ~6 ms cost was entirely the .to(Device::CUDA) sync. Compare
-                // freshly-built CPU bytes against the cached mirror; only do
-                // the H2D when they differ.
-                LOG_TIMER("uploadSelectionOverlay.prepare_sources.overlay_params");
-                auto overlay_params_cpu = buildOverlayParamsCpuTensor(
+                // former ~6 ms cost was entirely the .to(Device::CUDA) sync.
+                LOG_TIMER("uploadOverlayBindings.prepare_sources.overlay_params");
+                auto overlay_params_cpu = buildOverlayParamsCpuFloats(
                     request,
                     selection_enabled,
                     preview_enabled,
                     transform_indices_enabled,
-                    request.overlay.emphasis.emphasized_node_mask.size());
+                    forward_node_mask_source.size(),
+                    node_visibility_restricts);
                 if (!overlay_params_cpu) {
                     return std::unexpected(overlay_params_cpu.error());
                 }
                 const bool overlay_params_cache_hit =
-                    slot.overlay_params_source.is_valid() &&
-                    slot.cached_overlay_params_cpu.is_valid() &&
-                    slot.cached_overlay_params_cpu.bytes() == overlay_params_cpu->bytes() &&
-                    std::memcmp(slot.cached_overlay_params_cpu.data_ptr(),
-                                overlay_params_cpu->data_ptr(),
-                                overlay_params_cpu->bytes()) == 0;
+                    slot.cached_overlay_params_cpu == *overlay_params_cpu;
                 if (!overlay_params_cache_hit) {
-                    LOG_TIMER("uploadSelectionOverlay.prepare_sources.overlay_params.h2d");
-                    slot.overlay_params_source = overlay_params_cpu->to(Device::CUDA).contiguous();
                     slot.cached_overlay_params_cpu = std::move(*overlay_params_cpu);
+                    slot.overlay_params_upload_cpu = slot.cached_overlay_params_cpu;
+                    slot.overlay_params_uploaded = false;
                 }
             }
             {
                 // Same output-bytes fingerprint pattern as overlay_params.
-                LOG_TIMER("uploadSelectionOverlay.prepare_sources.model_transforms");
+                LOG_TIMER("uploadOverlayBindings.prepare_sources.model_transforms");
                 auto model_transforms_cpu =
-                    buildModelTransformsCpuTensor(request.scene.model_transforms);
+                    buildModelTransformsCpuFloats(request.scene.model_transforms);
                 if (!model_transforms_cpu) {
                     return std::unexpected(model_transforms_cpu.error());
                 }
                 const bool model_transforms_cache_hit =
-                    slot.model_transforms_source.is_valid() &&
-                    slot.cached_model_transforms_cpu.is_valid() &&
-                    slot.cached_model_transforms_cpu.bytes() == model_transforms_cpu->bytes() &&
-                    std::memcmp(slot.cached_model_transforms_cpu.data_ptr(),
-                                model_transforms_cpu->data_ptr(),
-                                model_transforms_cpu->bytes()) == 0;
+                    slot.cached_model_transforms_cpu == *model_transforms_cpu;
                 if (!model_transforms_cache_hit) {
-                    LOG_TIMER("uploadSelectionOverlay.prepare_sources.model_transforms.h2d");
-                    slot.model_transforms_source =
-                        model_transforms_cpu->to(Device::CUDA).contiguous();
                     slot.cached_model_transforms_cpu = std::move(*model_transforms_cpu);
+                    slot.model_transforms_upload_cpu = slot.cached_model_transforms_cpu;
+                    slot.model_transforms_uploaded = false;
                 }
             }
         }
@@ -1314,7 +2120,7 @@ namespace lfs::vis {
         // on the current stream (NULL by default), legacy implicit-FIFO
         // ordering already chains us correctly behind whichever stream wrote
         // the foreign sources.
-        cudaStream_t stream = slot.color_table_source.stream();
+        cudaStream_t stream = nullptr;
         if (selection_enabled) {
             stream = slot.selection_source.stream();
         } else if (preview_enabled) {
@@ -1322,9 +2128,9 @@ namespace lfs::vis {
         }
 
         {
-            LOG_TIMER("uploadSelectionOverlay.copy_to_interop");
+            LOG_TIMER("uploadOverlayBindings.copy_to_interop");
             if (selection_enabled) {
-                LOG_TIMER("uploadSelectionOverlay.copy_to_interop.selection_mask");
+                LOG_TIMER("uploadOverlayBindings.copy_to_interop.selection_mask");
                 if (!slot.interop.copyFromTensor(slot.selection_source,
                                                  num_splats,
                                                  slot.region_offset[OverlaySelectionMask],
@@ -1334,7 +2140,7 @@ namespace lfs::vis {
                 }
             }
             if (preview_enabled) {
-                LOG_TIMER("uploadSelectionOverlay.copy_to_interop.preview_mask");
+                LOG_TIMER("uploadOverlayBindings.copy_to_interop.preview_mask");
                 if (!slot.interop.copyFromTensor(slot.preview_source,
                                                  num_splats,
                                                  slot.region_offset[OverlayPreviewMask],
@@ -1344,17 +2150,22 @@ namespace lfs::vis {
                 }
             }
             {
-                LOG_TIMER("uploadSelectionOverlay.copy_to_interop.color_table");
-                if (!slot.interop.copyFromTensor(slot.color_table_source,
-                                                 slot.region_bytes[OverlaySelectionColors],
-                                                 slot.region_offset[OverlaySelectionColors],
-                                                 stream)) {
-                    return std::unexpected(std::format("VkSplat selection color upload failed: {}",
-                                                       slot.interop.lastError()));
+                LOG_TIMER("uploadOverlayBindings.copy_to_interop.color_table");
+                if (!slot.color_table_uploaded) {
+                    if (auto ok = copyHostFloatsToInteropRegion(slot.interop,
+                                                                slot.color_table_upload_cpu,
+                                                                slot.region_bytes[OverlaySelectionColors],
+                                                                slot.region_offset[OverlaySelectionColors],
+                                                                stream,
+                                                                "selection color table");
+                        !ok) {
+                        return std::unexpected(ok.error());
+                    }
+                    slot.color_table_uploaded = true;
                 }
             }
             {
-                LOG_TIMER("uploadSelectionOverlay.copy_to_interop.transform_indices");
+                LOG_TIMER("uploadOverlayBindings.copy_to_interop.transform_indices");
                 if (!slot.interop.copyFromTensor(slot.transform_indices_source,
                                                  slot.region_bytes[OverlayTransformIndices],
                                                  slot.region_offset[OverlayTransformIndices],
@@ -1364,43 +2175,58 @@ namespace lfs::vis {
                 }
             }
             {
-                LOG_TIMER("uploadSelectionOverlay.copy_to_interop.node_mask");
-                if (!slot.interop.copyFromTensor(slot.node_mask_source,
-                                                 slot.node_mask_source.bytes(),
-                                                 slot.region_offset[OverlayNodeMask],
-                                                 stream)) {
-                    return std::unexpected(std::format("VkSplat node-mask upload failed: {}",
-                                                       slot.interop.lastError()));
+                LOG_TIMER("uploadOverlayBindings.copy_to_interop.node_mask");
+                if (!slot.node_mask_uploaded) {
+                    if (auto ok = copyHostBytesToInteropRegion(slot.interop,
+                                                               slot.node_mask_upload_cpu,
+                                                               slot.region_bytes[OverlayNodeMask],
+                                                               slot.region_offset[OverlayNodeMask],
+                                                               stream,
+                                                               "node mask");
+                        !ok) {
+                        return std::unexpected(ok.error());
+                    }
+                    slot.node_mask_uploaded = true;
                 }
             }
             {
-                LOG_TIMER("uploadSelectionOverlay.copy_to_interop.overlay_params");
-                if (!slot.interop.copyFromTensor(slot.overlay_params_source,
-                                                 slot.region_bytes[OverlayParams],
-                                                 slot.region_offset[OverlayParams],
-                                                 stream)) {
-                    return std::unexpected(std::format("VkSplat overlay parameter upload failed: {}",
-                                                       slot.interop.lastError()));
+                LOG_TIMER("uploadOverlayBindings.copy_to_interop.overlay_params");
+                if (!slot.overlay_params_uploaded) {
+                    if (auto ok = copyHostFloatsToInteropRegion(slot.interop,
+                                                                slot.overlay_params_upload_cpu,
+                                                                slot.region_bytes[OverlayParams],
+                                                                slot.region_offset[OverlayParams],
+                                                                stream,
+                                                                "overlay parameter");
+                        !ok) {
+                        return std::unexpected(ok.error());
+                    }
+                    slot.overlay_params_uploaded = true;
                 }
             }
             {
-                LOG_TIMER("uploadSelectionOverlay.copy_to_interop.model_transforms");
-                if (!slot.interop.copyFromTensor(slot.model_transforms_source,
-                                                 slot.region_bytes[OverlayModelTransforms],
-                                                 slot.region_offset[OverlayModelTransforms],
-                                                 stream)) {
-                    return std::unexpected(std::format("VkSplat model-transform upload failed: {}",
-                                                       slot.interop.lastError()));
+                LOG_TIMER("uploadOverlayBindings.copy_to_interop.model_transforms");
+                if (!slot.model_transforms_uploaded) {
+                    if (auto ok = copyHostFloatsToInteropRegion(slot.interop,
+                                                                slot.model_transforms_upload_cpu,
+                                                                slot.region_bytes[OverlayModelTransforms],
+                                                                slot.region_offset[OverlayModelTransforms],
+                                                                stream,
+                                                                "model transform");
+                        !ok) {
+                        return std::unexpected(ok.error());
+                    }
+                    slot.model_transforms_uploaded = true;
                 }
             }
         }
 
         {
-            LOG_TIMER("uploadSelectionOverlay.signal_timeline");
+            LOG_TIMER("uploadOverlayBindings.signal_timeline");
             auto& timeline = overlay_upload_timelines_[ring_slot];
             const std::uint64_t signal_value = ++timeline.value;
             if (!timeline.cuda_semaphore.cudaSignal(signal_value, stream)) {
-                return std::unexpected(std::format("VkSplat selection overlay upload signal failed: {}",
+                return std::unexpected(std::format("VkSplat overlay binding upload signal failed: {}",
                                                    timeline.cuda_semaphore.lastError()));
             }
             renderer_.addTimelineWait(timeline.vk_semaphore.semaphore,
@@ -1419,6 +2245,7 @@ namespace lfs::vis {
             .node_mask = view(OverlayNodeMask),
             .overlay_params = view(OverlayParams),
             .model_transforms = view(OverlayModelTransforms),
+            .overlays_active = overlays_active,
         };
     }
 
@@ -1460,7 +2287,42 @@ namespace lfs::vis {
                                                            : context.graphicsQueue(),
                                          use_async_compute ? context.computeQueueFamily()
                                                            : context.graphicsQueueFamily(),
-                                         context.allocator());
+                                         context.allocator(),
+                                         context.pipelineCache());
+            renderer_.assignBufferLabels(buffers_);
+            renderer_.setCpuTimerCallback([](const std::string_view name, const double ms) {
+                LOG_PERF("{} took {:.2f}ms", name, ms);
+            });
+            renderer_.addTimerCallback([](const std::vector<std::pair<size_t, double>>& updates) {
+                for (size_t stage = 0; stage < updates.size() && stage < PerfTimer::stage_count(); ++stage) {
+                    const auto [count, seconds] = updates[stage];
+                    if (count == 0)
+                        continue;
+                    LOG_PERF("vksplat.gpu.{} took {:.3f}ms count={}",
+                             PerfTimer::stage_name(stage),
+                             seconds * 1000.0,
+                             count);
+                }
+            });
+
+            VkSemaphoreTypeCreateInfo timeline_info{};
+            timeline_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+            timeline_info.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+            timeline_info.initialValue = 0;
+            VkSemaphoreCreateInfo semaphore_info{};
+            semaphore_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+            semaphore_info.pNext = &timeline_info;
+            const VkResult semaphore_result =
+                vkCreateSemaphore(context.device(), &semaphore_info, nullptr, &render_complete_timeline_);
+            if (semaphore_result != VK_SUCCESS) {
+                return std::unexpected(std::format(
+                    "VkSplat render completion timeline creation failed: {}",
+                    vkError("vkCreateSemaphore", semaphore_result)));
+            }
+            context.setDebugObjectName(VK_OBJECT_TYPE_SEMAPHORE,
+                                       render_complete_timeline_,
+                                       "VkSplat render completion timeline");
+            render_complete_value_ = 0;
         } catch (const std::exception& e) {
             return std::unexpected(std::format("VkSplat initialization failed: {}", e.what()));
         }
@@ -1494,13 +2356,13 @@ namespace lfs::vis {
         for (auto& timeline : overlay_upload_timelines_) {
             if (!context.createExternalTimelineSemaphore(0, timeline.vk_semaphore)) {
                 return std::unexpected(std::format(
-                    "VkSplat selection overlay timeline semaphore creation failed: {}",
+                    "VkSplat overlay upload timeline semaphore creation failed: {}",
                     context.lastError()));
             }
             const auto handle = context.releaseExternalSemaphoreNativeHandle(timeline.vk_semaphore);
             if (!VulkanContext::externalNativeHandleValid(handle)) {
                 context.destroyExternalSemaphore(timeline.vk_semaphore);
-                return std::unexpected("VkSplat selection overlay timeline semaphore export failed");
+                return std::unexpected("VkSplat overlay upload timeline semaphore export failed");
             }
             lfs::rendering::CudaVulkanExternalSemaphoreImport import{};
             import.semaphore_handle = handle;
@@ -1509,13 +2371,86 @@ namespace lfs::vis {
                 std::string err = timeline.cuda_semaphore.lastError();
                 context.destroyExternalSemaphore(timeline.vk_semaphore);
                 return std::unexpected(std::format(
-                    "VkSplat selection overlay timeline semaphore CUDA import failed: {}", err));
+                    "VkSplat overlay upload timeline semaphore CUDA import failed: {}", err));
+            }
+            timeline.value = 0;
+        }
+        {
+            auto& timeline = selection_query_timeline_;
+            if (!context.createExternalTimelineSemaphore(0, timeline.vk_semaphore)) {
+                return std::unexpected(std::format(
+                    "VkSplat selection query timeline semaphore creation failed: {}",
+                    context.lastError()));
+            }
+            const auto handle = context.releaseExternalSemaphoreNativeHandle(timeline.vk_semaphore);
+            if (!VulkanContext::externalNativeHandleValid(handle)) {
+                context.destroyExternalSemaphore(timeline.vk_semaphore);
+                timeline.vk_semaphore = {};
+                return std::unexpected("VkSplat selection query timeline semaphore export failed");
+            }
+            lfs::rendering::CudaVulkanExternalSemaphoreImport import{};
+            import.semaphore_handle = handle;
+            import.initial_value = timeline.vk_semaphore.initial_value;
+            if (!timeline.cuda_semaphore.init(import)) {
+                std::string err = timeline.cuda_semaphore.lastError();
+                context.destroyExternalSemaphore(timeline.vk_semaphore);
+                timeline.vk_semaphore = {};
+                return std::unexpected(std::format(
+                    "VkSplat selection query timeline semaphore CUDA import failed: {}", err));
             }
             timeline.value = 0;
         }
 
         initialized_ = true;
         return {};
+    }
+
+    std::expected<void, std::string> VksplatViewportRenderer::waitForRingSlot(
+        const std::size_t ring_slot,
+        const std::string_view reason) {
+        if (ring_slot >= ring_completion_values_.size() ||
+            render_complete_timeline_ == VK_NULL_HANDLE) {
+            return {};
+        }
+        const std::uint64_t value = ring_completion_values_[ring_slot];
+        if (value == 0) {
+            return {};
+        }
+        try {
+            if (renderer_.timelineValueComplete(render_complete_timeline_, value)) {
+                ring_completion_values_[ring_slot] = 0;
+                return {};
+            }
+        } catch (const std::exception& e) {
+            return std::unexpected(std::format("VkSplat {} ring-slot status failed: {}",
+                                               reason,
+                                               e.what()));
+        }
+
+        LOG_TIMER("vksplat.ring_slot.wait_reuse");
+        VkSemaphoreWaitInfo wait_info{};
+        wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+        wait_info.semaphoreCount = 1;
+        wait_info.pSemaphores = &render_complete_timeline_;
+        wait_info.pValues = &value;
+        const VkResult result = vkWaitSemaphores(context_->device(), &wait_info, UINT64_MAX);
+        if (result != VK_SUCCESS) {
+            return std::unexpected(std::format("VkSplat {} ring-slot wait failed: {}",
+                                               reason,
+                                               vkError("vkWaitSemaphores", result)));
+        }
+        ring_completion_values_[ring_slot] = 0;
+        return {};
+    }
+
+    std::size_t VksplatViewportRenderer::acquireRingSlot() {
+        const std::size_t slot = next_ring_slot_;
+        next_ring_slot_ = (next_ring_slot_ + 1) % kFrameRingSize;
+        return slot;
+    }
+
+    std::size_t VksplatViewportRenderer::latestOutputRingSlot(const OutputSlot output_slot) const {
+        return latest_output_ring_slot_[outputSlotIndex(output_slot)];
     }
 
     bool VksplatViewportRenderer::inputsResident(const lfs::core::SplatData& splat_data,
@@ -1531,6 +2466,7 @@ namespace lfs::vis {
         const lfs::core::SplatData& splat_data,
         const std::size_t ring_slot,
         const bool force_upload,
+        const int upload_sh_degree,
         const bool synchronize_upload) {
         const std::size_t n = static_cast<std::size_t>(splat_data.size());
         if (n == 0) {
@@ -1543,11 +2479,20 @@ namespace lfs::vis {
         assert(ring_slot < cuda_inputs_.size());
         auto& slot = cuda_inputs_[ring_slot];
 
-        auto layout = vksplat::rawDeviceInputLayout(splat_data);
-        if (!layout) {
-            return std::unexpected(layout.error());
+        const int effective_upload_sh_degree =
+            upload_sh_degree < 0
+                ? splat_data.get_max_sh_degree()
+                : std::clamp(upload_sh_degree, 0, splat_data.get_max_sh_degree());
+        auto upload_layout = vksplat::rawDeviceInputLayout(splat_data, effective_upload_sh_degree);
+        if (!upload_layout) {
+            return std::unexpected(upload_layout.error());
         }
-        const bool input_snapshot_changed = force_upload || !inputsResident(splat_data, ring_slot);
+        auto external_layout = vksplat::rawDeviceInputLayout(splat_data, splat_data.get_max_sh_degree());
+        if (!external_layout) {
+            return std::unexpected(external_layout.error());
+        }
+        const bool input_snapshot_changed = !inputsResident(splat_data, ring_slot);
+        const bool input_upload_requested = force_upload || input_snapshot_changed;
 
         std::shared_ptr<VulkanExternalTensorStorage> means_storage, sh0_storage, shN_storage,
             rotations_storage, scaling_storage, opacity_storage;
@@ -1560,18 +2505,52 @@ namespace lfs::vis {
             scaling_storage = vulkanExternalStorage(splat_data.scaling_raw());
             opacity_storage = vulkanExternalStorage(splat_data.opacity_raw());
         }
-        // When the model has a soft-deleted mask we can't borrow the opacity
-        // buffer directly — the rasterizer has no per-splat skip flag, so the
-        // copy path runs a kernel that bakes the mask into the uploaded opacity
-        // (sigmoid-bound to ~0 for deleted entries). Borrow only when nothing
-        // is marked deleted, otherwise undo/redo of deletes wouldn't take.
+        // Soft deletes only need opacity rewritten; all geometry/color tensors can
+        // still be borrowed from Vulkan-external model storage. Keep that path
+        // narrow so a delete mask costs N floats instead of a full raw-model copy.
+        const bool has_deleted_mask = splat_data.has_deleted_mask();
+        const bool base_inputs_external =
+            means_storage && sh0_storage && rotations_storage && scaling_storage;
         const bool can_bind_external =
-            means_storage && sh0_storage && shN_storage && rotations_storage &&
-            scaling_storage && opacity_storage && !splat_data.has_deleted_mask();
+            base_inputs_external &&
+            (upload_layout->omits_shN || shN_storage) &&
+            (opacity_storage || has_deleted_mask);
+        const auto& layout = can_bind_external && shN_storage ? external_layout : upload_layout;
 
-        const auto reset_buffer_bookkeeping = [&](const bool reset_cached_raster_state) {
-            buffers_.scales_opacs.clear();
-            buffers_.sh_coeffs.clear();
+        std::vector<std::string> input_copy_reasons;
+        const auto note_missing_storage =
+            [&](const std::shared_ptr<VulkanExternalTensorStorage>& storage,
+                const char* const name) {
+                if (!storage) {
+                    input_copy_reasons.emplace_back(std::format("missing_{}", name));
+                }
+            };
+        note_missing_storage(means_storage, "means");
+        note_missing_storage(sh0_storage, "sh0");
+        note_missing_storage(rotations_storage, "rotation");
+        note_missing_storage(scaling_storage, "scaling");
+        if (!has_deleted_mask) {
+            note_missing_storage(opacity_storage, "opacity");
+        }
+        if (!upload_layout->omits_shN) {
+            note_missing_storage(shN_storage, "shN");
+        }
+        if (!can_bind_external && has_deleted_mask) {
+            input_copy_reasons.emplace_back("soft_deleted_mask");
+        }
+        std::string input_copy_reason = "unknown";
+        if (!input_copy_reasons.empty()) {
+            input_copy_reason.clear();
+            for (const auto& reason : input_copy_reasons) {
+                if (!input_copy_reason.empty()) {
+                    input_copy_reason += "+";
+                }
+                input_copy_reason += reason;
+            }
+        }
+
+        const auto update_input_metadata = [&](const bool reset_cached_raster_state) {
+            releaseInputHostStorage(buffers_);
             buffers_.num_splats = n;
             if (reset_cached_raster_state) {
                 buffers_.num_indices = 0;
@@ -1580,6 +2559,12 @@ namespace lfs::vis {
         };
 
         if (can_bind_external) {
+            if (slot.buffer.buffer != VK_NULL_HANDLE) {
+                LOG_PERF("vksplat.memory.release_input_copy ring={} bytes={} reason=zero_copy_external_tensors",
+                         ring_slot,
+                         static_cast<std::size_t>(slot.buffer.allocation_size));
+                releaseInputSlot(context, ring_slot);
+            }
             const auto require_capacity =
                 [](const std::shared_ptr<VulkanExternalTensorStorage>& storage,
                    const std::size_t bytes,
@@ -1606,8 +2591,10 @@ namespace lfs::vis {
                 if (auto ok = require_capacity(sh0_storage, layout->sh0_bytes, "sh0"); !ok) {
                     return std::unexpected(ok.error());
                 }
-                if (auto ok = require_capacity(shN_storage, layout->shN_bytes, "shN"); !ok) {
-                    return std::unexpected(ok.error());
+                if (!layout->omits_shN) {
+                    if (auto ok = require_capacity(shN_storage, layout->shN_bytes, "shN"); !ok) {
+                        return std::unexpected(ok.error());
+                    }
                 }
                 if (auto ok = require_capacity(rotations_storage, layout->rotations_bytes, "rotation"); !ok) {
                     return std::unexpected(ok.error());
@@ -1615,9 +2602,61 @@ namespace lfs::vis {
                 if (auto ok = require_capacity(scaling_storage, layout->scaling_bytes, "scaling"); !ok) {
                     return std::unexpected(ok.error());
                 }
-                if (auto ok = require_capacity(opacity_storage, layout->opacity_bytes, "opacity"); !ok) {
-                    return std::unexpected(ok.error());
+                if (!has_deleted_mask) {
+                    if (auto ok = require_capacity(opacity_storage, layout->opacity_bytes, "opacity"); !ok) {
+                        return std::unexpected(ok.error());
+                    }
                 }
+            }
+
+            auto& opacity_slot = cuda_opacity_copies_[ring_slot];
+            bool opacity_copy_upload_needed = false;
+            if (has_deleted_mask) {
+                const VkBuffer previous_opacity_buffer = opacity_slot.buffer.buffer;
+                const std::size_t previous_opacity_bytes = opacity_slot.bytes;
+                const bool opacity_slot_had_buffer = previous_opacity_buffer != VK_NULL_HANDLE;
+                {
+                    LOG_TIMER("prepareInputs.opacity_copy.ensure_buffer");
+                    if (auto ok = ensureCudaInteropBuffer(context,
+                                                          opacity_slot.buffer,
+                                                          opacity_slot.interop,
+                                                          layout->opacity_bytes,
+                                                          "vulkan.vksplat.opacity_copy",
+                                                          std::format("ring{}.soft_deleted_opacity", ring_slot),
+                                                          "deleted opacity");
+                        !ok) {
+                        return std::unexpected(ok.error());
+                    }
+                }
+                opacity_copy_upload_needed =
+                    input_upload_requested ||
+                    !opacity_slot_had_buffer ||
+                    opacity_slot.buffer.buffer != previous_opacity_buffer ||
+                    previous_opacity_bytes != layout->opacity_bytes;
+                opacity_slot.bytes = layout->opacity_bytes;
+            } else if (opacity_slot.buffer.buffer != VK_NULL_HANDLE) {
+                LOG_PERF("vksplat.memory.release_opacity_copy ring={} bytes={} reason=no_deleted_mask",
+                         ring_slot,
+                         static_cast<std::size_t>(opacity_slot.buffer.allocation_size));
+                releaseOpacityCopySlot(context, ring_slot);
+            }
+
+            if (has_deleted_mask && opacity_slot.interop.devicePointer() == nullptr) {
+                return std::unexpected("VkSplat deleted-opacity buffer is not mapped");
+            }
+
+            if (has_deleted_mask) {
+                buffers_.opacity_raw.deviceBuffer = makeRegionView(opacity_slot.buffer, 0, layout->opacity_bytes);
+            } else {
+                buffers_.opacity_raw.deviceBuffer = makeBorrowedBufferView(
+                    opacity_storage->vkBuffer(), opacity_storage->bytes(), layout->opacity_bytes, opacity_storage->vkOffset());
+            }
+
+            if (has_deleted_mask) {
+                LOG_PERF("vksplat.memory.opacity_copy ring={} bytes={} upload_needed={}",
+                         ring_slot,
+                         layout->opacity_bytes,
+                         opacity_copy_upload_needed);
             }
 
             {
@@ -1626,23 +2665,40 @@ namespace lfs::vis {
                     means_storage->vkBuffer(), means_storage->bytes(), layout->xyz_bytes, means_storage->vkOffset());
                 buffers_.sh0.deviceBuffer = makeBorrowedBufferView(
                     sh0_storage->vkBuffer(), sh0_storage->bytes(), layout->sh0_bytes, sh0_storage->vkOffset());
-                buffers_.shN.deviceBuffer = makeBorrowedBufferView(
-                    shN_storage->vkBuffer(), shN_storage->bytes(), layout->shN_bytes, shN_storage->vkOffset());
+                buffers_.shN.deviceBuffer = layout->omits_shN
+                                                ? makeBorrowedBufferView(
+                                                      rotations_storage->vkBuffer(),
+                                                      rotations_storage->bytes(),
+                                                      layout->shN_bytes,
+                                                      rotations_storage->vkOffset())
+                                                : makeBorrowedBufferView(
+                                                      shN_storage->vkBuffer(),
+                                                      shN_storage->bytes(),
+                                                      layout->shN_bytes,
+                                                      shN_storage->vkOffset());
                 buffers_.rotations.deviceBuffer = makeBorrowedBufferView(
                     rotations_storage->vkBuffer(), rotations_storage->bytes(), layout->rotations_bytes, rotations_storage->vkOffset());
                 buffers_.scaling_raw.deviceBuffer = makeBorrowedBufferView(
                     scaling_storage->vkBuffer(), scaling_storage->bytes(), layout->scaling_bytes, scaling_storage->vkOffset());
-                buffers_.opacity_raw.deviceBuffer = makeBorrowedBufferView(
-                    opacity_storage->vkBuffer(), opacity_storage->bytes(), layout->opacity_bytes, opacity_storage->vkOffset());
                 buffers_.scales_opacs.deviceBuffer = {};
                 buffers_.sh_coeffs.deviceBuffer = {};
-                reset_buffer_bookkeeping(input_snapshot_changed);
+                update_input_metadata(input_snapshot_changed);
             }
 
             const cudaStream_t stream = splat_data.means_raw().stream();
             {
                 LOG_TIMER("prepareInputs.wait_streams");
                 if (auto ok = waitForSplatInputStreams(stream, splat_data); !ok) {
+                    return std::unexpected(ok.error());
+                }
+            }
+            if (has_deleted_mask && opacity_copy_upload_needed) {
+                LOG_TIMER("prepareInputs.opacity_copy.copyRawOpacity");
+                if (auto ok = vksplat::copyRawOpacityToBuffer(
+                        splat_data,
+                        opacity_slot.interop.devicePointer(),
+                        stream);
+                    !ok) {
                     return std::unexpected(ok.error());
                 }
             }
@@ -1672,113 +2728,129 @@ namespace lfs::vis {
                 LOG_TIMER("prepareInputs.snapshot");
                 ring_uploaded_[ring_slot] = makeModelInputSnapshot(splat_data);
             }
+            current_input_sh_degree_ = shN_storage ? splat_data.get_max_sh_degree()
+                                                   : effective_upload_sh_degree;
             return InputBindingResult{.uses_temporary_upload_slot = false};
         }
 
-        std::array<std::size_t, kInputRegionCount> region_bytes{};
-        region_bytes[InputXyzWs] = layout->xyz_bytes;
-        region_bytes[InputSh0] = layout->sh0_bytes;
-        region_bytes[InputShN] = layout->shN_bytes;
-        region_bytes[InputRotations] = layout->rotations_bytes;
-        region_bytes[InputScalingRaw] = layout->scaling_bytes;
-        region_bytes[InputOpacityRaw] = layout->opacity_bytes;
+        if (slot.buffer.buffer != VK_NULL_HANDLE) {
+            LOG_PERF("vksplat.memory.release_input_copy ring={} bytes={} reason=missing_external_storage",
+                     ring_slot,
+                     static_cast<std::size_t>(slot.buffer.allocation_size));
+            releaseInputSlot(context, ring_slot);
+        }
+        if (cuda_opacity_copies_[ring_slot].buffer.buffer != VK_NULL_HANDLE) {
+            LOG_PERF("vksplat.memory.release_opacity_copy ring={} bytes={} reason=missing_external_storage",
+                     ring_slot,
+                     static_cast<std::size_t>(cuda_opacity_copies_[ring_slot].buffer.allocation_size));
+            releaseOpacityCopySlot(context, ring_slot);
+        }
+        ring_uploaded_[ring_slot] = {};
+        return std::unexpected(std::format(
+            "VkSplat refusing full input-copy fallback; model tensors must use Vulkan-external storage ({})",
+            input_copy_reason));
+    }
 
-        // Lay out the raw regions back-to-back, padding each to kRegionAlignment
-        // so the resulting offsets are valid for VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
-        // bindings on every conformant device. Driver-required alignment is at
-        // most 256 bytes (often less); overshooting here costs <= 1 KiB per ring.
-        std::array<std::size_t, kInputRegionCount> region_offset{};
-        const std::size_t total_bytes = layoutRegions(region_bytes, region_offset, kRegionAlignment);
+    void VksplatViewportRenderer::logVramBreakdownIfChanged(const std::string_view reason) {
+        const std::size_t owned_total = buffers_.getTotalOwnedAllocSize();
+        const std::size_t pipeline_current = renderer_.getCurrentAllocSize();
+        const std::size_t pipeline_peak = renderer_.getPeakAllocSize();
+        const std::size_t input_view_bytes =
+            viewBytes(buffers_.xyz_ws) +
+            viewBytes(buffers_.sh0) +
+            viewBytes(buffers_.shN) +
+            viewBytes(buffers_.rotations) +
+            viewBytes(buffers_.scaling_raw) +
+            viewBytes(buffers_.opacity_raw);
+        const std::size_t sort_buffer_bytes =
+            buffers_.sorting_keys_1.deviceBuffer.allocSize +
+            buffers_.sorting_keys_2.deviceBuffer.allocSize +
+            buffers_.sorting_gauss_idx_1.deviceBuffer.allocSize +
+            buffers_.sorting_gauss_idx_2.deviceBuffer.allocSize;
 
-        const bool slot_had_buffer = slot.buffer.buffer != VK_NULL_HANDLE;
-        {
-            LOG_TIMER("prepareInputs.copy.ensure_buffer");
-            if (auto ok = ensureCudaInteropBuffer(context,
-                                                  slot.buffer,
-                                                  slot.interop,
-                                                  total_bytes,
-                                                  "vksplat_inputs",
-                                                  "input");
-                !ok) {
-                return std::unexpected(ok.error());
+        std::size_t fallback_input_bytes = 0;
+        for (const auto& slot : cuda_inputs_) {
+            fallback_input_bytes += static_cast<std::size_t>(slot.buffer.allocation_size);
+        }
+        std::size_t opacity_copy_bytes = 0;
+        for (const auto& slot : cuda_opacity_copies_) {
+            opacity_copy_bytes += static_cast<std::size_t>(slot.buffer.allocation_size);
+        }
+        std::size_t overlay_bytes = 0;
+        for (const auto& slot : cuda_overlays_) {
+            overlay_bytes += static_cast<std::size_t>(slot.buffer.allocation_size);
+        }
+        overlay_bytes += static_cast<std::size_t>(cuda_selection_query_.buffer.allocation_size);
+
+        std::size_t output_image_bytes = 0;
+        for (const auto& output_slots : output_slots_) {
+            for (const auto& slot : output_slots) {
+                output_image_bytes += static_cast<std::size_t>(slot.image.allocation_size);
+                output_image_bytes += static_cast<std::size_t>(slot.depth_image.allocation_size);
             }
         }
+        const std::size_t shared_scratch_bytes = shared_scratch_.bytes;
 
-        slot.region_offset = region_offset;
-        slot.region_bytes = region_bytes;
-
-        bool upload_needed;
-        {
-            LOG_TIMER("prepareInputs.copy.inputs_resident_check");
-            upload_needed = input_snapshot_changed || !slot_had_buffer;
+        const auto mix = [](const std::size_t seed, const std::size_t value) {
+            return seed ^ (value + 0x9e3779b97f4a7c15ull + (seed << 6u) + (seed >> 2u));
+        };
+        std::size_t signature = 0;
+        signature = mix(signature, owned_total);
+        signature = mix(signature, pipeline_current);
+        signature = mix(signature, pipeline_peak);
+        signature = mix(signature, input_view_bytes);
+        signature = mix(signature, fallback_input_bytes);
+        signature = mix(signature, opacity_copy_bytes);
+        signature = mix(signature, overlay_bytes);
+        signature = mix(signature, output_image_bytes);
+        signature = mix(signature, sort_buffer_bytes);
+        signature = mix(signature, shared_scratch_bytes);
+        if (signature == last_vram_report_signature_) {
+            return;
         }
+        last_vram_report_signature_ = signature;
 
-        if (!upload_needed) {
-            LOG_TIMER("prepareInputs.copy.plug_only");
-            plugRingInputs(ring_slot, n, false);
-            return InputBindingResult{.uses_temporary_upload_slot = true};
-        }
-
-        // Single CUDA-imported VkBuffer. Copy raw SplatData into its regions only
-        // when model storage cannot be bound directly as Vulkan buffers.
-        auto* const base = static_cast<std::uint8_t*>(slot.interop.devicePointer());
-        if (base == nullptr) {
-            return std::unexpected("VkSplat CUDA/Vulkan input buffer is not mapped");
-        }
-        const cudaStream_t stream = splat_data.means_raw().stream();
-        {
-            LOG_TIMER("prepareInputs.copy.copyRawDeviceInputs");
-            if (auto ok = vksplat::copyRawDeviceInputsToBuffer(
-                    splat_data,
-                    base + region_offset[InputXyzWs],
-                    base + region_offset[InputSh0],
-                    base + region_offset[InputShN],
-                    base + region_offset[InputRotations],
-                    base + region_offset[InputScalingRaw],
-                    base + region_offset[InputOpacityRaw],
-                    stream);
-                !ok) {
-                return std::unexpected(ok.error());
+        std::vector<std::pair<std::string, std::size_t>> entries;
+        for (const auto& [name, bytes] : buffers_.getOwnedVramBreakdown()) {
+            if (bytes != 0) {
+                entries.emplace_back(name, bytes);
             }
         }
-        if (synchronize_upload) {
-            LOG_TIMER("prepareInputs.copy.stream_sync");
-            if (const cudaError_t status = cudaStreamSynchronize(stream); status != cudaSuccess) {
-                return std::unexpected(std::format("VkSplat CUDA input upload sync failed: {} ({})",
-                                                   cudaGetErrorName(status),
-                                                   cudaGetErrorString(status)));
+        std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) {
+            return a.second > b.second;
+        });
+
+        std::string top;
+        const std::size_t top_count = std::min<std::size_t>(entries.size(), 10);
+        for (std::size_t i = 0; i < top_count; ++i) {
+            if (!top.empty()) {
+                top += ", ";
             }
+            top += std::format("{}={:.2f}GiB", entries[i].first, gib(entries[i].second));
         }
 
-        // Cross-API handoff: signal CUDA-side after the memcpys complete, queue
-        // a Vulkan-side wait so the next vksplat compute submit waits on it
-        // before reading the buffers. No CPU stall.
-        {
-            LOG_TIMER("prepareInputs.copy.cuda_signal");
-            auto& timeline = upload_timelines_[ring_slot];
-            const std::uint64_t signal_value = ++timeline.value;
-            if (!timeline.cuda_semaphore.cudaSignal(signal_value, stream)) {
-                return std::unexpected(std::format("VkSplat CUDA upload signal failed: {}",
-                                                   timeline.cuda_semaphore.lastError()));
-            }
-            renderer_.addTimelineWait(timeline.vk_semaphore.semaphore,
-                                      signal_value,
-                                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-        }
-
-        {
-            LOG_TIMER("prepareInputs.copy.snapshot");
-            ring_uploaded_[ring_slot] = makeModelInputSnapshot(splat_data);
-        }
-        plugRingInputs(ring_slot, n, true);
-        return InputBindingResult{.uses_temporary_upload_slot = true};
+        LOG_PERF("vksplat.memory reason={} renderer_owned={:.2f}GiB pipeline_current={:.2f}GiB pipeline_peak={:.2f}GiB input_views={:.2f}GiB fallback_inputs={:.2f}GiB opacity_copies={:.2f}GiB overlays={:.2f}GiB outputs={:.2f}GiB sort_buffers={:.2f}GiB shared_scratch={:.2f}GiB sort_capacity={} top=[{}]",
+                 reason,
+                 gib(owned_total),
+                 gib(pipeline_current),
+                 gib(pipeline_peak),
+                 gib(input_view_bytes),
+                 gib(fallback_input_bytes),
+                 gib(opacity_copy_bytes),
+                 gib(overlay_bytes),
+                 gib(output_image_bytes),
+                 gib(sort_buffer_bytes),
+                 gib(shared_scratch_bytes),
+                 buffers_.num_indices,
+                 top);
     }
 
     std::expected<void, std::string> VksplatViewportRenderer::ensureOutputImages(
         VulkanContext& context,
         const glm::ivec2 size,
-        const OutputSlot output_slot) {
-        auto& slot = output_slots_[outputSlotIndex(output_slot)];
+        const OutputSlot output_slot,
+        const std::size_t ring_slot) {
+        auto& slot = output_slots_[outputSlotIndex(output_slot)][ring_slot];
         if (slot.image.image != VK_NULL_HANDLE && slot.depth_image.image != VK_NULL_HANDLE &&
             slot.size == size) {
             return {};
@@ -1807,10 +2879,18 @@ namespace lfs::vis {
             .width = static_cast<std::uint32_t>(size.x),
             .height = static_cast<std::uint32_t>(size.y),
         };
-        if (!context.createExternalImage(extent, VK_FORMAT_R8G8B8A8_UNORM, slot.image)) {
+        if (!context.createExternalImage(extent,
+                                         VK_FORMAT_R8G8B8A8_UNORM,
+                                         slot.image,
+                                         "vulkan.vksplat.output_image",
+                                         std::format("{}.color.ring{}", outputSlotDiagnosticName(output_slot), ring_slot))) {
             return std::unexpected(context.lastError());
         }
-        if (!context.createExternalImage(extent, VK_FORMAT_R32_SFLOAT, slot.depth_image)) {
+        if (!context.createExternalImage(extent,
+                                         VK_FORMAT_R32_SFLOAT,
+                                         slot.depth_image,
+                                         "vulkan.vksplat.output_image",
+                                         std::format("{}.depth.ring{}", outputSlotDiagnosticName(output_slot), ring_slot))) {
             const std::string error = context.lastError();
             context.destroyExternalImage(slot.image);
             return std::unexpected(error);
@@ -1908,6 +2988,7 @@ namespace lfs::vis {
         const VulkanGSRendererUniforms& uniforms,
         const glm::vec3& background,
         const OutputSlot output_slot,
+        const std::size_t output_ring_slot,
         const bool transparent_background,
         const bool depth_view,
         const float depth_min,
@@ -1915,7 +2996,8 @@ namespace lfs::vis {
         if (auto ok = ensureComposePipeline(context); !ok) {
             return ok;
         }
-        auto& output = output_slots_[outputSlotIndex(output_slot)];
+        const std::size_t output_index = outputSlotIndex(output_slot);
+        auto& output = output_slots_[output_index][output_ring_slot];
 
         const bool has_pixel_state = buffers_.num_indices > 0 &&
                                      buffers_.pixel_state.deviceBuffer.buffer != VK_NULL_HANDLE &&
@@ -1959,15 +3041,18 @@ namespace lfs::vis {
                                                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             output.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             output.depth_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            ++output.generation;
+            output.generation = ++output_generations_[output_index];
+            latest_output_ring_slot_[output_index] = output_ring_slot;
             return {};
         }
 
         VkDescriptorBufferInfo pixel_info{};
         pixel_info.buffer = buffers_.pixel_state.deviceBuffer.buffer;
+        pixel_info.offset = buffers_.pixel_state.deviceBuffer.offset;
         pixel_info.range = buffers_.pixel_state.deviceBuffer.size;
         VkDescriptorBufferInfo depth_info{};
         depth_info.buffer = buffers_.pixel_depth.deviceBuffer.buffer;
+        depth_info.offset = buffers_.pixel_depth.deviceBuffer.offset;
         depth_info.range = buffers_.pixel_depth.deviceBuffer.size;
         VkDescriptorImageInfo image_info{};
         image_info.imageView = output.image.view;
@@ -2006,9 +3091,11 @@ namespace lfs::vis {
         pixel_barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         pixel_barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         pixel_barriers[0].buffer = buffers_.pixel_state.deviceBuffer.buffer;
+        pixel_barriers[0].offset = buffers_.pixel_state.deviceBuffer.offset;
         pixel_barriers[0].size = buffers_.pixel_state.deviceBuffer.size;
         pixel_barriers[1] = pixel_barriers[0];
         pixel_barriers[1].buffer = buffers_.pixel_depth.deviceBuffer.buffer;
+        pixel_barriers[1].offset = buffers_.pixel_depth.deviceBuffer.offset;
         pixel_barriers[1].size = buffers_.pixel_depth.deviceBuffer.size;
         VkDependencyInfo pixel_dep{};
         pixel_dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
@@ -2061,20 +3148,66 @@ namespace lfs::vis {
                                                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         output.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         output.depth_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        ++output.generation;
+        output.generation = ++output_generations_[output_index];
+        latest_output_ring_slot_[output_index] = output_ring_slot;
+        return {};
+    }
+
+    std::expected<void, std::string> VksplatViewportRenderer::ensureReadbackContext() const {
+        if (!context_ || context_->device() == VK_NULL_HANDLE) {
+            return std::unexpected("VkSplat readback context requested before device initialization");
+        }
+        if (readback_pool_ != VK_NULL_HANDLE) {
+            return {};
+        }
+        const VkDevice device = context_->device();
+        VkCommandPoolCreateInfo pool_info{};
+        pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        pool_info.queueFamilyIndex = context_->graphicsQueueFamily();
+        if (const VkResult r = vkCreateCommandPool(device, &pool_info, nullptr, &readback_pool_);
+            r != VK_SUCCESS) {
+            return std::unexpected(vkError("vkCreateCommandPool(VkSplat readback)", r));
+        }
+        VkCommandBufferAllocateInfo command_info{};
+        command_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        command_info.commandPool = readback_pool_;
+        command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        command_info.commandBufferCount = 1;
+        if (const VkResult r = vkAllocateCommandBuffers(device, &command_info, &readback_cmd_);
+            r != VK_SUCCESS) {
+            vkDestroyCommandPool(device, readback_pool_, nullptr);
+            readback_pool_ = VK_NULL_HANDLE;
+            return std::unexpected(vkError("vkAllocateCommandBuffers(VkSplat readback)", r));
+        }
+        VkFenceCreateInfo fence_info{};
+        fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        if (const VkResult r = vkCreateFence(device, &fence_info, nullptr, &readback_fence_);
+            r != VK_SUCCESS) {
+            vkDestroyCommandPool(device, readback_pool_, nullptr);
+            readback_pool_ = VK_NULL_HANDLE;
+            readback_cmd_ = VK_NULL_HANDLE;
+            return std::unexpected(vkError("vkCreateFence(VkSplat readback)", r));
+        }
         return {};
     }
 
     std::expected<std::shared_ptr<lfs::core::Tensor>, std::string>
     VksplatViewportRenderer::readOutputImage(VulkanContext& context, const OutputSlot output_slot) const {
+        std::lock_guard<std::mutex> readback_lock(readback_mutex_);
         if (!context_) {
             return std::unexpected("VkSplat output readback requested before renderer initialization");
         }
         if (&context != context_) {
             return std::unexpected("VkSplat output readback received a different Vulkan context");
         }
+        try {
+            const_cast<VulkanGSRenderer&>(renderer_).waitForPendingBatch();
+        } catch (const std::exception& e) {
+            return std::unexpected(std::format("VkSplat output readback pending-batch wait failed: {}", e.what()));
+        }
 
-        const auto& output = output_slots_[outputSlotIndex(output_slot)];
+        const auto& output = output_slots_[outputSlotIndex(output_slot)][latestOutputRingSlot(output_slot)];
         if (output.image.image == VK_NULL_HANDLE ||
             output.size.x <= 0 ||
             output.size.y <= 0) {
@@ -2097,7 +3230,8 @@ namespace lfs::vis {
             return std::unexpected("VkSplat output readback has zero bytes");
         }
 
-        ScopedStagingBuffer staging{.allocator = context.allocator()};
+        ScopedStagingBuffer staging{};
+        staging.allocator = context.allocator();
         VkBufferCreateInfo buffer_info{};
         buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
         buffer_info.size = byte_count;
@@ -2118,29 +3252,23 @@ namespace lfs::vis {
         if (result != VK_SUCCESS || staging.buffer == VK_NULL_HANDLE) {
             return std::unexpected(vkError("vmaCreateBuffer(VkSplat readback)", result));
         }
+        staging.vram_scope = "vulkan.vksplat.readback_buffer";
+        staging.vram_label = std::format("rgba:{}x{}", output.size.x, output.size.y);
+        lfs::diagnostics::VramProfiler::instance().recordCurrentBytes(
+            staging.vram_scope,
+            staging.vram_label,
+            static_cast<std::size_t>(staging.allocation_info.size));
         if (staging.allocation_info.pMappedData == nullptr) {
             return std::unexpected("VkSplat readback staging buffer is not host-mapped");
         }
 
-        ScopedCommandPool command_pool{.device = device};
-        VkCommandPoolCreateInfo pool_info{};
-        pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-        pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-        pool_info.queueFamilyIndex = context.graphicsQueueFamily();
-        result = vkCreateCommandPool(device, &pool_info, nullptr, &command_pool.pool);
-        if (result != VK_SUCCESS) {
-            return std::unexpected(vkError("vkCreateCommandPool(VkSplat readback)", result));
+        if (const auto ready = ensureReadbackContext(); !ready) {
+            return std::unexpected(ready.error());
         }
-
-        VkCommandBuffer command_buffer = VK_NULL_HANDLE;
-        VkCommandBufferAllocateInfo command_info{};
-        command_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        command_info.commandPool = command_pool.pool;
-        command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        command_info.commandBufferCount = 1;
-        result = vkAllocateCommandBuffers(device, &command_info, &command_buffer);
+        const VkCommandBuffer command_buffer = readback_cmd_;
+        result = vkResetCommandBuffer(command_buffer, 0);
         if (result != VK_SUCCESS) {
-            return std::unexpected(vkError("vkAllocateCommandBuffers(VkSplat readback)", result));
+            return std::unexpected(vkError("vkResetCommandBuffer(VkSplat readback)", result));
         }
 
         VkCommandBufferBeginInfo begin_info{};
@@ -2186,23 +3314,20 @@ namespace lfs::vis {
             return std::unexpected(vkError("vkEndCommandBuffer(VkSplat readback)", result));
         }
 
-        ScopedFence fence{.device = device};
-        VkFenceCreateInfo fence_info{};
-        fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-        result = vkCreateFence(device, &fence_info, nullptr, &fence.fence);
+        result = vkResetFences(device, 1, &readback_fence_);
         if (result != VK_SUCCESS) {
-            return std::unexpected(vkError("vkCreateFence(VkSplat readback)", result));
+            return std::unexpected(vkError("vkResetFences(VkSplat readback)", result));
         }
 
         VkSubmitInfo submit_info{};
         submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         submit_info.commandBufferCount = 1;
         submit_info.pCommandBuffers = &command_buffer;
-        result = vkQueueSubmit(context.graphicsQueue(), 1, &submit_info, fence.fence);
+        result = vkQueueSubmit(context.graphicsQueue(), 1, &submit_info, readback_fence_);
         if (result != VK_SUCCESS) {
             return std::unexpected(vkError("vkQueueSubmit(VkSplat readback)", result));
         }
-        result = vkWaitForFences(device, 1, &fence.fence, VK_TRUE, UINT64_MAX);
+        result = vkWaitForFences(device, 1, &readback_fence_, VK_TRUE, UINT64_MAX);
         if (result != VK_SUCCESS) {
             return std::unexpected(vkError("vkWaitForFences(VkSplat readback)", result));
         }
@@ -2239,14 +3364,20 @@ namespace lfs::vis {
         const int x,
         const int y,
         const OutputSlot output_slot) const {
+        std::lock_guard<std::mutex> readback_lock(readback_mutex_);
         if (!context_) {
             return std::unexpected("VkSplat depth sample requested before renderer initialization");
         }
         if (&context != context_) {
             return std::unexpected("VkSplat depth sample received a different Vulkan context");
         }
+        try {
+            const_cast<VulkanGSRenderer&>(renderer_).waitForPendingBatch();
+        } catch (const std::exception& e) {
+            return std::unexpected(std::format("VkSplat depth sample pending-batch wait failed: {}", e.what()));
+        }
 
-        const auto& output = output_slots_[outputSlotIndex(output_slot)];
+        const auto& output = output_slots_[outputSlotIndex(output_slot)][latestOutputRingSlot(output_slot)];
         if (output.depth_image.image == VK_NULL_HANDLE ||
             output.size.x <= 0 ||
             output.size.y <= 0) {
@@ -2265,7 +3396,8 @@ namespace lfs::vis {
 
         const VkDevice device = context.device();
         constexpr VkDeviceSize byte_count = sizeof(float);
-        ScopedStagingBuffer staging{.allocator = context.allocator()};
+        ScopedStagingBuffer staging{};
+        staging.allocator = context.allocator();
         VkBufferCreateInfo buffer_info{};
         buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
         buffer_info.size = byte_count;
@@ -2286,29 +3418,23 @@ namespace lfs::vis {
         if (result != VK_SUCCESS || staging.buffer == VK_NULL_HANDLE) {
             return std::unexpected(vkError("vmaCreateBuffer(VkSplat depth sample)", result));
         }
+        staging.vram_scope = "vulkan.vksplat.readback_buffer";
+        staging.vram_label = "depth_sample";
+        lfs::diagnostics::VramProfiler::instance().recordCurrentBytes(
+            staging.vram_scope,
+            staging.vram_label,
+            static_cast<std::size_t>(staging.allocation_info.size));
         if (staging.allocation_info.pMappedData == nullptr) {
             return std::unexpected("VkSplat depth sample staging buffer is not host-mapped");
         }
 
-        ScopedCommandPool command_pool{.device = device};
-        VkCommandPoolCreateInfo pool_info{};
-        pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-        pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-        pool_info.queueFamilyIndex = context.graphicsQueueFamily();
-        result = vkCreateCommandPool(device, &pool_info, nullptr, &command_pool.pool);
-        if (result != VK_SUCCESS) {
-            return std::unexpected(vkError("vkCreateCommandPool(VkSplat depth sample)", result));
+        if (const auto ready = ensureReadbackContext(); !ready) {
+            return std::unexpected(ready.error());
         }
-
-        VkCommandBuffer command_buffer = VK_NULL_HANDLE;
-        VkCommandBufferAllocateInfo command_info{};
-        command_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        command_info.commandPool = command_pool.pool;
-        command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        command_info.commandBufferCount = 1;
-        result = vkAllocateCommandBuffers(device, &command_info, &command_buffer);
+        const VkCommandBuffer command_buffer = readback_cmd_;
+        result = vkResetCommandBuffer(command_buffer, 0);
         if (result != VK_SUCCESS) {
-            return std::unexpected(vkError("vkAllocateCommandBuffers(VkSplat depth sample)", result));
+            return std::unexpected(vkError("vkResetCommandBuffer(VkSplat depth sample)", result));
         }
 
         VkCommandBufferBeginInfo begin_info{};
@@ -2352,23 +3478,20 @@ namespace lfs::vis {
             return std::unexpected(vkError("vkEndCommandBuffer(VkSplat depth sample)", result));
         }
 
-        ScopedFence fence{.device = device};
-        VkFenceCreateInfo fence_info{};
-        fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-        result = vkCreateFence(device, &fence_info, nullptr, &fence.fence);
+        result = vkResetFences(device, 1, &readback_fence_);
         if (result != VK_SUCCESS) {
-            return std::unexpected(vkError("vkCreateFence(VkSplat depth sample)", result));
+            return std::unexpected(vkError("vkResetFences(VkSplat depth sample)", result));
         }
 
         VkSubmitInfo submit_info{};
         submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         submit_info.commandBufferCount = 1;
         submit_info.pCommandBuffers = &command_buffer;
-        result = vkQueueSubmit(context.graphicsQueue(), 1, &submit_info, fence.fence);
+        result = vkQueueSubmit(context.graphicsQueue(), 1, &submit_info, readback_fence_);
         if (result != VK_SUCCESS) {
             return std::unexpected(vkError("vkQueueSubmit(VkSplat depth sample)", result));
         }
-        result = vkWaitForFences(device, 1, &fence.fence, VK_TRUE, UINT64_MAX);
+        result = vkWaitForFences(device, 1, &readback_fence_, VK_TRUE, UINT64_MAX);
         if (result != VK_SUCCESS) {
             return std::unexpected(vkError("vkWaitForFences(VkSplat depth sample)", result));
         }
@@ -2444,23 +3567,30 @@ namespace lfs::vis {
             return std::unexpected("VkSplat selection query requires CUDA/Vulkan external-memory interop");
         }
 
-        if (auto ok = ensureInitialized(context); !ok) {
-            return std::unexpected(ok.error());
+        {
+            LOG_TIMER("VksplatViewportRenderer::buildSelectionMask.ensureInitialized");
+            if (auto ok = ensureInitialized(context); !ok) {
+                return std::unexpected(ok.error());
+            }
         }
 
-        constexpr std::size_t ring_slot = 0;
+        std::size_t ring_slot = 0;
+        {
+            LOG_TIMER("VksplatViewportRenderer::buildSelectionMask.wait_ring_slot");
+            ring_slot = acquireRingSlot();
+            if (auto ok = waitForRingSlot(ring_slot, "selection query"); !ok) {
+                return std::unexpected(ok.error());
+            }
+        }
 
-        const bool model_inputs_changed = force_input_upload || !inputsResident(splat_data, ring_slot);
         auto input_binding = [&] {
             LOG_TIMER("VksplatViewportRenderer::buildSelectionMask.prepareInputs");
             return prepareInputs(context, splat_data, ring_slot, force_input_upload,
+                                 0,
                                  request.synchronize_input_upload);
         }();
         if (!input_binding) {
             return std::unexpected(input_binding.error());
-        }
-        if (model_inputs_changed) {
-            renderer_.resetNumIndicesEstimate();
         }
         // Intentionally do NOT release ring_slot here. The slot's CUDA-imported
         // Vulkan buffer + uploaded splat data stay resident across selection
@@ -2474,7 +3604,8 @@ namespace lfs::vis {
         const bool transform_indices_enabled = hasTransformIndices(request.scene.transform_indices, num_splats);
         const bool node_visibility_enabled = !request.scene.node_visibility_mask.empty();
 
-        const std::size_t output_region_bytes = alignUp(std::max<std::size_t>(num_splats, 1), 4);
+        const std::size_t output_tensor_region_bytes = alignUp(std::max<std::size_t>(num_splats, 1), 4);
+        const std::size_t unused_query_output_region_bytes = sizeof(std::uint32_t);
         const std::size_t transform_region_bytes =
             std::max<std::size_t>(transform_indices_enabled ? num_splats * sizeof(std::int32_t)
                                                             : sizeof(std::int32_t),
@@ -2494,27 +3625,109 @@ namespace lfs::vis {
         const std::size_t polygon_mask_region_bytes =
             alignUp(std::max<std::size_t>(polygon_mask_pixels, 1u), 4u);
         std::array<std::size_t, kSelectionQueryRegionCount> region_bytes{};
-        region_bytes[SelectionQueryOutput] = output_region_bytes;
+        region_bytes[SelectionQueryOutput] = unused_query_output_region_bytes;
         region_bytes[SelectionQueryTransformIndices] = transform_region_bytes;
         region_bytes[SelectionQueryNodeMask] = node_mask_region_bytes;
         region_bytes[SelectionQueryPrimitives] = primitive_region_bytes;
         region_bytes[SelectionQueryModelTransforms] = model_transforms_region_bytes;
         region_bytes[SelectionQueryPolygonVertices] = polygon_vertices_region_bytes;
         region_bytes[SelectionQueryPolygonMask] = polygon_mask_region_bytes;
+        auto region_capacity_bytes = slot.region_capacity_bytes;
+        const auto grow_fixed = [&](const std::size_t region) {
+            region_capacity_bytes[region] =
+                growRegionCapacity(region_capacity_bytes[region], region_bytes[region], region_bytes[region]);
+        };
+        const auto grow_dynamic = [&](const std::size_t region, const std::size_t minimum) {
+            region_capacity_bytes[region] =
+                growRegionCapacity(region_capacity_bytes[region], region_bytes[region], minimum);
+        };
+        grow_fixed(SelectionQueryOutput);
+        grow_fixed(SelectionQueryTransformIndices);
+        grow_fixed(SelectionQueryNodeMask);
+        grow_dynamic(SelectionQueryPrimitives, 4u * 256u * sizeof(float));
+        grow_fixed(SelectionQueryModelTransforms);
+        grow_dynamic(SelectionQueryPolygonVertices, 8192u * 2u * sizeof(float));
+        const std::size_t viewport_polygon_mask_bytes =
+            alignUp(static_cast<std::size_t>(size.x) * static_cast<std::size_t>(size.y), 4u);
+        grow_dynamic(SelectionQueryPolygonMask, viewport_polygon_mask_bytes);
         std::array<std::size_t, kSelectionQueryRegionCount> region_offset{};
-        const std::size_t total_bytes = layoutRegions(region_bytes, region_offset, kRegionAlignment);
+        const std::size_t total_bytes = layoutRegions(region_capacity_bytes, region_offset, kRegionAlignment);
+        const bool query_buffer_reallocated =
+            slot.buffer.buffer == VK_NULL_HANDLE || slot.buffer.size < total_bytes;
+        const auto previous_region_offset = slot.region_offset;
+        const auto previous_region_bytes = slot.region_bytes;
 
-        if (auto ok = ensureCudaInteropBuffer(context,
-                                              slot.buffer,
-                                              slot.interop,
-                                              total_bytes,
-                                              "vksplat_selection_query",
-                                              "selection query");
-            !ok) {
-            return std::unexpected(ok.error());
+        {
+            LOG_TIMER("VksplatViewportRenderer::buildSelectionMask.ensure_query_buffer");
+            if (query_buffer_reallocated) {
+                LOG_PERF("VksplatViewportRenderer::buildSelectionMask.query_buffer_reallocate "
+                         "required={} previous={}",
+                         total_bytes,
+                         static_cast<std::size_t>(slot.buffer.size));
+            }
+            if (auto ok = ensureCudaInteropBuffer(context,
+                                                  slot.buffer,
+                                                  slot.interop,
+                                                  total_bytes,
+                                                  "vulkan.vksplat.selection_query",
+                                                  "selection_query",
+                                                  "selection query");
+                !ok) {
+                return std::unexpected(ok.error());
+            }
         }
         slot.region_offset = region_offset;
         slot.region_bytes = region_bytes;
+        slot.region_capacity_bytes = region_capacity_bytes;
+        // Upload caches are only valid for the exact region they populated.
+        // Brush/rectangle primitive counts can move later regions without reallocating.
+        const auto region_storage_changed = [&](const std::size_t region) {
+            return query_buffer_reallocated ||
+                   previous_region_offset[region] != region_offset[region] ||
+                   previous_region_bytes[region] != region_bytes[region];
+        };
+        if (region_storage_changed(SelectionQueryTransformIndices)) {
+            slot.transform_indices_uploaded = false;
+        }
+        if (region_storage_changed(SelectionQueryNodeMask)) {
+            slot.node_mask_uploaded = false;
+        }
+        if (region_storage_changed(SelectionQueryModelTransforms)) {
+            slot.model_transforms_uploaded = false;
+        }
+        if (region_storage_changed(SelectionQueryPolygonVertices)) {
+            slot.polygon_vertices_uploaded = false;
+        }
+
+        {
+            LOG_TIMER("VksplatViewportRenderer::buildSelectionMask.ensure_output_tensor");
+            auto output_storage = vulkanExternalStorage(slot.output_tensor);
+            if (!slot.output_tensor.is_valid() ||
+                slot.output_tensor.dtype() != DataType::Bool ||
+                slot.output_tensor.device() != Device::CUDA ||
+                slot.output_tensor.numel() != num_splats ||
+                !output_storage ||
+                output_storage->bytes() < output_tensor_region_bytes) {
+                auto output_tensor = makeVulkanExternalTensor(
+                    context,
+                    {num_splats},
+                    DataType::Bool,
+                    output_tensor_region_bytes,
+                    "vksplat_selection_query_output");
+                if (!output_tensor) {
+                    return std::unexpected(output_tensor.error());
+                }
+                slot.output_tensor = std::move(*output_tensor);
+            }
+        }
+        const auto output_storage = vulkanExternalStorage(slot.output_tensor);
+        if (!output_storage) {
+            return std::unexpected("VkSplat selection output tensor is not Vulkan external storage");
+        }
+        const auto output_view = makeBorrowedBufferView(output_storage->vkBuffer(),
+                                                        output_storage->bytes(),
+                                                        output_tensor_region_bytes,
+                                                        output_storage->vkOffset());
 
         {
             LOG_TIMER("VksplatViewportRenderer::buildSelectionMask.staging");
@@ -2522,98 +3735,138 @@ namespace lfs::vis {
             if (!transform_indices) {
                 return std::unexpected(transform_indices.error());
             }
+            const bool transform_indices_cache_hit =
+                slot.transform_indices_source.is_valid() &&
+                slot.cached_transform_indices_ptr == transform_indices->data_ptr() &&
+                slot.cached_transform_indices_bytes == transform_indices->bytes();
             slot.transform_indices_source = std::move(*transform_indices);
-            auto node_mask = makeNodeMaskTensor(request.scene.node_visibility_mask);
-            if (!node_mask) {
-                return std::unexpected(node_mask.error());
+            if (!transform_indices_cache_hit) {
+                slot.cached_transform_indices_ptr = slot.transform_indices_source.data_ptr();
+                slot.cached_transform_indices_bytes = slot.transform_indices_source.bytes();
+                slot.transform_indices_uploaded = false;
             }
-            slot.node_mask_source = std::move(*node_mask);
-            auto primitive_source = makeSelectionPrimitiveTensor(request.primitives);
-            if (!primitive_source) {
-                return std::unexpected(primitive_source.error());
+
+            const bool node_mask_cache_hit =
+                !slot.node_mask_upload_cpu.empty() &&
+                slot.cached_node_visibility_mask == request.scene.node_visibility_mask;
+            if (!node_mask_cache_hit) {
+                stageNodeMaskCpu(slot.node_mask_upload_cpu,
+                                 request.scene.node_visibility_mask,
+                                 slot.region_bytes[SelectionQueryNodeMask]);
+                slot.cached_node_visibility_mask = request.scene.node_visibility_mask;
+                slot.node_mask_uploaded = false;
             }
-            slot.primitive_source = std::move(*primitive_source);
-            // buildSelectionMask is called on user interaction (mouse drag /
-            // commit), not per frame, so no caching pressure here — just do
-            // the CPU build + H2D inline.
+
+            stageSelectionPrimitivesCpu(slot.primitive_upload_cpu, request.primitives);
+
             auto model_transforms_cpu =
-                buildModelTransformsCpuTensor(request.scene.model_transforms);
+                buildModelTransformsCpuFloats(request.scene.model_transforms);
             if (!model_transforms_cpu) {
                 return std::unexpected(model_transforms_cpu.error());
             }
-            slot.model_transforms_source =
-                model_transforms_cpu->to(Device::CUDA).contiguous();
-            auto polygon_vertices_source = makeSelectionPolygonVerticesTensor(request.polygon_vertices);
-            if (!polygon_vertices_source) {
-                return std::unexpected(polygon_vertices_source.error());
+            const bool model_transforms_cache_hit =
+                slot.cached_model_transforms_cpu == *model_transforms_cpu;
+            if (!model_transforms_cache_hit) {
+                slot.cached_model_transforms_cpu = std::move(*model_transforms_cpu);
+                slot.model_transforms_upload_cpu = slot.cached_model_transforms_cpu;
+                slot.model_transforms_uploaded = false;
             }
-            slot.polygon_vertices_source = std::move(*polygon_vertices_source);
+
+            if (polygon_mode) {
+                const bool polygon_vertices_cache_hit =
+                    slot.cached_polygon_vertices.size() == request.polygon_vertices.size() &&
+                    std::equal(slot.cached_polygon_vertices.begin(),
+                               slot.cached_polygon_vertices.end(),
+                               request.polygon_vertices.begin(),
+                               [](const glm::vec2& a, const glm::vec2& b) {
+                                   return a.x == b.x && a.y == b.y;
+                               });
+                if (!polygon_vertices_cache_hit) {
+                    stageSelectionPolygonVerticesCpu(slot.polygon_vertices_upload_cpu, request.polygon_vertices);
+                    slot.cached_polygon_vertices = request.polygon_vertices;
+                    slot.polygon_vertices_uploaded = false;
+                }
+            }
         }
 
+        const cudaStream_t selection_query_stream = nullptr;
         {
             LOG_TIMER("VksplatViewportRenderer::buildSelectionMask.upload");
-            const cudaStream_t stream = slot.primitive_source.stream();
-            if (!slot.interop.copyFromTensor(slot.transform_indices_source,
-                                             slot.region_bytes[SelectionQueryTransformIndices],
-                                             slot.region_offset[SelectionQueryTransformIndices],
-                                             stream)) {
-                return std::unexpected(std::format("VkSplat selection transform-index upload failed: {}",
-                                                   slot.interop.lastError()));
+            if (!slot.transform_indices_uploaded) {
+                if (!slot.interop.copyFromTensor(slot.transform_indices_source,
+                                                 slot.region_bytes[SelectionQueryTransformIndices],
+                                                 slot.region_offset[SelectionQueryTransformIndices],
+                                                 selection_query_stream)) {
+                    return std::unexpected(std::format("VkSplat selection transform-index upload failed: {}",
+                                                       slot.interop.lastError()));
+                }
+                slot.transform_indices_uploaded = true;
             }
-            if (!slot.interop.copyFromTensor(slot.node_mask_source,
-                                             slot.node_mask_source.bytes(),
-                                             slot.region_offset[SelectionQueryNodeMask],
-                                             stream)) {
-                return std::unexpected(std::format("VkSplat selection node-mask upload failed: {}",
-                                                   slot.interop.lastError()));
+            if (!slot.node_mask_uploaded) {
+                if (auto ok = copyHostBytesToInteropRegion(slot.interop,
+                                                           slot.node_mask_upload_cpu,
+                                                           slot.region_bytes[SelectionQueryNodeMask],
+                                                           slot.region_offset[SelectionQueryNodeMask],
+                                                           selection_query_stream,
+                                                           "selection node mask");
+                    !ok) {
+                    return std::unexpected(ok.error());
+                }
+                slot.node_mask_uploaded = true;
             }
-            if (!slot.interop.copyFromTensor(slot.primitive_source,
-                                             slot.region_bytes[SelectionQueryPrimitives],
-                                             slot.region_offset[SelectionQueryPrimitives],
-                                             stream)) {
-                return std::unexpected(std::format("VkSplat selection primitive upload failed: {}",
-                                                   slot.interop.lastError()));
+            if (!slot.primitive_upload_cpu.empty()) {
+                if (auto ok = copyHostFloatsToInteropRegion(slot.interop,
+                                                            slot.primitive_upload_cpu,
+                                                            slot.region_bytes[SelectionQueryPrimitives],
+                                                            slot.region_offset[SelectionQueryPrimitives],
+                                                            selection_query_stream,
+                                                            "selection primitive");
+                    !ok) {
+                    return std::unexpected(ok.error());
+                }
             }
-            if (!slot.interop.copyFromTensor(slot.model_transforms_source,
-                                             slot.region_bytes[SelectionQueryModelTransforms],
-                                             slot.region_offset[SelectionQueryModelTransforms],
-                                             stream)) {
-                return std::unexpected(std::format("VkSplat selection model-transform upload failed: {}",
-                                                   slot.interop.lastError()));
+            if (!slot.model_transforms_uploaded) {
+                if (auto ok = copyHostFloatsToInteropRegion(slot.interop,
+                                                            slot.model_transforms_upload_cpu,
+                                                            slot.region_bytes[SelectionQueryModelTransforms],
+                                                            slot.region_offset[SelectionQueryModelTransforms],
+                                                            selection_query_stream,
+                                                            "selection model transform");
+                    !ok) {
+                    return std::unexpected(ok.error());
+                }
+                slot.model_transforms_uploaded = true;
             }
-            if (!slot.interop.copyFromTensor(slot.polygon_vertices_source,
-                                             slot.region_bytes[SelectionQueryPolygonVertices],
-                                             slot.region_offset[SelectionQueryPolygonVertices],
-                                             stream)) {
-                return std::unexpected(std::format("VkSplat polygon vertex upload failed: {}",
-                                                   slot.interop.lastError()));
+            if (polygon_mode && !slot.polygon_vertices_uploaded) {
+                if (!slot.polygon_vertices_upload_cpu.empty()) {
+                    if (auto ok = copyHostFloatsToInteropRegion(slot.interop,
+                                                                slot.polygon_vertices_upload_cpu,
+                                                                slot.region_bytes[SelectionQueryPolygonVertices],
+                                                                slot.region_offset[SelectionQueryPolygonVertices],
+                                                                selection_query_stream,
+                                                                "polygon vertex");
+                        !ok) {
+                        return std::unexpected(ok.error());
+                    }
+                }
+                slot.polygon_vertices_uploaded = true;
             }
-            auto* const output_ptr =
-                static_cast<std::uint8_t*>(slot.interop.devicePointer()) + slot.region_offset[SelectionQueryOutput];
-            if (const cudaError_t status = cudaMemsetAsync(output_ptr, 0, output_region_bytes, stream);
-                status != cudaSuccess) {
-                return std::unexpected(std::format("VkSplat selection output clear failed: {} ({})",
-                                                   cudaGetErrorName(status),
-                                                   cudaGetErrorString(status)));
-            }
-            auto* const polygon_mask_ptr =
-                static_cast<std::uint8_t*>(slot.interop.devicePointer()) + slot.region_offset[SelectionQueryPolygonMask];
-            if (const cudaError_t status =
-                    cudaMemsetAsync(polygon_mask_ptr, 0, polygon_mask_region_bytes, stream);
-                status != cudaSuccess) {
-                return std::unexpected(std::format("VkSplat polygon mask clear failed: {} ({})",
-                                                   cudaGetErrorName(status),
-                                                   cudaGetErrorString(status)));
-            }
-            if (const cudaError_t status = cudaStreamSynchronize(stream); status != cudaSuccess) {
-                return std::unexpected(std::format("VkSplat selection upload sync failed: {} ({})",
-                                                   cudaGetErrorName(status),
-                                                   cudaGetErrorString(status)));
+            if (polygon_mode) {
+                auto* const polygon_mask_ptr =
+                    static_cast<std::uint8_t*>(slot.interop.devicePointer()) +
+                    slot.region_offset[SelectionQueryPolygonMask];
+                if (const cudaError_t status =
+                        cudaMemsetAsync(polygon_mask_ptr, 0, polygon_mask_region_bytes, selection_query_stream);
+                    status != cudaSuccess) {
+                    return std::unexpected(std::format("VkSplat polygon mask clear failed: {} ({})",
+                                                       cudaGetErrorName(status),
+                                                       cudaGetErrorString(status)));
+                }
             }
         }
 
         const auto view = [&](const std::size_t region) {
-            return makeRegionView(slot.buffer, slot.region_offset[region], slot.region_bytes[region]);
+            return makeRegionView(slot.buffer, slot.region_offset[region], slot.region_capacity_bytes[region]);
         };
 
         VulkanGSRendererUniforms camera_uniforms{};
@@ -2624,7 +3877,8 @@ namespace lfs::vis {
                                       0,
                                       num_splats,
                                       request.equirectangular,
-                                      request.gut);
+                                      request.gut,
+                                      false);
         VulkanGSSelectionMaskUniforms selection_uniforms{};
         selection_uniforms.num_splats = static_cast<std::uint32_t>(num_splats);
         selection_uniforms.primitive_count = static_cast<std::uint32_t>(request.primitives.size());
@@ -2653,10 +3907,32 @@ namespace lfs::vis {
         selection_uniforms.aabb_w = polygon_aabb.w;
         selection_uniforms.aabb_h = polygon_aabb.h;
 
+        if (renderer_.isCommandBatchInProgress()) {
+            return std::unexpected("VkSplat selection query cannot run inside an active command batch");
+        }
+
+        std::uint64_t selection_query_complete_value = 0;
+        {
+            LOG_TIMER("VksplatViewportRenderer::buildSelectionMask.upload_ready_signal");
+            auto& timeline = selection_query_timeline_;
+            const std::uint64_t upload_ready_value = ++timeline.value;
+            if (!timeline.cuda_semaphore.cudaSignal(upload_ready_value, selection_query_stream)) {
+                return std::unexpected(std::format("VkSplat selection query upload-ready signal failed: {}",
+                                                   timeline.cuda_semaphore.lastError()));
+            }
+            renderer_.addTimelineWait(timeline.vk_semaphore.semaphore,
+                                      upload_ready_value,
+                                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            selection_query_complete_value = ++timeline.value;
+        }
+
         {
             LOG_TIMER("VksplatViewportRenderer::buildSelectionMask.dispatch");
             try {
-                auto batch = DeviceGuard(&renderer_);
+                auto batch = DeviceGuard(&renderer_,
+                                         false,
+                                         selection_query_timeline_.vk_semaphore.semaphore,
+                                         selection_query_complete_value);
                 if (polygon_mode) {
                     LOG_TIMER("VksplatViewportRenderer::buildSelectionMask.dispatch.polygon_rasterize");
                     VulkanGSSelectionPolygonRasterizeUniforms rasterize_uniforms{};
@@ -2678,7 +3954,7 @@ namespace lfs::vis {
                                                    view(SelectionQueryNodeMask),
                                                    view(SelectionQueryPrimitives),
                                                    view(SelectionQueryModelTransforms),
-                                                   view(SelectionQueryOutput),
+                                                   output_view,
                                                    view(SelectionQueryPolygonMask));
                 }
             } catch (const std::exception& e) {
@@ -2687,20 +3963,18 @@ namespace lfs::vis {
         }
 
         {
-            LOG_TIMER("VksplatViewportRenderer::buildSelectionMask.download");
-            slot.output_tensor = Tensor::empty({num_splats}, Device::CUDA, DataType::Bool);
-            if (!slot.interop.copyToTensor(slot.output_tensor,
-                                           num_splats,
-                                           slot.region_offset[SelectionQueryOutput],
-                                           slot.output_tensor.stream())) {
-                return std::unexpected(std::format("VkSplat selection output download failed: {}",
-                                                   slot.interop.lastError()));
+            LOG_TIMER("VksplatViewportRenderer::buildSelectionMask.dispatch.cuda_wait");
+            if (!selection_query_timeline_.cuda_semaphore.cudaWait(selection_query_complete_value,
+                                                                   selection_query_stream)) {
+                return std::unexpected(std::format("VkSplat selection query completion wait failed: {}",
+                                                   selection_query_timeline_.cuda_semaphore.lastError()));
             }
-            if (const cudaError_t status = cudaStreamSynchronize(slot.output_tensor.stream());
-                status != cudaSuccess) {
-                return std::unexpected(std::format("VkSplat selection output sync failed: {} ({})",
-                                                   cudaGetErrorName(status),
-                                                   cudaGetErrorString(status)));
+        }
+
+        {
+            LOG_TIMER("VksplatViewportRenderer::buildSelectionMask.output_tensor");
+            if (!slot.output_tensor.is_valid() || slot.output_tensor.numel() != num_splats) {
+                return std::unexpected("VkSplat selection output tensor became invalid after dispatch");
             }
         }
 
@@ -2712,7 +3986,8 @@ namespace lfs::vis {
         VulkanContext& context,
         const lfs::core::SplatData& splat_data,
         const lfs::rendering::ViewportRenderRequest& request,
-        const OutputSlot output_slot) {
+        const OutputSlot output_slot,
+        const bool synchronize_input_read) {
         const glm::ivec2 size = request.frame_view.size;
         if (size.x <= 0 || size.y <= 0) {
             return std::unexpected("VkSplat selection overlay received an invalid viewport size");
@@ -2727,7 +4002,18 @@ namespace lfs::vis {
             return std::unexpected("VkSplat selection overlay requested without reusable render state");
         }
 
-        const auto& output = output_slots_[outputSlotIndex(output_slot)];
+        const std::size_t ring_slot = acquireRingSlot();
+        if (auto ok = waitForRingSlot(ring_slot, "selection overlay"); !ok) {
+            return std::unexpected(ok.error());
+        }
+        {
+            LOG_TIMER("vksplat.selection_overlay.ensureOutputImages");
+            if (auto ok = ensureOutputImages(context, size, output_slot, ring_slot); !ok) {
+                return std::unexpected(ok.error());
+            }
+        }
+
+        const auto& output = output_slots_[outputSlotIndex(output_slot)][ring_slot];
         if (output.image.image == VK_NULL_HANDLE ||
             output.image.view == VK_NULL_HANDLE ||
             output.depth_image.image == VK_NULL_HANDLE ||
@@ -2758,10 +4044,9 @@ namespace lfs::vis {
             return std::unexpected("VkSplat 3DGUT selection overlay cached model inputs are unavailable");
         }
 
-        constexpr std::size_t ring_slot = 0;
         auto overlay_bindings = [&] {
-            LOG_TIMER("vksplat.selection_overlay.uploadSelectionOverlay");
-            return uploadSelectionOverlay(context, request, num_splats, ring_slot);
+            LOG_TIMER("vksplat.selection_overlay.uploadOverlayBindings");
+            return uploadOverlayBindings(context, request, num_splats, ring_slot);
         }();
         if (!overlay_bindings) {
             return std::unexpected(overlay_bindings.error());
@@ -2770,17 +4055,20 @@ namespace lfs::vis {
         VulkanGSRendererUniforms uniforms{};
         {
             LOG_TIMER("vksplat.selection_overlay.populateUniforms");
-            const int active_sh_degree =
-                std::clamp(request.sh_degree, 0, std::min(3, splat_data.get_max_sh_degree()));
+            const int active_sh_degree = effectiveRenderShDegree(splat_data, request.sh_degree);
+            const int resident_sh_degree =
+                current_input_sh_degree_ >= 0
+                    ? std::min(active_sh_degree, current_input_sh_degree_)
+                    : active_sh_degree;
             populateVksplatCameraUniforms(uniforms,
                                           request.frame_view,
                                           request.scene,
-                                          active_sh_degree,
-                                          lfs::core::sh_float4_slots_for_rest(
-                                              static_cast<std::uint32_t>(splat_data.max_sh_coeffs_rest())),
+                                          resident_sh_degree,
+                                          renderShNLayoutSlots(resident_sh_degree, current_input_sh_degree_),
                                           buffers_.num_splats,
                                           request.equirectangular,
-                                          request.gut);
+                                          request.gut,
+                                          request.mip_filter);
             uniforms.step = static_cast<std::uint32_t>(modelTransformCount(request.scene.model_transforms));
             uniforms.sort_capacity = static_cast<uint32_t>(
                 std::min<std::size_t>(buffers_.num_indices,
@@ -2788,9 +4076,13 @@ namespace lfs::vis {
         }
 
         std::expected<void, std::string> compose_status;
+        const std::uint64_t completion_value = ++render_complete_value_;
         try {
             LOG_TIMER("vksplat.selection_overlay.batch_total");
-            auto batch = DeviceGuard(&renderer_);
+            auto batch = DeviceGuard(&renderer_,
+                                     synchronize_input_read,
+                                     render_complete_timeline_,
+                                     completion_value);
             {
                 LOG_TIMER("vksplat.selection_overlay.record");
                 {
@@ -2804,7 +4096,8 @@ namespace lfs::vis {
                                                       overlay_bindings->overlay_params,
                                                       overlay_bindings->transform_indices,
                                                       overlay_bindings->model_transforms,
-                                                      request.gut);
+                                                      request.gut,
+                                                      overlay_bindings->overlays_active);
                 }
                 {
                     LOG_TIMER("vksplat.selection_overlay.record.composePixelState");
@@ -2814,6 +4107,7 @@ namespace lfs::vis {
                         uniforms,
                         request.frame_view.background_color,
                         output_slot,
+                        ring_slot,
                         request.transparent_background,
                         request.depth_view,
                         request.depth_view_min,
@@ -2827,7 +4121,8 @@ namespace lfs::vis {
             return std::unexpected(compose_status.error());
         }
 
-        const auto& updated_output = output_slots_[outputSlotIndex(output_slot)];
+        ring_completion_values_[ring_slot] = completion_value;
+        const auto& updated_output = output_slots_[outputSlotIndex(output_slot)][ring_slot];
         return RenderResult{
             .image = updated_output.image.image,
             .image_view = updated_output.image.view,
@@ -2839,6 +4134,8 @@ namespace lfs::vis {
             .depth_generation = updated_output.generation,
             .size = size,
             .flip_y = false,
+            .completion_semaphore = render_complete_timeline_,
+            .completion_value = completion_value,
         };
     }
 
@@ -2860,50 +4157,42 @@ namespace lfs::vis {
             return std::unexpected("VkSplat forward path requires CUDA/Vulkan external-memory interop");
         }
 
-        const int active_sh_degree = std::clamp(request.sh_degree, 0, std::min(3, splat_data.get_max_sh_degree()));
+        const int active_sh_degree = effectiveRenderShDegree(splat_data, request.sh_degree);
         if (auto ok = ensureInitialized(context); !ok) {
             return std::unexpected(ok.error());
         }
 
-        constexpr std::size_t ring_slot = 0;
+        drainRetiredScratchBuffers(false);
 
-        const bool model_inputs_changed = force_input_upload || !inputsResident(splat_data, ring_slot);
+        const std::size_t ring_slot = acquireRingSlot();
+        if (auto ok = waitForRingSlot(ring_slot, "render"); !ok) {
+            return std::unexpected(ok.error());
+        }
+        if (const auto visibility_stats = renderer_.pollDeferredPrimitiveVisibilityStats()) {
+            const double ratio = visibility_stats->num_splats == 0
+                                     ? 0.0
+                                     : static_cast<double>(visibility_stats->visible_count) /
+                                           static_cast<double>(visibility_stats->num_splats);
+            LOG_PERF("vksplat.render.visible_primitives count={} total={} ratio={:.4f}",
+                     visibility_stats->visible_count,
+                     visibility_stats->num_splats,
+                     ratio);
+        }
+
         auto input_binding = prepareInputs(context,
                                            splat_data,
                                            ring_slot,
                                            force_input_upload,
+                                           active_sh_degree,
                                            synchronize_input_upload);
         if (!input_binding) {
             return std::unexpected(input_binding.error());
         }
-        if (model_inputs_changed) {
-            // Drop the deferred-readback high-water-mark whenever the model identity
-            // changes; a fresh model can have a wildly different num_indices range,
-            // and stale estimates risk under-sizing the sort buffers (or wasting VRAM
-            // if oversized). The next frame re-seeds via heuristic and grows from there.
-            renderer_.resetNumIndicesEstimate();
-        }
-        // Keep ring_slot's buffer + CUDA import alive across frames. Sort scratch
-        // can overlay this buffer (see aliasSortScratchToInputSlot), which
-        // invalidates the contents and forces the next prepareInputs() to
-        // re-upload into the still-alive buffer. Avoids ~3.7 ms/frame of
-        // destroy+create+import when no selection overlay rerender is expected.
+        // Keep the ring slot's buffer + CUDA import alive across frames so
+        // prepareInputs() can hit the resident fast path. Input-slot sort
+        // aliasing is disabled in the async path because overwriting the upload
+        // buffer would couple render throughput to selection-overlay correctness.
         (void)input_binding;
-
-        auto overlay_bindings = [&] {
-            LOG_TIMER("vksplat.render.uploadSelectionOverlay");
-            return uploadSelectionOverlay(
-                context, request, static_cast<std::size_t>(splat_data.size()), ring_slot);
-        }();
-        if (!overlay_bindings) {
-            return std::unexpected(overlay_bindings.error());
-        }
-        {
-            LOG_TIMER("vksplat.render.ensureOutputImages");
-            if (auto ok = ensureOutputImages(context, size, output_slot); !ok) {
-                return std::unexpected(ok.error());
-            }
-        }
 
         VulkanGSRendererUniforms uniforms{};
         {
@@ -2913,11 +4202,11 @@ namespace lfs::vis {
                                           request.frame_view,
                                           request.scene,
                                           active_sh_degree,
-                                          lfs::core::sh_float4_slots_for_rest(
-                                              static_cast<std::uint32_t>(splat_data.max_sh_coeffs_rest())),
+                                          renderShNLayoutSlots(active_sh_degree, current_input_sh_degree_),
                                           render_splat_count,
                                           request.equirectangular,
-                                          request.gut);
+                                          request.gut,
+                                          request.mip_filter);
             uniforms.step = static_cast<std::uint32_t>(modelTransformCount(request.scene.model_transforms));
             uniforms.lod_enabled = request.lod_count > 0 ? 1u : 0u;
             uniforms.lod_count = static_cast<std::uint32_t>(request.lod_count);
@@ -2967,14 +4256,100 @@ namespace lfs::vis {
             }
         }
 
-        const bool selection_overlay_may_rerender =
-            request.overlay.cursor.enabled ||
-            request.overlay.emphasis.transient_mask.mask != nullptr ||
-            request.overlay.emphasis.focused_gaussian_id >= 0;
-        if (input_binding->uses_temporary_upload_slot && !request.gut && !selection_overlay_may_rerender) {
-            LOG_TIMER("vksplat.render.aliasSortScratch");
-            aliasSortScratchToInputSlot(ring_slot);
-        } else if (input_binding->uses_temporary_upload_slot && !request.gut) {
+        const std::size_t target_sort_capacity = std::max(buffers_.num_indices, buffers_.num_splats);
+        // Reserve from the exact measured tile-instance count. num_indices is the
+        // exact total from the previous frame's executeCalculateIndexBufferOffset
+        // and num_indices_high_water is its running max, so after the first frame
+        // the sort buffers are sized to exactly what the tile sort needs. The 4x
+        // estimate only seeds the very first frame, before any tile-instance count
+        // exists; the shared block grows in place if it turns out to be too small.
+        const std::size_t first_frame_estimate =
+            buffers_.num_indices_high_water == 0
+                ? (buffers_.num_splats > (std::numeric_limits<std::size_t>::max() / 4u)
+                       ? buffers_.num_splats
+                       : buffers_.num_splats * 4u)
+                : 0u;
+        // Size the sort buffers to the exact measured peak: num_indices_high_water is
+        // the running max tile-instance count, so this is exactly what every frame seen
+        // so far needed. A genuine new peak (viewport maximize or a densification burst
+        // pushing the count beyond all history) renders one frame clamped to the prior
+        // peak, then the next frame grows the block in place (ensureSharedScratchArena).
+        // The former unconditional *2 cost ~100 MiB of permanently-committed sort scratch
+        // at 5M splats; a rare one-frame regrow during transients is the better trade.
+        const std::size_t shared_sort_capacity =
+            std::max({buffers_.num_indices, buffers_.num_splats,
+                      buffers_.num_indices_high_water, first_frame_estimate});
+        const std::size_t num_pixels =
+            static_cast<std::size_t>(uniforms.image_width) * static_cast<std::size_t>(uniforms.image_height);
+        const std::size_t num_tiles =
+            static_cast<std::size_t>(uniforms.grid_width) * static_cast<std::size_t>(uniforms.grid_height);
+        bool shared_scratch_bound = false;
+        std::optional<RasterizerArenaRenderGuard> shared_arena_guard;
+
+        static const bool kDisableSharedScratch = (std::getenv("LFS_NO_SHARED_SCRATCH") != nullptr);
+        if (synchronize_input_upload && !kDisableSharedScratch) {
+            // A busy training arena makes this frame fall back to the cached viewport.
+            // Do not resize output images until this render is guaranteed to proceed.
+            releasePrivateScratchBuffers();
+            const std::size_t required_shared_scratch =
+                estimateSharedScratchBytes(buffers_.num_splats, shared_sort_capacity, num_pixels, num_tiles);
+            if (auto ok = ensureSharedScratchArena(context, required_shared_scratch); ok) {
+                try {
+                    shared_arena_guard.emplace();
+                    // Now that the render owns the arena frame (training is
+                    // excluded), it is safe to re-import the block if training grew
+                    // it in place since the last frame — the handle/size are stable.
+                    if (auto rok = reimportSharedScratchIfGrown(context); !rok) {
+                        shared_arena_guard.reset();
+                        return std::unexpected(rok.error());
+                    }
+                    bindSharedScratchBuffers(buffers_.num_splats, shared_sort_capacity, num_pixels, num_tiles);
+                    shared_scratch_bound = true;
+                    LOG_PERF("vksplat.memory.shared_scratch required={}MiB capacity={}MiB sort_capacity={} splats={}",
+                             required_shared_scratch >> 20,
+                             shared_scratch_.bytes >> 20,
+                             shared_sort_capacity,
+                             buffers_.num_splats);
+                } catch (const std::exception& e) {
+                    shared_arena_guard.reset();
+                    detachSharedScratchBuffers();
+                    return std::unexpected(std::format(
+                        "VkSplat shared scratch activation failed: {}", e.what()));
+                }
+            } else {
+                return std::unexpected(ok.error());
+            }
+        }
+
+        auto shared_scratch_cleanup = ScopeExit([&]() {
+            if (shared_scratch_bound) {
+                detachSharedScratchBuffers();
+            }
+        });
+
+        if (!synchronize_input_upload &&
+            renderer_.shrinkSortBuffersForCapacity(buffers_, target_sort_capacity)) {
+            LOG_PERF("vksplat.memory.shrink_sort_buffers target_capacity={} splats={}",
+                     target_sort_capacity,
+                     buffers_.num_splats);
+        }
+
+        auto overlay_bindings = [&] {
+            LOG_TIMER("vksplat.render.uploadOverlayBindings");
+            return uploadOverlayBindings(
+                context, request, static_cast<std::size_t>(splat_data.size()), ring_slot);
+        }();
+        if (!overlay_bindings) {
+            return std::unexpected(overlay_bindings.error());
+        }
+        {
+            LOG_TIMER("vksplat.render.ensureOutputImages");
+            if (auto ok = ensureOutputImages(context, size, output_slot, ring_slot); !ok) {
+                return std::unexpected(ok.error());
+            }
+        }
+
+        if (input_binding->uses_temporary_upload_slot && !request.gut) {
             const VkBuffer input_buffer = cuda_inputs_[ring_slot].buffer.buffer;
             const auto detach_alias = [input_buffer](auto& buffer) {
                 auto& device_buffer = buffer.deviceBuffer;
@@ -2989,14 +4364,20 @@ namespace lfs::vis {
         }
 
         std::expected<void, std::string> compose_status;
+        const std::uint64_t completion_value = ++render_complete_value_;
         try {
             // Timer/guard ordering trick: the LOG_TIMER for batch_total is
             // declared FIRST so it destructs LAST. The DeviceGuard `batch`
-            // destructs first at try-block exit, triggering endCommandBatch()
-            // (the fence wait). batch_total therefore measures
-            // record + composePixelState + endCommandBatch fence wait.
+            // destructs first at try-block exit, triggering endCommandBatch().
+            // When rendering a live training model, keep the caller's shared
+            // render lock held until Vulkan has finished reading the zero-copy
+            // tensors. Otherwise CUDA training can mutate scales/opacities for
+            // the next iteration while this frame is still in flight.
             LOG_TIMER("vksplat.render.batch_total");
-            auto batch = DeviceGuard(&renderer_);
+            auto batch = DeviceGuard(&renderer_,
+                                     synchronize_input_upload,
+                                     render_complete_timeline_,
+                                     completion_value);
             {
                 LOG_TIMER("vksplat.render.record");
                 {
@@ -3035,6 +4416,25 @@ namespace lfs::vis {
                     LOG_TIMER("vksplat.render.record.executeCalculateIndexBufferOffset");
                     renderer_.executeCalculateIndexBufferOffset(uniforms, buffers_);
                 }
+                if (shared_scratch_bound && buffers_.num_indices > shared_sort_capacity) {
+                    return std::unexpected(std::format(
+                        "VkSplat shared scratch sort capacity insufficient: have {}, need {}",
+                        shared_sort_capacity,
+                        buffers_.num_indices));
+                }
+                if (buffers_.num_splats > 0) {
+                    const double instances_per_splat =
+                        static_cast<double>(buffers_.num_indices) /
+                        static_cast<double>(buffers_.num_splats);
+                    const std::uint32_t grid_width = uniforms.grid_width;
+                    const std::uint32_t grid_height = uniforms.grid_height;
+                    LOG_PERF("vksplat.render.tile_instances count={} splats={} instances_per_splat={:.3f} grid={}x{}",
+                             buffers_.num_indices,
+                             buffers_.num_splats,
+                             instances_per_splat,
+                             grid_width,
+                             grid_height);
+                }
                 uniforms.sort_capacity = static_cast<uint32_t>(
                     std::min<std::size_t>(buffers_.num_indices,
                                           static_cast<std::size_t>(std::numeric_limits<uint32_t>::max())));
@@ -3054,7 +4454,7 @@ namespace lfs::vis {
                     }
                     {
                         LOG_TIMER("vksplat.render.record.executeSort");
-                        renderer_.executeSort(uniforms, buffers_, tile_bits);
+                        renderer_.executeSortTileInstances(uniforms, buffers_, tile_bits);
                     }
                     {
                         LOG_TIMER("vksplat.render.record.executeComputeTileRanges");
@@ -3071,7 +4471,8 @@ namespace lfs::vis {
                                                           overlay_bindings->overlay_params,
                                                           overlay_bindings->transform_indices,
                                                           overlay_bindings->model_transforms,
-                                                          request.gut);
+                                                          request.gut,
+                                                          overlay_bindings->overlays_active);
                     }
                 }
                 {
@@ -3084,6 +4485,7 @@ namespace lfs::vis {
                         uniforms,
                         request.frame_view.background_color,
                         output_slot,
+                        ring_slot,
                         request.transparent_background,
                         request.depth_view,
                         request.depth_view_min,
@@ -3096,11 +4498,15 @@ namespace lfs::vis {
         } catch (const std::exception& e) {
             return std::unexpected(std::format("VkSplat forward pass failed: {}", e.what()));
         }
+        logVramBreakdownIfChanged("render");
         if (!compose_status) {
             return std::unexpected(compose_status.error());
         }
 
-        const auto& output = output_slots_[outputSlotIndex(output_slot)];
+        renderer_.tagDeferredVisibleCountReadback(render_complete_timeline_, completion_value);
+        ring_completion_values_[ring_slot] = completion_value;
+
+        const auto& output = output_slots_[outputSlotIndex(output_slot)][ring_slot];
         return RenderResult{
             .image = output.image.image,
             .image_view = output.image.view,
@@ -3112,6 +4518,8 @@ namespace lfs::vis {
             .depth_generation = output.generation,
             .size = size,
             .flip_y = false,
+            .completion_semaphore = render_complete_timeline_,
+            .completion_value = completion_value,
         };
     }
 

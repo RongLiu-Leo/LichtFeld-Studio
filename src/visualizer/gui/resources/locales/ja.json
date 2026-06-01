@@ -235,7 +235,6 @@
     "type.splat": "スプラット",
     "type.spz": "SPZ",
     "type.usd": "USD",
-    "type.video": "動画",
     "unit.b": "B",
     "unit.gb": "GB",
     "unit.kb": "KB",
@@ -776,7 +775,15 @@
     "sequencer": "シーケンサー",
     "ellipsoid": "Ellipsoid",
     "histogram": "Histogram",
-    "depth_map": "深度マップ"
+    "depth_map": "深度マップ",
+    "depth_mode_disable": "深度モードを無効化",
+    "depth_mode_enable": "深度モードを有効化",
+    "delete_selection": "選択を削除",
+    "undo": "元に戻す",
+    "redo": "やり直し",
+    "invert_selection": "選択を反転",
+    "select_all": "すべて選択",
+    "unselect": "選択解除"
   },
   "transform": {
     "node": "ノード: %s",
@@ -790,8 +797,20 @@
     "uniform_scale": "均一スケール",
     "use_gizmo": "ギズモを使用して変換",
     "reset_all": "すべての変換をリセット",
+    "reset_all_short": "すべてリセット",
     "reset_transform": "変換をリセット",
-    "nodes_selected": "%zu ノードを選択中"
+    "nodes_selected": "%zu ノードを選択中",
+    "bake_transform": "変換を適用",
+    "tool": "変換",
+    "axis": "軸",
+    "space_plain": "空間"
+  },
+  "selection": {
+    "operation_failed": "選択操作に失敗しました",
+    "operation_failed_generic": "操作に失敗しました。",
+    "update_depth_failed": "選択深度フィルターを更新できませんでした。",
+    "undo_failed": "元に戻せませんでした。",
+    "redo_failed": "やり直せませんでした。"
   },
   "cropbox": {
     "title": "クロップボックス",
@@ -1637,7 +1656,7 @@
     "no_marked_range": "No marked range",
     "gaussian_count": "{count} Gaussians",
     "range_value": "{min} to {max}",
-    "status_drag_delete": "Left-drag across the histogram to mark a range, then delete it.",
+    "status_drag_delete": "Left-drag to mark a range, then delete it  ·  Ctrl+scroll to zoom  ·  double-click to fit",
     "status_selection": "Marked range becomes the active Gaussian selection.",
     "summary": "{metric} distribution across {count} Gaussians",
     "bin_tooltip": "Bin {index}: {left} to {right} | {count} Gaussians",

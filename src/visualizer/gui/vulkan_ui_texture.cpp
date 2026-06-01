@@ -7,6 +7,7 @@
 #include "config.h"
 #include "core/logger.hpp"
 #include "core/tensor.hpp"
+#include "diagnostics/vram_profiler.hpp"
 #include "gui/rmlui/rmlui_vk_backend.hpp"
 #include "rendering/image_layout.hpp"
 #include "window/vulkan_context.hpp"
@@ -19,8 +20,10 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <format>
 #include <limits>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -135,13 +138,21 @@ namespace lfs::vis::gui {
         VkImage image = VK_NULL_HANDLE;
         VmaAllocation image_allocation = VK_NULL_HANDLE;
         VkImageView image_view = VK_NULL_HANDLE;
+        std::string image_vram_label;
         VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
         VkImageLayout image_layout = VK_IMAGE_LAYOUT_UNDEFINED;
         VulkanImageBarrierTracker image_barriers;
-        VkFence upload_fence = VK_NULL_HANDLE;
-        VkBuffer pending_staging_buffer = VK_NULL_HANDLE;
-        VmaAllocation pending_staging_allocation = VK_NULL_HANDLE;
-        VkCommandBuffer pending_command_buffer = VK_NULL_HANDLE;
+        struct PendingUpload {
+            VkFence fence = VK_NULL_HANDLE;
+            VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+            VkBuffer staging_buffer = VK_NULL_HANDLE;
+            VmaAllocation staging_allocation = VK_NULL_HANDLE;
+        };
+        // Bounded ring of in-flight uploads. Uploads to the same image serialize on the graphics
+        // queue (no semaphores), so a depth > 1 only defers staging-buffer reclamation; it does not
+        // race the GPU. The main thread blocks only when the ring is full.
+        static constexpr std::size_t kMaxPendingUploads = 3;
+        std::vector<PendingUpload> pending_uploads;
         int width = 0;
         int height = 0;
 
@@ -154,39 +165,59 @@ namespace lfs::vis::gui {
         std::uint64_t interop_timeline_value = 0;
         bool interop_disabled = false;
 
-        void releasePendingUpload() {
-            if (pending_command_buffer != VK_NULL_HANDLE && command_pool != VK_NULL_HANDLE) {
-                vkFreeCommandBuffers(device, command_pool, 1, &pending_command_buffer);
-                pending_command_buffer = VK_NULL_HANDLE;
+        void destroyPendingUpload(PendingUpload& upload) {
+            if (upload.command_buffer != VK_NULL_HANDLE && command_pool != VK_NULL_HANDLE) {
+                vkFreeCommandBuffers(device, command_pool, 1, &upload.command_buffer);
             }
-            if (pending_staging_buffer != VK_NULL_HANDLE) {
-                vmaDestroyBuffer(allocator, pending_staging_buffer, pending_staging_allocation);
-                pending_staging_buffer = VK_NULL_HANDLE;
-                pending_staging_allocation = VK_NULL_HANDLE;
+            if (upload.staging_buffer != VK_NULL_HANDLE) {
+                vmaDestroyBuffer(allocator, upload.staging_buffer, upload.staging_allocation);
             }
-            if (upload_fence == VK_NULL_HANDLE) {
-                return;
+            if (upload.fence != VK_NULL_HANDLE) {
+                vkDestroyFence(device, upload.fence, nullptr);
             }
-            vkDestroyFence(device, upload_fence, nullptr);
-            upload_fence = VK_NULL_HANDLE;
+            upload = {};
         }
 
+        // Reap entries whose GPU work has completed. Non-blocking.
         void tryReleasePendingUpload() {
-            if (upload_fence == VK_NULL_HANDLE) {
-                return;
+            auto write = pending_uploads.begin();
+            for (auto read = pending_uploads.begin(); read != pending_uploads.end(); ++read) {
+                if (read->fence != VK_NULL_HANDLE && vkGetFenceStatus(device, read->fence) == VK_SUCCESS) {
+                    destroyPendingUpload(*read);
+                } else {
+                    if (write != read) {
+                        *write = *read;
+                    }
+                    ++write;
+                }
             }
-            if (vkGetFenceStatus(device, upload_fence) == VK_SUCCESS) {
-                releasePendingUpload();
-            }
+            pending_uploads.erase(write, pending_uploads.end());
         }
 
+        // Wait for all in-flight uploads to finish, then release them. Used before destroying the image.
         void waitAndReleasePendingUpload() {
-            if (upload_fence == VK_NULL_HANDLE) {
-                return;
+            for (auto& upload : pending_uploads) {
+                if (upload.fence != VK_NULL_HANDLE) {
+                    vkWaitForFences(device, 1, &upload.fence, VK_TRUE,
+                                    std::numeric_limits<std::uint64_t>::max());
+                }
+                destroyPendingUpload(upload);
             }
-            vkWaitForFences(device, 1, &upload_fence, VK_TRUE,
-                            std::numeric_limits<std::uint64_t>::max());
-            releasePendingUpload();
+            pending_uploads.clear();
+        }
+
+        // Block only when the ring is full: wait on the oldest entry to free a slot.
+        void enforcePendingUploadBound() {
+            tryReleasePendingUpload();
+            while (pending_uploads.size() >= kMaxPendingUploads) {
+                PendingUpload& oldest = pending_uploads.front();
+                if (oldest.fence != VK_NULL_HANDLE) {
+                    vkWaitForFences(device, 1, &oldest.fence, VK_TRUE,
+                                    std::numeric_limits<std::uint64_t>::max());
+                }
+                destroyPendingUpload(oldest);
+                pending_uploads.erase(pending_uploads.begin());
+            }
         }
 
         [[nodiscard]] bool init(VulkanContext& ctx) {
@@ -398,12 +429,18 @@ namespace lfs::vis::gui {
 
             VmaAllocationCreateInfo allocation_info{};
             allocation_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-            if (vmaCreateImage(allocator, &image_info, &allocation_info, &image, &image_allocation, nullptr) != VK_SUCCESS) {
+            VmaAllocationInfo created_allocation_info{};
+            if (vmaCreateImage(allocator, &image_info, &allocation_info, &image, &image_allocation, &created_allocation_info) != VK_SUCCESS) {
                 LOG_ERROR("Failed to create Vulkan UI texture image");
                 destroyImage();
                 return false;
             }
             vmaSetAllocationName(allocator, image_allocation, "Vulkan UI texture");
+            image_vram_label = std::format("cpu_upload_rgba8:{}x{}", new_width, new_height);
+            lfs::diagnostics::VramProfiler::instance().recordCurrentBytes(
+                "vulkan.ui_texture.image",
+                image_vram_label,
+                static_cast<std::size_t>(created_allocation_info.size));
 
             VkImageViewCreateInfo view_info{};
             view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -473,7 +510,11 @@ namespace lfs::vis::gui {
                 static_cast<std::uint32_t>(new_width),
                 static_cast<std::uint32_t>(new_height),
             };
-            if (!context->createExternalImage(extent, VK_FORMAT_R8G8B8A8_UNORM, interop_image) ||
+            if (!context->createExternalImage(extent,
+                                              VK_FORMAT_R8G8B8A8_UNORM,
+                                              interop_image,
+                                              "vulkan.ui_texture.interop_image",
+                                              "rgba8") ||
                 !context->createExternalTimelineSemaphore(0, interop_semaphore)) {
                 LOG_WARN("Vulkan UI texture interop setup failed: {}", context->lastError());
                 destroyImage();
@@ -595,8 +636,8 @@ namespace lfs::vis::gui {
                 return false;
             }
 
-            // Block here only if a previous upload to this texture is still in flight.
-            waitAndReleasePendingUpload();
+            // Reap completed uploads; block only if the in-flight ring is full.
+            enforcePendingUploadBound();
 
             const VkDeviceSize upload_size = static_cast<VkDeviceSize>(rgba.size());
             VkBuffer staging_buffer = VK_NULL_HANDLE;
@@ -676,10 +717,7 @@ namespace lfs::vis::gui {
             // Defer command-buffer + staging-buffer cleanup until the GPU finishes via the fence.
             // The next upload (or destruction) reaps them.
             image_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            upload_fence = fence;
-            pending_command_buffer = command_buffer;
-            pending_staging_buffer = staging_buffer;
-            pending_staging_allocation = staging_allocation;
+            pending_uploads.push_back(PendingUpload{fence, command_buffer, staging_buffer, staging_allocation});
             return true;
         }
 
@@ -743,6 +781,12 @@ namespace lfs::vis::gui {
                     image_view = VK_NULL_HANDLE;
                 }
                 if (image != VK_NULL_HANDLE) {
+                    if (!image_vram_label.empty()) {
+                        lfs::diagnostics::VramProfiler::instance().recordCurrentBytes(
+                            "vulkan.ui_texture.image",
+                            image_vram_label,
+                            0);
+                    }
                     image_barriers.forgetImage(image);
                     vmaDestroyImage(allocator, image, image_allocation);
                     image = VK_NULL_HANDLE;
@@ -750,6 +794,7 @@ namespace lfs::vis::gui {
                 }
             }
             image_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+            image_vram_label.clear();
             mode = Mode::Uninitialized;
             width = 0;
             height = 0;

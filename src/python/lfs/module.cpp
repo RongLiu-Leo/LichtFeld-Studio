@@ -31,6 +31,7 @@
 #include "py_signals.hpp"
 #include "py_splat_data.hpp"
 #include "py_splat_simplify.hpp"
+#include "py_store.hpp"
 #include "py_tensor.hpp"
 #include "py_ui.hpp"
 #include "py_uilist.hpp"
@@ -48,6 +49,7 @@
 #include "core/logger.hpp"
 #include "core/parameters.hpp"
 #include "core/path_utils.hpp"
+#include "diagnostics/vram_profiler.hpp"
 #include "gui/rmlui/elements/loss_graph_element.hpp"
 #include "internal/resource_paths.hpp"
 #include "io/filesystem_utils.hpp"
@@ -988,6 +990,21 @@ NB_MODULE(lichtfeld, m) {
         },
         "Get current loss");
 
+    m.def(
+        "set_vram_profiler_enabled",
+        [](const bool enabled) {
+            lfs::diagnostics::VramProfiler::instance().setEnabled(enabled);
+        },
+        nb::arg("enabled"),
+        "Enable or disable the live VRAM diagnostics profiler");
+
+    m.def(
+        "get_vram_profiler_enabled",
+        []() -> bool {
+            return lfs::diagnostics::VramProfiler::instance().enabled();
+        },
+        "Return whether the live VRAM diagnostics profiler is enabled");
+
     // Scene manipulation
     m.def(
         "set_node_visibility", [](const std::string& name, bool visible) {
@@ -1491,6 +1508,9 @@ NB_MODULE(lichtfeld, m) {
         "toggle_ui", []() { lfs::core::events::ui::ToggleUI{}.emit(); },
         "Toggle UI overlay visibility");
     m.def(
+        "toggle_vram_hud", []() { lfs::core::events::ui::ToggleVramHud{}.emit(); },
+        "Toggle the VRAM diagnostics HUD overlay (requires vram profiler enabled)");
+    m.def(
         "toggle_independent_split_view", []() {
             auto* controller = lfs::vis::InputController::instance();
             if (!controller)
@@ -1521,10 +1541,15 @@ NB_MODULE(lichtfeld, m) {
             if (!rm)
                 return;
             auto settings = rm->getSettings();
-            settings.point_cloud_mode = (mode == RenderMode::Points);
+            const bool enable_point_cloud_mode = mode == RenderMode::Points;
+            const bool point_cloud_mode_changed = settings.point_cloud_mode != enable_point_cloud_mode;
+            settings.point_cloud_mode = enable_point_cloud_mode;
             settings.show_rings = (mode == RenderMode::Rings);
             settings.show_center_markers = (mode == RenderMode::Centers);
-            rm->updateSettings(settings);
+            rm->updateSettings(settings,
+                               point_cloud_mode_changed && enable_point_cloud_mode
+                                   ? lfs::vis::DirtyFlag::ALL
+                                   : lfs::vis::DirtyFlag::SELECTION);
         },
         nb::arg("mode"), "Set the render mode (Splats, Points, Rings, Centers)");
 
@@ -1549,7 +1574,7 @@ NB_MODULE(lichtfeld, m) {
                 return;
             auto settings = rm->getSettings();
             settings.depth_view = enabled;
-            rm->updateSettings(settings);
+            rm->updateSettings(settings, lfs::vis::DirtyFlag::SELECTION);
         },
         nb::arg("enabled"), "Enable or disable depth-map view");
 
@@ -1643,6 +1668,7 @@ NB_MODULE(lichtfeld, m) {
 
     // Signal bridge for reactive UI updates
     lfs::python::register_signals(ui_module);
+    lfs::python::register_store(ui_module);
 
     // Set up notification handlers (C++ events -> PyModalRegistry)
     lfs::python::setup_notification_handlers();

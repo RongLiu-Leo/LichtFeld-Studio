@@ -23,6 +23,7 @@
 #include "python/python_runtime.hpp"
 #include "rendering/coordinate_conventions.hpp"
 #include "rendering/rendering_manager.hpp"
+#include "rendering/vulkan_external_tensor.hpp"
 #include "training/checkpoint.hpp"
 #include "training/components/ppisp.hpp"
 #include "training/components/ppisp_controller.hpp"
@@ -84,6 +85,37 @@ namespace lfs::vis {
                 }
             }
             return nodes;
+        }
+
+        [[nodiscard]] lfs::io::SplatTensorAllocator makeViewerSplatTensorAllocator() {
+            auto* const window_manager = services().windowOrNull();
+            auto* const context = window_manager ? window_manager->getVulkanContext() : nullptr;
+            if (!context || !context->externalMemoryInteropEnabled()) {
+                return {};
+            }
+
+            return [context](lfs::core::TensorShape shape,
+                             const size_t capacity,
+                             const lfs::core::DataType dtype,
+                             const std::string_view name) -> lfs::core::Tensor {
+                const std::string debug_name{name};
+                auto tensor = makeVulkanExternalTensor(
+                    *context,
+                    std::move(shape),
+                    dtype,
+                    capacity,
+                    debug_name.c_str(),
+                    nullptr,
+                    false);
+                if (!tensor) {
+                    throw lfs::core::TensorError(std::format(
+                        "Vulkan-external loaded splat tensor allocation failed for '{}': {}",
+                        debug_name,
+                        tensor.error()));
+                }
+                tensor->set_name(debug_name);
+                return std::move(*tensor);
+            };
         }
 
         [[nodiscard]] bool hasActiveSelectionFilter(const RenderingManager* const rendering_manager) {
@@ -466,11 +498,14 @@ namespace lfs::vis {
             // Load the file
             LOG_DEBUG("Creating loader for splat file");
             auto loader = lfs::io::Loader::create();
+            auto splat_allocator = makeViewerSplatTensorAllocator();
+            scene_.setCombinedModelAllocator(splat_allocator);
             lfs::io::LoadOptions options{
                 .resize_factor = -1,
                 .max_width = 0,
                 .images_folder = "images",
-                .validate_only = false};
+                .validate_only = false,
+                .splat_tensor_allocator = splat_allocator};
 
             LOG_TRACE("Loading splat file with loader");
             auto load_result = loader->load(path, options);
@@ -684,11 +719,14 @@ namespace lfs::vis {
             }
 
             auto loader = lfs::io::Loader::create();
+            auto splat_allocator = makeViewerSplatTensorAllocator();
+            scene_.setCombinedModelAllocator(splat_allocator);
             const lfs::io::LoadOptions options{
                 .resize_factor = -1,
                 .max_width = 0,
                 .images_folder = "images",
-                .validate_only = false};
+                .validate_only = false,
+                .splat_tensor_allocator = splat_allocator};
 
             auto load_result = loader->load(path, options);
             if (!load_result) {
@@ -2277,7 +2315,8 @@ namespace lfs::vis {
                 }
             }
 
-            auto splat_result = lfs::core::load_checkpoint_splat_data(path);
+            auto tensor_allocator = makeViewerSplatTensorAllocator();
+            auto splat_result = lfs::core::load_checkpoint_splat_data(path, tensor_allocator);
             if (!splat_result) {
                 throw std::runtime_error("Failed to load checkpoint SplatData: " + splat_result.error());
             }
@@ -2294,6 +2333,7 @@ namespace lfs::vis {
             checkpoint_params.resume_checkpoint = path;
 
             auto trainer = std::make_unique<lfs::training::Trainer>(scene_);
+            trainer->setSplatTensorAllocator(tensor_allocator);
             const auto init_result = trainer->initialize(checkpoint_params);
             if (!init_result) {
                 throw std::runtime_error("Failed to initialize trainer: " + init_result.error());
@@ -2426,10 +2466,14 @@ namespace lfs::vis {
         SceneRenderState state;
 
         // Get combined model or point cloud
+        bool hidden_dataset_training_model = false;
         if (content_type_ == ContentType::SplatFiles) {
             state.combined_model = scene_.getCombinedModel();
         } else if (content_type_ == ContentType::Dataset) {
             state.combined_model = scene_.getTrainingModel();
+            hidden_dataset_training_model =
+                state.combined_model != nullptr &&
+                !scene_.isTrainingModelEffectivelyVisible();
         }
 
         // Fall back to the visible point cloud whenever the active splat model is absent or empty.
@@ -2455,24 +2499,40 @@ namespace lfs::vis {
             vm.is_selected = selection_.isNodeSelected(vm.node_id);
         }
 
-        // Get transforms and indices
-        state.model_transforms = scene_.getVisibleNodeTransforms();
-        for (auto& transform : state.model_transforms) {
-            transform = rendering::dataWorldTransformToVisualizerWorld(transform);
+        // Get transforms and indices. A hidden dataset training model may still
+        // be owned by the trainer; cull it through the render-state node mask
+        // instead of letting the model pointer disappear.
+        if (hidden_dataset_training_model) {
+            const auto* const training_node = scene_.getNode(scene_.getTrainingModelNodeName());
+            const glm::mat4 transform = training_node
+                                            ? scene_.getWorldTransform(training_node->id)
+                                            : glm::mat4(1.0f);
+            state.model_transforms = {
+                rendering::dataWorldTransformToVisualizerWorld(transform)};
+            state.transform_indices.reset();
+            state.visible_splat_count = 0;
+            state.node_visibility_mask = {false};
+        } else {
+            state.model_transforms = scene_.getVisibleNodeTransforms();
+            for (auto& transform : state.model_transforms) {
+                transform = rendering::dataWorldTransformToVisualizerWorld(transform);
+            }
+            state.transform_indices = scene_.getTransformIndices();
+            state.visible_splat_count = state.model_transforms.size();
+
+            // Get node visibility mask (for consolidated models)
+            state.node_visibility_mask = scene_.getNodeVisibilityMask();
         }
         state.camera_scene_transforms = scene_.getVisibleCameraSceneTransforms();
         for (auto& transform : state.camera_scene_transforms) {
             transform = rendering::dataWorldTransformToVisualizerWorld(transform);
         }
-        state.transform_indices = scene_.getTransformIndices();
-        state.visible_splat_count = state.model_transforms.size();
-
-        // Get node visibility mask (for consolidated models)
-        state.node_visibility_mask = scene_.getNodeVisibilityMask();
 
         // Renderers consume masks in visible-model order. Scene selection state remains full-scene
         // so hidden-node selections survive visibility toggles.
-        state.selection_mask = scene_.getVisibleSelectionMask();
+        if (!hidden_dataset_training_model) {
+            state.selection_mask = scene_.getVisibleSelectionMask();
+        }
         const size_t render_splat_count = state.combined_model
                                               ? static_cast<size_t>(state.combined_model->size())
                                               : scene_.getTotalGaussianCount();

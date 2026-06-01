@@ -67,6 +67,27 @@ class _HandleStub:
     def dirty_all(self):
         self.dirty_fields.append("__all__")
 
+    def request_update(self):
+        self.dirty_fields.append("__update__")
+
+
+class _SignalStub:
+    def __init__(self):
+        self._callbacks = []
+
+    def subscribe(self, callback):
+        self._callbacks.append(callback)
+
+        def unsubscribe():
+            if callback in self._callbacks:
+                self._callbacks.remove(callback)
+
+        return unsubscribe
+
+    def emit(self, value):
+        for callback in list(self._callbacks):
+            callback(value)
+
 
 class _ElementStub:
     def __init__(self, attrs=None, parent=None, tag_name="div"):
@@ -154,13 +175,40 @@ def _make_asset():
             "image_root": "images",
         },
         "geometry_metadata": {},
-        "video_metadata": {},
         "project_id": "p1",
         "scene_id": "s1",
         "created_at": "2026-02-15T21:52:45.881056",
         "modified_at": "2026-04-28T14:48:57.606369",
         "is_favorite": False,
     }
+
+
+def test_asset_manager_uses_dirty_update_policy(asset_manager_panel_module):
+    assert asset_manager_panel_module.AssetManagerPanel.update_policy == "dirty"
+    assert "update_interval_ms" not in asset_manager_panel_module.AssetManagerPanel.__dict__
+
+
+def test_asset_manager_requests_update_from_reactive_store(asset_manager_panel_module, monkeypatch):
+    module = asset_manager_panel_module
+    signals = SimpleNamespace(
+        scene_generation=_SignalStub(),
+        language_generation=_SignalStub(),
+    )
+    monkeypatch.setattr(module, "RuntimeState", signals)
+
+    panel = module.AssetManagerPanel()
+    panel._handle = _HandleStub()
+
+    panel._subscribe_reactive_state()
+    signals.scene_generation.emit(1)
+    signals.language_generation.emit(1)
+
+    assert panel._handle.dirty_fields == ["__update__", "__update__"]
+
+    panel._unsubscribe_reactive_state()
+    signals.scene_generation.emit(2)
+
+    assert panel._handle.dirty_fields == ["__update__", "__update__"]
 
 
 def test_asset_rows_expose_scalar_tag_label(asset_manager_panel_module):
@@ -856,3 +904,37 @@ def test_gallery_precise_scroll_moves_scroll_container(asset_manager_panel_modul
 
     assert gallery_scroll.scroll_top == 152.0
     assert event.stopped is True
+
+
+def test_project_count_matches_visible_list(asset_manager_panel_module, tmp_path):
+    present_file = tmp_path / "present.ply"
+    present_file.write_bytes(b"ply")
+
+    def _asset(asset_id, path):
+        asset = dict(_make_asset())
+        asset["id"] = asset_id
+        asset["absolute_path"] = str(path)
+        asset["path"] = str(path)
+        asset["project_id"] = "p1"
+        asset["scene_id"] = "s1"
+        return asset
+
+    panel = asset_manager_panel_module.AssetManagerPanel()
+    panel._handle = _HandleStub()
+    panel._asset_index = SimpleNamespace(
+        assets={
+            "present": _asset("present", present_file),
+            "missing": _asset("missing", tmp_path / "deleted.ply"),
+        },
+        projects={"p1": {"id": "p1", "name": "Default", "scene_ids": ["s1"]}},
+        scenes={"s1": {"id": "s1", "name": "scene", "project_id": "p1"}},
+        tags={},
+        collections={},
+    )
+
+    visible = panel.get_filtered_assets()
+
+    assert len(panel._asset_index.assets) == 2
+    assert [asset["id"] for asset in visible] == ["present"]
+    assert panel._project_asset_count("p1") == len(visible)
+    assert panel._scene_asset_count("s1") == 1

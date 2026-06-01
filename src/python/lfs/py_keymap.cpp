@@ -12,6 +12,8 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
+#include <cstdint>
+
 namespace nb = nanobind;
 
 namespace lfs::python {
@@ -170,7 +172,8 @@ namespace lfs::python {
             .value("TOOL_BRUSH", Action::TOOL_BRUSH)
             .value("TOOL_ALIGN", Action::TOOL_ALIGN)
             .value("PIE_MENU", Action::PIE_MENU)
-            .value("DEPTH_ADJUST_NEAR", Action::DEPTH_ADJUST_NEAR);
+            .value("DEPTH_ADJUST_NEAR", Action::DEPTH_ADJUST_NEAR)
+            .value("HISTOGRAM_ZOOM_MARKED", Action::HISTOGRAM_ZOOM_MARKED);
 
         // Expose ToolMode enum
         nb::enum_<ToolMode>(keymap, "ToolMode")
@@ -223,6 +226,16 @@ namespace lfs::python {
             },
             nb::arg("mode"), nb::arg("key"), nb::arg("modifiers") = 0,
             "Get action bound to a key in given mode");
+
+        keymap.def(
+            "get_action_for_scroll",
+            [](ToolMode mode, int modifiers, std::vector<int> held_keys) {
+                if (!get_keymap_bindings())
+                    return Action::NONE;
+                return get_keymap_bindings()->getActionForScroll(mode, modifiers, held_keys);
+            },
+            nb::arg("mode"), nb::arg("modifiers") = 0, nb::arg("held_keys") = std::vector<int>{},
+            "Get action bound to a mouse scroll trigger in given mode");
 
         keymap.def(
             "get_key_for_action",
@@ -375,6 +388,15 @@ namespace lfs::python {
                 return get_keymap_bindings()->getCurrentProfileName();
             },
             "Get name of active keymap profile");
+
+        keymap.def(
+            "bindings_revision",
+            []() -> std::uint64_t {
+                if (!get_keymap_bindings())
+                    return 0;
+                return get_keymap_bindings()->getBindingsRevision();
+            },
+            "Get a monotonic revision for key binding changes");
 
         keymap.def(
             "load_profile",

@@ -563,6 +563,37 @@ namespace lfs::core {
         return pool;
     }
 
+    namespace {
+        thread_local std::string g_pool_pending_label;
+    }
+
+    CudaMemoryPool::LabelGuard::LabelGuard(std::string_view label)
+        : previous_(std::move(g_pool_pending_label)),
+          active_(!label.empty()) {
+        if (active_) {
+            g_pool_pending_label.assign(label);
+        }
+    }
+
+    CudaMemoryPool::LabelGuard::~LabelGuard() {
+        g_pool_pending_label = std::move(previous_);
+    }
+
+    std::string_view CudaMemoryPool::current_label() noexcept {
+        return g_pool_pending_label;
+    }
+
+    void Tensor::relabel_allocation_for_profiler() {
+        if (device_ != Device::CUDA || data_ == nullptr || state_->name.empty()) {
+            return;
+        }
+        try {
+            lfs::diagnostics::VramProfiler::instance().relabelAllocation(data_, state_->name);
+        } catch (...) {
+            // Diagnostics must never throw out of tensor operations.
+        }
+    }
+
     void Tensor::trim_memory_pool() {
         CudaMemoryPool::instance().trim_cached_memory();
     }
@@ -1174,18 +1205,10 @@ namespace lfs::core {
         }
 
         // Float32 <-> Int32
-        // DEBUG: Add logging for Float32->Int32 conversion
         if (dtype_ == DataType::Float32 && dtype == DataType::Int32) {
             auto result = empty(shape_, device_, DataType::Int32);
             if (numel() == 0)
                 return result;
-
-            // Read source value before conversion (for debugging)
-            if (numel() == 1 && device_ == Device::CUDA) {
-                float src_val;
-                cudaMemcpy(&src_val, ptr<float>(), sizeof(float), cudaMemcpyDeviceToHost);
-                printf("[to Float32->Int32] Source value: %f\n", src_val);
-            }
 
             if (device_ == Device::CUDA) {
                 tensor_ops::launch_convert_type<float, int>(
@@ -2709,7 +2732,7 @@ namespace lfs::core {
         : std::runtime_error(msg),
           tensor_info_(t ? t->str() : "") {}
 
-    Tensor Tensor::zeros_direct(TensorShape shape, size_t capacity, Device device) {
+    Tensor Tensor::zeros_direct(TensorShape shape, size_t capacity, Device device, DataType dtype) {
         if (device != Device::CUDA) {
             throw TensorError("zeros_direct only supports CUDA device");
         }
@@ -2724,7 +2747,7 @@ namespace lfs::core {
             t.strides_ = {};
             t.storage_offset_ = 0;
             t.device_ = device;
-            t.dtype_ = DataType::Float32;
+            t.dtype_ = dtype;
             t.state_->capacity = 0;
             t.state_->logical_size = 0;
             t.id_ = next_id_++;
@@ -2738,7 +2761,7 @@ namespace lfs::core {
         }
 
         const size_t total_elements = capacity * row_size;
-        const size_t total_bytes = total_elements * sizeof(float);
+        const size_t total_bytes = total_elements * dtype_size(dtype);
 
         if (total_bytes == 0) {
             Tensor t;
@@ -2749,7 +2772,7 @@ namespace lfs::core {
             t.strides_ = shape.strides();
             t.storage_offset_ = 0;
             t.device_ = device;
-            t.dtype_ = DataType::Float32;
+            t.dtype_ = dtype;
             t.state_->capacity = capacity;
             t.state_->logical_size = current_size;
             t.id_ = next_id_++;
@@ -2789,7 +2812,7 @@ namespace lfs::core {
         t.strides_ = shape.strides();
         t.storage_offset_ = 0;
         t.device_ = device;
-        t.dtype_ = DataType::Float32;
+        t.dtype_ = dtype;
         t.state_->capacity = capacity;
         t.state_->logical_size = current_size;
         t.id_ = next_id_++;

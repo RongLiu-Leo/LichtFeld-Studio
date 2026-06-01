@@ -848,7 +848,8 @@ namespace lfs::core {
         static Tensor empty_unpinned(TensorShape shape, DataType dtype = DataType::Float32);
         static Tensor zeros(TensorShape shape, Device device = Device::CUDA,
                             DataType dtype = DataType::Float32);
-        static Tensor zeros_direct(TensorShape shape, size_t capacity, Device device = Device::CUDA);
+        static Tensor zeros_direct(TensorShape shape, size_t capacity, Device device = Device::CUDA,
+                                   DataType dtype = DataType::Float32);
         static Tensor ones(TensorShape shape, Device device = Device::CUDA,
                            DataType dtype = DataType::Float32);
         static Tensor full(TensorShape shape, float value, Device device = Device::CUDA,
@@ -1093,13 +1094,19 @@ namespace lfs::core {
         Tensor& track() { return set_tracked(true); } // Convenience alias
         Tensor& untrack() { return set_tracked(false); }
 
-        // Optional name for identifying tensors in traces
+        // Optional name for identifying tensors in traces. Also forwarded to the
+        // VRAM profiler so the underlying allocation is labelled with this name.
         const std::string& name() const { return state_->name; }
         Tensor& set_name(std::string name) {
             state_->name = std::move(name);
+            relabel_allocation_for_profiler();
             return *this;
         }
 
+    private:
+        void relabel_allocation_for_profiler();
+
+    public:
         size_t size(size_t dim) const {
             if (!is_valid())
                 return 0;
@@ -1903,6 +1910,11 @@ namespace lfs::core {
         Tensor& index_put_(const std::vector<Tensor>& indices, const Tensor& values);
 
         Tensor index_select(int dim, const Tensor& indices, BoundaryMode mode) const;
+        // Gather rows along `dim` into a caller-provided output (no allocation),
+        // letting the caller control the output's storage (e.g. a Vulkan-external
+        // backing block). `out` must already be sized [..., indices.numel(), ...]
+        // and share this tensor's dtype/device; `indices` must be 1-D integer.
+        void index_select_into(Tensor& out, int dim, const Tensor& indices, BoundaryMode mode) const;
         Tensor gather(int dim, const Tensor& indices, BoundaryMode mode) const;
 
         TensorIndexer operator[](const Tensor& indices);

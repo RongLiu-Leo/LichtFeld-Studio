@@ -28,10 +28,6 @@ ASSET_TYPE_COLORS: dict[str, str] = {
     "checkpoint": "#5CB85C",
     # Datasets - Orange
     "dataset": "#F0AD4E",
-    # Videos - Purple
-    "video": "#9B59B6",
-    "mp4": "#9B59B6",
-    "mov": "#9B59B6",
     # USD files - Red
     "usd": "#D9534F",
     "usdz": "#D9534F",
@@ -46,6 +42,7 @@ DEFAULT_COLOR = "#999999"
 # image decorators fill the gallery slot without visibly stretching the source.
 THUMB_WIDTH = 512
 THUMB_HEIGHT = 224
+MAX_RENDERED_PREVIEW_FILE_BYTES = 2 * 1024 * 1024 * 1024
 
 RENDERABLE_PREVIEW_TYPES = {
     "checkpoint",
@@ -282,7 +279,7 @@ class AssetThumbnails:
         The image is saved to the thumbnails directory.
 
         Args:
-            asset_type: Type of asset (e.g., "ply", "checkpoint", "mp4")
+            asset_type: Type of asset (e.g., "ply", "checkpoint")
             asset_id: Unique identifier for the asset
 
         Returns:
@@ -448,8 +445,20 @@ class AssetThumbnails:
         if not callable(render_preview) or not callable(save_image):
             return None
 
+        path = Path(asset_path).expanduser()
+        try:
+            if path.is_file() and path.stat().st_size > MAX_RENDERED_PREVIEW_FILE_BYTES:
+                _logger.debug(
+                    "Skipping rendered thumbnail for %s: file exceeds %d MiB budget",
+                    asset_id,
+                    MAX_RENDERED_PREVIEW_FILE_BYTES // (1024 * 1024),
+                )
+                return None
+        except OSError:
+            pass
+
         image = render_preview(
-            str(asset_path),
+            str(path),
             width=THUMB_WIDTH,
             height=THUMB_HEIGHT,
             **render_kwargs,
@@ -598,7 +607,7 @@ class AssetThumbnails:
         rather than a specific asset.
 
         Args:
-            asset_type: Type of asset (e.g., "ply", "checkpoint", "mp4")
+            asset_type: Type of asset (e.g., "ply", "checkpoint")
 
         Returns:
             Path to the type thumbnail file

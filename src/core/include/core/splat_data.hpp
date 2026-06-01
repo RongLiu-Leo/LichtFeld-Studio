@@ -8,6 +8,7 @@
 #include "core/point_cloud.hpp"
 #include "core/tensor.hpp"
 
+#include <atomic>
 #include <expected>
 #include <filesystem>
 #include <functional>
@@ -37,6 +38,11 @@ namespace lfs::core {
         size_t total_nodes() const { return child_count.size(); }
         bool   has_tree() const  { return !child_count.empty(); }
     };
+
+    using SplatTensorAllocator = std::function<Tensor(TensorShape shape,
+                                                      size_t capacity,
+                                                      DataType dtype,
+                                                      std::string_view name)>;
 
     /**
      * @brief Core data structure for Gaussian splat representation
@@ -148,6 +154,16 @@ namespace lfs::core {
         [[nodiscard]] bool has_deleted_mask() const { return _deleted.is_valid(); }
         [[nodiscard]] unsigned long visible_count() const;
 
+        // Cached count of deleted gaussians, refreshed by the owner (trainer) on its
+        // own thread/stream via refresh_deleted_count(). Lets other threads (e.g. the
+        // Vulkan viewer) decide whether the soft-delete path is needed with a plain
+        // atomic read — no GPU reduction on the shared mask, which would race the
+        // strategy's writes and can deadlock against the render interop handshake.
+        [[nodiscard]] std::size_t deleted_count() const {
+            return _deleted_count.load(std::memory_order_relaxed);
+        }
+        void refresh_deleted_count();
+
         // Mark gaussians as deleted, returns previous state for undo
         Tensor soft_delete(const Tensor& mask);
         void undelete(const Tensor& mask);
@@ -169,7 +185,15 @@ namespace lfs::core {
 
         // ========== Serialization ==========
         void serialize(std::ostream& os) const;
-        void deserialize(std::istream& is);
+        void deserialize(std::istream& is, SplatTensorAllocator tensor_allocator = {});
+
+        // Allocator used to back the parameter tensors (e.g. Vulkan-external interop
+        // storage). Retained so edits that rebuild tensors (apply_deleted) can keep
+        // them in the same storage the renderer requires, instead of falling back to
+        // the default device allocator.
+        void set_tensor_allocator(SplatTensorAllocator allocator) {
+            _tensor_allocator = std::move(allocator);
+        }
 
     public:
         // Holds the magnitude of the screen space gradient (used for densification)
@@ -193,6 +217,12 @@ namespace lfs::core {
 
         // Soft deletion mask: bool tensor [N], true = hidden from rendering
         Tensor _deleted;
+        // Cached nonzero count of _deleted; see refresh_deleted_count(). Atomic so
+        // the render thread can read it without a data race on the writer.
+        std::atomic<std::size_t> _deleted_count{0};
+
+        // Backing allocator for parameter tensors (see set_tensor_allocator).
+        SplatTensorAllocator _tensor_allocator;
 
         // Allow free functions in splat_data_transform.cpp to access private members
         friend LFS_CORE_API SplatData& transform(SplatData&, const glm::mat4&);
@@ -200,11 +230,6 @@ namespace lfs::core {
         friend LFS_CORE_API SplatData extract_by_mask(const SplatData&, const Tensor&);
         friend LFS_CORE_API void random_choose(SplatData&, int, int);
     };
-
-    using SplatTensorAllocator = std::function<Tensor(TensorShape shape,
-                                                      size_t capacity,
-                                                      DataType dtype,
-                                                      std::string_view name)>;
 
     // ========== Free function: Factory ==========
 

@@ -81,6 +81,8 @@ namespace lfs::vis {
             VkImageView external_image_view = VK_NULL_HANDLE;
             VkImageLayout external_image_layout = VK_IMAGE_LAYOUT_UNDEFINED;
             std::uint64_t external_image_generation = 0;
+            VkSemaphore completion_semaphore = VK_NULL_HANDLE;
+            std::uint64_t completion_value = 0;
             // Bumps only when the underlying image content changes (fresh render).
             // Cache-HIT frames keep the previous value so downstream consumers
             // (e.g. CUDA→Vulkan interop upload) can skip work by generation.
@@ -160,6 +162,7 @@ namespace lfs::vis {
 
         // Settings management
         void updateSettings(const RenderSettings& settings);
+        void updateSettings(const RenderSettings& settings, DirtyMask dirty_flags);
         RenderSettings getSettings() const;
 
         // Toggle orthographic mode, calculating ortho_scale to preserve size at pivot
@@ -316,7 +319,8 @@ namespace lfs::vis {
 
         // Rectangle preview
         void setRectPreview(float x0, float y0, float x1, float y1, bool add_mode = true,
-                            std::optional<SplitViewPanelId> panel = std::nullopt);
+                            std::optional<SplitViewPanelId> panel = std::nullopt,
+                            bool track_cursor = false);
         void clearRectPreview();
         [[nodiscard]] bool isRectPreviewActive() const { return viewport_overlay_service_.isRectPreviewActive(); }
         [[nodiscard]] std::optional<SplitViewPanelId> getRectPreviewPanel() const {
@@ -328,6 +332,9 @@ namespace lfs::vis {
             x1 = viewport_overlay_service_.rectX1();
             y1 = viewport_overlay_service_.rectY1();
             add_mode = viewport_overlay_service_.rectAddMode();
+        }
+        [[nodiscard]] bool rectPreviewTracksCursor() const {
+            return viewport_overlay_service_.rectTracksCursor();
         }
 
         // Polygon preview (render-space points, same coordinate system as screen_positions output)
@@ -356,7 +363,8 @@ namespace lfs::vis {
 
         // Lasso preview
         void setLassoPreview(const std::vector<std::pair<float, float>>& points, bool add_mode = true,
-                             std::optional<SplitViewPanelId> panel = std::nullopt);
+                             std::optional<SplitViewPanelId> panel = std::nullopt,
+                             bool track_cursor = false);
         void clearLassoPreview();
         [[nodiscard]] bool isLassoPreviewActive() const { return viewport_overlay_service_.isLassoPreviewActive(); }
         [[nodiscard]] std::optional<SplitViewPanelId> getLassoPreviewPanel() const {
@@ -366,6 +374,9 @@ namespace lfs::vis {
             return viewport_overlay_service_.lassoPoints();
         }
         [[nodiscard]] bool isLassoAddMode() const { return viewport_overlay_service_.lassoAddMode(); }
+        [[nodiscard]] bool lassoPreviewTracksCursor() const {
+            return viewport_overlay_service_.lassoTracksCursor();
+        }
 
         // Vulkan mesh frame — populated by `renderVulkanFrame` when there are meshes in
         // the scene, consumed by gui_manager to feed `vulkan_viewport_pass.mesh_items`.
@@ -496,6 +507,7 @@ namespace lfs::vis {
         lfs::core::Tensor point_cloud_colors_cache_;
         const void* point_cloud_colors_cache_key_ = nullptr;
         std::size_t point_cloud_colors_cache_size_ = 0;
+        std::uint64_t point_cloud_data_revision_ = 0;
         std::uint64_t point_cloud_preview_selection_revision_ = 0;
         VulkanContext* last_vulkan_context_ = nullptr;
         VkImage vulkan_external_viewport_image_ = VK_NULL_HANDLE;
