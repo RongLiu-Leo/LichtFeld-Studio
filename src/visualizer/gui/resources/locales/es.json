@@ -255,16 +255,16 @@
   "tooltip": {
     "lod_enabled": "Habilitar renderizado jerárquico de nivel de detalle para archivos RAD",
     "lod_max_splats": "Número máximo de splats a renderizar por fotograma",
-    "lod_render_scale": "Multiplicador de resolución para los cálculos de LOD",
-    "lod_cone_foveation": "Factor de penalización periférica LOD (1.0 = sin penalización)",
+    "lod_render_scale": "Multiplicador de resolución para los cálculos de Level of Detail",
+    "lod_cone_foveation": "Factor de penalización periférica Level of Detail (1.0 = sin penalización)",
     "lod_cone_inner_degrees": "Ángulo interior del cono en grados (sin penalización dentro de este ángulo)",
     "lod_cone_outer_degrees": "Ángulo exterior del cono en grados (penalización completa más allá de este ángulo)",
-    "lod_debug_mode": "Colorear splats según su nivel de LOD para depuración"
+    "lod_debug_mode": "Colorear splats según su nivel de Level of Detail para depuración"
   },
   "rendering_panel": {
     "fov_format": "FOV: {hfov:.1f}° H / {vfov:.1f}° V",
-    "section_lod": "LOD",
-    "lod_enabled": "Habilitar LOD",
+    "section_lod": "Level of Detail",
+    "lod_enabled": "Habilitar Level of Detail",
     "lod_max_splats": "Splats máximos",
     "lod_render_scale": "Escala de render",
     "lod_cone_foveation": "Foveación en cono",
