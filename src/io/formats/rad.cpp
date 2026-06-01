@@ -888,7 +888,6 @@ namespace lfs::io {
                     float temp_x = oct_x;
                     oct_x = (1.0f - std::abs(oct_y)) * (oct_x >= 0.0f ? 1.0f : -1.0f);
                     oct_y = (1.0f - std::abs(temp_x)) * (oct_y >= 0.0f ? 1.0f : -1.0f);
-                    oct_z = -oct_z;
                 }
 
                 // Project from octahedron to sphere (normalize)
