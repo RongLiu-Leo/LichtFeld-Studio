@@ -4197,7 +4197,8 @@ namespace lfs::vis {
         VulkanGSRendererUniforms uniforms{};
         {
             LOG_TIMER("vksplat.render.populateUniforms");
-            const std::size_t render_splat_count = request.lod_count > 0 ? request.lod_count : buffers_.num_splats;
+            const bool lod_indices_present = request.lod_count > 0 && request.lod_indices != nullptr;
+            const std::size_t render_splat_count = lod_indices_present ? request.lod_count : buffers_.num_splats;
             populateVksplatCameraUniforms(uniforms,
                                           request.frame_view,
                                           request.scene,
@@ -4208,9 +4209,10 @@ namespace lfs::vis {
                                           request.gut,
                                           request.mip_filter);
             uniforms.step = static_cast<std::uint32_t>(modelTransformCount(request.scene.model_transforms));
-            uniforms.lod_enabled = request.lod_count > 0 ? 1u : 0u;
-            uniforms.lod_count = static_cast<std::uint32_t>(request.lod_count);
-            if (splat_data.lod_tree &&
+            uniforms.lod_enabled = lod_indices_present ? 1u : 0u;
+            uniforms.lod_count = lod_indices_present ? static_cast<std::uint32_t>(request.lod_count) : 0u;
+            if (lod_indices_present &&
+                splat_data.lod_tree &&
                 splat_data.lod_tree->lod_opacity_encoded) {
                 // Bit 2 (value 4): Spark LOD opacity encoding is active (opacity may exceed 1.0).
                 uniforms.lod_enabled |= 4u;
