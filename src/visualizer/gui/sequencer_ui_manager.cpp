@@ -30,9 +30,9 @@
 
 #include <algorithm>
 #include <cctype>
-#include <cuda_runtime.h>
 #include <cmath>
 #include <cstdlib>
+#include <cuda_runtime.h>
 #include <filesystem>
 #include <format>
 #include <fstream>
