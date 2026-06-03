@@ -634,17 +634,17 @@ namespace lfs::vis {
 
                 const auto* splat_for_cropbox = scene_.getNode(name);
                 if (splat_for_cropbox) {
-                    // Keep LOD OFF by default. We only expose availability here.
+                    // Auto-enable LOD for RAD files that have an LOD tree.
                     const bool has_lod_tree =
                         (ext == ".rad" && splat_for_cropbox->model &&
                          splat_for_cropbox->model->lod_tree &&
                          splat_for_cropbox->model->lod_tree->has_tree());
                     if (auto* rm = services().renderingOrNull()) {
                         rm->setLodAvailable(has_lod_tree);
-                        rm->setLodEnabled(false);
+                        rm->setLodEnabled(has_lod_tree);
                     }
                     if (has_lod_tree) {
-                        LOG_INFO("RAD file loaded with LOD tree (available), LOD kept disabled by default");
+                        LOG_INFO("RAD file loaded with LOD tree; LOD viewer mode auto-enabled");
                     }
 
                     const core::NodeId cropbox_id = scene_.getCropBoxForSplat(splat_for_cropbox->id);
