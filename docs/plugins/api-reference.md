@@ -1430,7 +1430,8 @@ Callbacks registered with `lf.on_*` receive one positional hook payload. If you 
 | `get_current_view()`                                  | `ViewInfo`       | Current camera view        |
 | `get_viewport_render()`                               | `ViewportRender` | Current viewport image     |
 | `capture_viewport()`                                  | `ViewportRender` | Capture for async use      |
-| `render_view(rotation, translation, w, h, fov=60, bg=None)` | `Tensor`  | Render from camera         |
+| `render_view(rotation, translation, w, h, fov=60, bg=None)` | `Tensor`  | Render active visualizer scene from camera |
+| `render_view_u8(rotation, translation, w, h, fov=60, bg=None)` | `Tensor`  | Render active visualizer scene as CPU uint8 RGB |
 | `compute_screen_positions(rotation, translation, w, h, fov=60)` | `Tensor` | [N, 2] screen positions |
 | `get_render_settings()`                               | `RenderSettings` | Current render settings    |
 | `get_render_mode()` / `set_render_mode(mode)`         | `RenderMode`     | Render mode                |

@@ -597,7 +597,19 @@ namespace lfs::vis {
         frame.depth_stencil_image_view = depth_stencil.view;
         frame.extent = swapchain_extent_;
         frame_active_ = true;
+        frame_rendering_active_ = true;
         last_error_.clear();
+        return true;
+    }
+
+    bool VulkanContext::finishActiveRendering(const VkCommandBuffer command_buffer) {
+        if (!frame_rendering_active_)
+            return true;
+        if (command_buffer == VK_NULL_HANDLE)
+            return fail("Cannot finish Vulkan rendering without an active command buffer");
+
+        vkCmdEndRendering(command_buffer);
+        frame_rendering_active_ = false;
         return true;
     }
 
@@ -610,7 +622,10 @@ namespace lfs::vis {
 
         const std::size_t current_frame = active_frame_index_;
         VkCommandBuffer command_buffer = command_buffers_[current_frame];
-        vkCmdEndRendering(command_buffer);
+        if (!finishActiveRendering(command_buffer)) {
+            frame_active_ = false;
+            return false;
+        }
         image_barriers_.transitionImage(command_buffer,
                                         swapchain_images_[active_image_index_],
                                         VK_IMAGE_ASPECT_COLOR_BIT,
@@ -704,6 +719,152 @@ namespace lfs::vis {
         }
 
         return true;
+    }
+
+    std::expected<VulkanContext::WindowCapture, std::string> VulkanContext::captureActiveFrameRgba() {
+        auto fail_capture = [this](std::string message) -> std::expected<WindowCapture, std::string> {
+            fail(std::move(message));
+            return std::unexpected(last_error_);
+        };
+
+        if (!frame_active_)
+            return fail_capture("Full-window capture requires an active Vulkan GUI frame");
+        if (device_ == VK_NULL_HANDLE || allocator_ == VK_NULL_HANDLE)
+            return fail_capture("Full-window capture requires initialized Vulkan resources");
+        if ((swapchain_image_usage_ & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) == 0)
+            return fail_capture("The Vulkan swapchain does not support transfer-source readback");
+        if (active_image_index_ >= swapchain_images_.size())
+            return fail_capture(std::format("Invalid active swapchain image index {}", active_image_index_));
+
+        const bool bgra =
+            swapchain_format_ == VK_FORMAT_B8G8R8A8_UNORM ||
+            swapchain_format_ == VK_FORMAT_B8G8R8A8_SRGB;
+        const bool rgba =
+            swapchain_format_ == VK_FORMAT_R8G8B8A8_UNORM ||
+            swapchain_format_ == VK_FORMAT_R8G8B8A8_SRGB;
+        if (!bgra && !rgba) {
+            return fail_capture(std::format("Full-window capture does not support swapchain format {}",
+                                            vkFormatToString(swapchain_format_)));
+        }
+
+        const auto extent = swapchain_extent_;
+        if (extent.width == 0 || extent.height == 0)
+            return fail_capture("Cannot capture a zero-sized Vulkan swapchain");
+
+        const VkDeviceSize byte_size =
+            static_cast<VkDeviceSize>(extent.width) *
+            static_cast<VkDeviceSize>(extent.height) * 4u;
+
+        VkBuffer staging_buffer = VK_NULL_HANDLE;
+        VmaAllocation staging_allocation = VK_NULL_HANDLE;
+        auto destroy_staging = [&]() {
+            if (staging_buffer != VK_NULL_HANDLE && staging_allocation != VK_NULL_HANDLE) {
+                vmaDestroyBuffer(allocator_, staging_buffer, staging_allocation);
+            }
+            staging_buffer = VK_NULL_HANDLE;
+            staging_allocation = VK_NULL_HANDLE;
+        };
+
+        VkBufferCreateInfo buffer_info{};
+        buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        buffer_info.size = byte_size;
+        buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        VmaAllocationCreateInfo allocation_info{};
+        allocation_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+        allocation_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+
+        VkResult result = static_cast<VkResult>(
+            vmaCreateBuffer(allocator_,
+                            &buffer_info,
+                            &allocation_info,
+                            &staging_buffer,
+                            &staging_allocation,
+                            nullptr));
+        if (result != VK_SUCCESS)
+            return fail_capture(std::format("vmaCreateBuffer(window capture) failed: {}",
+                                            vkResultToString(result)));
+        vmaSetAllocationName(allocator_, staging_allocation, "Window capture readback");
+
+        VkCommandBuffer command_buffer = command_buffers_[active_frame_index_];
+        if (!finishActiveRendering(command_buffer)) {
+            destroy_staging();
+            return std::unexpected(last_error_);
+        }
+
+        const VkImage image = swapchain_images_[active_image_index_];
+        image_barriers_.transitionImage(command_buffer,
+                                        image,
+                                        VK_IMAGE_ASPECT_COLOR_BIT,
+                                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+        VkBufferImageCopy copy_region{};
+        copy_region.bufferOffset = 0;
+        copy_region.bufferRowLength = 0;
+        copy_region.bufferImageHeight = 0;
+        copy_region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copy_region.imageSubresource.mipLevel = 0;
+        copy_region.imageSubresource.baseArrayLayer = 0;
+        copy_region.imageSubresource.layerCount = 1;
+        copy_region.imageOffset = {0, 0, 0};
+        copy_region.imageExtent = {extent.width, extent.height, 1};
+        vkCmdCopyImageToBuffer(command_buffer,
+                               image,
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               staging_buffer,
+                               1,
+                               &copy_region);
+
+        if (!endFrame()) {
+            const std::string error = last_error_.empty() ? "Vulkan frame submission failed during window capture"
+                                                          : last_error_;
+            (void)deviceWaitIdle();
+            destroy_staging();
+            return std::unexpected(error);
+        }
+        if (!waitForSubmittedFrames()) {
+            destroy_staging();
+            return std::unexpected(last_error_.empty() ? "Timed out waiting for window capture readback"
+                                                       : last_error_);
+        }
+
+        result = static_cast<VkResult>(vmaInvalidateAllocation(allocator_, staging_allocation, 0, byte_size));
+        if (result != VK_SUCCESS) {
+            destroy_staging();
+            return fail_capture(std::format("vmaInvalidateAllocation(window capture) failed: {}",
+                                            vkResultToString(result)));
+        }
+
+        void* mapped = nullptr;
+        result = static_cast<VkResult>(vmaMapMemory(allocator_, staging_allocation, &mapped));
+        if (result != VK_SUCCESS || !mapped) {
+            destroy_staging();
+            return fail_capture(std::format("vmaMapMemory(window capture) failed: {}",
+                                            vkResultToString(result)));
+        }
+
+        WindowCapture capture;
+        capture.width = static_cast<int>(extent.width);
+        capture.height = static_cast<int>(extent.height);
+        capture.rgba.resize(static_cast<std::size_t>(byte_size));
+
+        const auto* src = static_cast<const std::uint8_t*>(mapped);
+        if (rgba) {
+            std::memcpy(capture.rgba.data(), src, capture.rgba.size());
+        } else {
+            for (std::size_t i = 0; i < capture.rgba.size(); i += 4) {
+                capture.rgba[i + 0] = src[i + 2];
+                capture.rgba[i + 1] = src[i + 1];
+                capture.rgba[i + 2] = src[i + 0];
+                capture.rgba[i + 3] = src[i + 3];
+            }
+        }
+
+        vmaUnmapMemory(allocator_, staging_allocation);
+        destroy_staging();
+        last_error_.clear();
+        return capture;
     }
 
     bool VulkanContext::waitForCurrentFrameSlot() {
@@ -1592,6 +1753,16 @@ namespace lfs::vis {
         VkResult result = vkGetPhysicalDeviceImageFormatProperties2(physical_device_, &format_info, &format_properties);
         if (result != VK_SUCCESS) {
             return fail(std::format("External Vulkan image format is unsupported: {}", vkResultToString(result)));
+        }
+        const VkExtent3D max_extent = format_properties.imageFormatProperties.maxExtent;
+        if (extent.width > max_extent.width || extent.height > max_extent.height) {
+            return fail(std::format(
+                "External Vulkan image {}x{} exceeds device-supported limit {}x{} for format {}",
+                extent.width,
+                extent.height,
+                max_extent.width,
+                max_extent.height,
+                static_cast<int>(format)));
         }
         if ((external_format_properties.externalMemoryProperties.externalMemoryFeatures &
              VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) == 0) {

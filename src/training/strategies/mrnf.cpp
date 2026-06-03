@@ -476,6 +476,7 @@ namespace lfs::training {
 
         _precomputed_edge_scores = _edge_score_sum.clone();
         _precomputed_edge_scores.div_(static_cast<float>(_edge_sample_count));
+        zero_frozen_scores_inplace(*_splat_data, _precomputed_edge_scores);
         _edge_precompute_valid = true;
         reset_edge_accumulator();
     }
@@ -562,7 +563,7 @@ namespace lfs::training {
             this->get_model(),
             _edge_canny_nms_output);
         normalize_by_positive_median_inplace(score_render.edges_score);
-        _edge_score_sum.add_(score_render.edges_score);
+        _edge_score_sum.add_(zero_frozen_scores(*_splat_data, score_render.edges_score));
         ++_edge_sample_count;
         _edge_last_sample_iter = iter;
     }
@@ -608,6 +609,8 @@ namespace lfs::training {
                 _vis_count.ptr<float>(),
                 vis_row,
                 n);
+            zero_frozen_scores_inplace(*_splat_data, _refine_weight_max);
+            zero_frozen_scores_inplace(*_splat_data, _vis_count);
         }
 
         _splat_data->_densification_info.zero_();
@@ -670,6 +673,7 @@ namespace lfs::training {
             auto active_mask = _free_mask.slice(0, 0, n).logical_not();
             prune_mask = prune_mask.logical_and(active_mask);
         }
+        prune_mask = exclude_frozen_from_mask(*_splat_data, prune_mask);
 
         const int pruned_count = static_cast<int>(prune_mask.sum().item());
 
@@ -714,12 +718,21 @@ namespace lfs::training {
 
         const size_t n = static_cast<size_t>(_splat_data->size());
         const size_t current_active = active_count();
+        lfs::core::Tensor active_mask;
+        if (_free_mask.is_valid() && n > 0) {
+            active_mask = _free_mask.slice(0, 0, n).logical_not();
+        }
+        lfs::core::Tensor trainable_mask = make_trainable_mask(*_splat_data, n, _splat_data->means().device());
+        auto refine_candidates = (_refine_weight_max > _params->growth_grad_threshold) &&
+                                 (_vis_count > 0.0f);
+        if (active_mask.is_valid()) {
+            refine_candidates = refine_candidates.logical_and(active_mask);
+        }
+        if (trainable_mask.is_valid()) {
+            refine_candidates = refine_candidates.logical_and(trainable_mask);
+        }
         const int desired_total = static_cast<int>(
-            std::round(static_cast<float>(
-                           ((_refine_weight_max > _params->growth_grad_threshold) &&
-                            (_vis_count > 0.0f))
-                               .sum()
-                               .item()) *
+            std::round(static_cast<float>(refine_candidates.sum().item()) *
                        _params->grow_fraction));
         const int budget = (_params->max_cap > 0)
                                ? std::max(0, _params->max_cap - static_cast<int>(current_active))
@@ -727,10 +740,6 @@ namespace lfs::training {
         const int requested_replace = std::min(pruned_count, budget);
         int n_grow = 0;
         lfs::core::Tensor above_threshold;
-        lfs::core::Tensor active_mask;
-        if (_free_mask.is_valid() && n > 0) {
-            active_mask = _free_mask.slice(0, 0, n).logical_not();
-        }
 
         auto seed = static_cast<uint64_t>(
             std::chrono::high_resolution_clock::now().time_since_epoch().count());
@@ -751,6 +760,9 @@ namespace lfs::training {
             if (active_mask.is_valid()) {
                 replace_weights = replace_weights * active_mask;
             }
+            if (trainable_mask.is_valid()) {
+                replace_weights = replace_weights * trainable_mask;
+            }
             if (edge_guidance.is_valid()) {
                 replace_weights = replace_weights * edge_guidance;
             }
@@ -769,11 +781,7 @@ namespace lfs::training {
         }
 
         if (iter < static_cast<int>(_params->grow_until_iter)) {
-            above_threshold = (_refine_weight_max > _params->growth_grad_threshold) &&
-                              (_vis_count > 0.0f);
-            if (active_mask.is_valid()) {
-                above_threshold = above_threshold.logical_and(active_mask);
-            }
+            above_threshold = refine_candidates;
             n_grow = std::max(0, desired_total - actual_replace);
             n_grow = std::min(n_grow, budget - actual_replace);
         }
@@ -1069,6 +1077,9 @@ namespace lfs::training {
             _vis_count = _vis_count.index_select(0, valid_indices).contiguous();
         if (_precomputed_edge_scores.is_valid() && _precomputed_edge_scores.numel() > new_size)
             _precomputed_edge_scores = _precomputed_edge_scores.index_select(0, valid_indices).contiguous();
+
+        remap_frozen_ranges_after_compaction(*_splat_data, valid_indices, old_size);
+        apply_frozen_ranges_to_optimizer(*_splat_data, *_optimizer);
     }
 
     void MRNF::inject_noise(int /*iter*/) {
@@ -1080,11 +1091,14 @@ namespace lfs::training {
 
         auto seed = static_cast<uint64_t>(
             std::chrono::high_resolution_clock::now().time_since_epoch().count());
+        const auto frozen_mask = make_frozen_mask(*_splat_data, n, _splat_data->means().device());
 
         mrnf_strategy::launch_mrnf_noise_injection(
             _splat_data->means().ptr<float>(),
             _splat_data->opacity_raw().ptr<float>(),
             _vis_count.ptr<float>(),
+            frozen_mask.is_valid() ? frozen_mask.ptr<bool>() : nullptr,
+            frozen_mask.is_valid() ? frozen_mask.numel() : 0,
             lr_mean,
             _params->means_noise_weight,
             _bounds.median_size,
@@ -1097,10 +1111,13 @@ namespace lfs::training {
             return;
 
         const float train_t = static_cast<float>(iter) / static_cast<float>(_params->iterations);
+        const auto frozen_mask = make_frozen_mask(*_splat_data, n, _splat_data->means().device());
 
         mrnf_strategy::launch_mrnf_decay(
             _splat_data->opacity_raw().ptr<float>(),
             _splat_data->scaling_raw().ptr<float>(),
+            frozen_mask.is_valid() ? frozen_mask.ptr<bool>() : nullptr,
+            frozen_mask.is_valid() ? frozen_mask.numel() : 0,
             _params->opacity_decay,
             _params->scale_decay,
             train_t,
@@ -1127,14 +1144,29 @@ namespace lfs::training {
         auto seed = static_cast<uint64_t>(
             std::chrono::high_resolution_clock::now().time_since_epoch().count());
 
-        auto keep_indices = Tensor::empty({cap}, Device::CUDA, DataType::Int64);
-        mrnf_strategy::launch_gumbel_topk(
-            opacities.ptr<float>(), n, cap, seed,
-            keep_indices.ptr<int64_t>());
-
         auto keep_mask = Tensor::zeros_bool({n}, opacities.device());
-        auto true_vals = Tensor::ones_bool({cap}, opacities.device());
-        keep_mask.index_put_(keep_indices, true_vals);
+        const auto frozen_mask = make_frozen_mask(*_splat_data, n, opacities.device());
+        size_t keep_budget = cap;
+        if (frozen_mask.is_valid()) {
+            const size_t frozen_count = frozen_row_count(*_splat_data, n);
+            if (frozen_count > cap) {
+                LOG_WARN("MRNF: {} frozen splats exceed max_cap {}; preserving frozen rows", frozen_count, cap);
+                return;
+            }
+            keep_mask = frozen_mask.clone();
+            keep_budget = cap - frozen_count;
+            opacities = opacities.masked_fill(frozen_mask, 0.0f);
+        }
+
+        if (keep_budget > 0) {
+            auto keep_indices = Tensor::empty({keep_budget}, Device::CUDA, DataType::Int64);
+            mrnf_strategy::launch_gumbel_topk(
+                opacities.ptr<float>(), n, keep_budget, seed,
+                keep_indices.ptr<int64_t>());
+
+            auto true_vals = Tensor::ones_bool({keep_budget}, opacities.device());
+            keep_mask.index_put_(keep_indices, true_vals);
+        }
         compact_splats(keep_mask);
 
         assert(_splat_data->size() <= cap);
@@ -1188,8 +1220,18 @@ namespace lfs::training {
             return;
         }
 
-        auto true_vals = lfs::core::Tensor::ones_bool({static_cast<size_t>(indices.numel())}, indices.device());
-        _free_mask.index_put_(indices, true_vals);
+        auto target_indices = indices;
+        if (auto frozen_mask = make_frozen_mask(*_splat_data, _splat_data->size(), indices.device());
+            frozen_mask.is_valid()) {
+            auto trainable = frozen_mask.index_select(0, indices).logical_not();
+            target_indices = indices.masked_select(trainable);
+            if (target_indices.numel() == 0) {
+                return;
+            }
+        }
+
+        auto true_vals = lfs::core::Tensor::ones_bool({static_cast<size_t>(target_indices.numel())}, target_indices.device());
+        _free_mask.index_put_(target_indices, true_vals);
     }
 
     std::pair<lfs::core::Tensor, int64_t> MRNF::fill_free_slots_with_data(
@@ -1210,6 +1252,11 @@ namespace lfs::training {
         const size_t current_size = static_cast<size_t>(_splat_data->size());
         auto active_region = _free_mask.slice(0, 0, current_size);
         auto free_indices = active_region.nonzero().squeeze(-1);
+        if (auto frozen_mask = make_frozen_mask(*_splat_data, current_size, free_indices.device());
+            frozen_mask.is_valid() && free_indices.numel() > 0) {
+            auto trainable = frozen_mask.index_select(0, free_indices).logical_not();
+            free_indices = free_indices.masked_select(trainable);
+        }
         const int64_t num_free = free_indices.numel();
 
         if (num_free == 0) {
@@ -1261,16 +1308,34 @@ namespace lfs::training {
     }
 
     void MRNF::compute_bounds() {
-        const size_t n = active_count();
+        const size_t current_size = static_cast<size_t>(_splat_data->size());
+        lfs::core::Tensor active_indices;
+        lfs::core::Tensor active_means = _splat_data->means();
+        size_t n = active_count();
+
+        if (_free_mask.is_valid() && free_count() > 0) {
+            active_indices = get_active_indices();
+        }
+        if (auto frozen_mask = make_frozen_mask(*_splat_data, current_size, _splat_data->means().device());
+            frozen_mask.is_valid()) {
+            if (!active_indices.is_valid()) {
+                active_indices = get_active_indices();
+            }
+            if (active_indices.numel() > 0) {
+                auto trainable = frozen_mask.index_select(0, active_indices).logical_not();
+                active_indices = active_indices.masked_select(trainable);
+            }
+        }
+        if (active_indices.is_valid()) {
+            n = active_indices.numel();
+            if (n > 0) {
+                active_means = _splat_data->means().index_select(0, active_indices).contiguous();
+            }
+        }
+
         if (n == 0) {
             _bounds_valid = false;
             return;
-        }
-
-        lfs::core::Tensor active_means = _splat_data->means();
-        if (_free_mask.is_valid() && free_count() > 0) {
-            auto active_indices = get_active_indices();
-            active_means = _splat_data->means().index_select(0, active_indices).contiguous();
         }
 
         mrnf_strategy::launch_percentile_bounds(
@@ -1303,7 +1368,8 @@ namespace lfs::training {
     void MRNF::remove_gaussians(const lfs::core::Tensor& mask) {
         using namespace lfs::core;
 
-        Tensor keep_mask = mask.logical_not();
+        const Tensor prune_mask = exclude_frozen_from_mask(*_splat_data, mask);
+        Tensor keep_mask = prune_mask.logical_not();
         const size_t old_size = static_cast<size_t>(_splat_data->size());
         const int n_remove = static_cast<int>(old_size - keep_mask.to(DataType::Int32).sum().template item<int>());
 

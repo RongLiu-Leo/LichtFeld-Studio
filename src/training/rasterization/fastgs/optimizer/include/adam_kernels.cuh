@@ -151,6 +151,8 @@ namespace fast_lfs::optimizer::kernels::adam {
         uint8_t* exp_avg_sq_q,
         float* exp_avg_sq_scale,
         const float* param_grad,
+        const bool* frozen_mask,
+        const int frozen_mask_size,
         const int n_rows,
         const int row_size,
         const float lr,
@@ -161,6 +163,8 @@ namespace fast_lfs::optimizer::kernels::adam {
         const float bias_correction2_sqrt_rcp) {
         const int row = blockIdx.x * blockDim.x + threadIdx.x;
         if (row >= n_rows || row_size <= 0)
+            return;
+        if (frozen_mask != nullptr && row < frozen_mask_size && frozen_mask[row])
             return;
 
         const int base = row * row_size;
@@ -257,6 +261,8 @@ namespace fast_lfs::optimizer::kernels::adam {
         uint8_t* exp_avg_sq_q,
         float* exp_avg_sq_scale,
         const float* param_grad,
+        const bool* frozen_mask,
+        const int frozen_mask_size,
         const int n_primitives,
         const int slots_per_primitive,
         const float lr,
@@ -267,6 +273,8 @@ namespace fast_lfs::optimizer::kernels::adam {
         const float bias_correction2_sqrt_rcp) {
         const int p = blockIdx.x * blockDim.x + threadIdx.x;
         if (p >= n_primitives || slots_per_primitive <= 0)
+            return;
+        if (frozen_mask != nullptr && p < frozen_mask_size && frozen_mask[p])
             return;
 
         float4* param4 = reinterpret_cast<float4*>(param);

@@ -16,6 +16,8 @@ namespace fast_lfs::rasterization {
         std::uint8_t* exp_avg_sq_q = nullptr;
         float* exp_avg_scale = nullptr;
         float* exp_avg_sq_scale = nullptr;
+        const bool* frozen_mask = nullptr;
+        int frozen_mask_size = 0;
         int n_elements = 0;
         int n_attributes = 0;
         float step_size = 0.0f;

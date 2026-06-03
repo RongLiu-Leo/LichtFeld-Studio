@@ -5731,6 +5731,9 @@ namespace lfs::vis::gui {
                         rmlui_manager_.clearVulkanQueue();
                     }
                 }
+                if (viewer_) {
+                    viewer_->processRenderWorkQueue();
+                }
                 {
                     LOG_TIMER("frame_pacing.vulkan_endFrame_present");
                     if (!vulkan_context->endFrame()) {
@@ -5743,6 +5746,9 @@ namespace lfs::vis::gui {
                 if (!vulkan_context->lastError().empty()) {
                     LOG_WARN("Vulkan GUI frame begin failed: {}", vulkan_context->lastError());
                 }
+                if (viewer_) {
+                    viewer_->processRenderWorkQueue();
+                }
             }
 
             if (!ui_layout_changed && ui_layout_settle_frames_ > 0)
@@ -5750,6 +5756,10 @@ namespace lfs::vis::gui {
 
             persistImGuiSettingsIfNeeded();
             return;
+        }
+
+        if (!vulkan_gui_ && viewer_) {
+            viewer_->processRenderWorkQueue();
         }
     }
 

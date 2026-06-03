@@ -1115,6 +1115,107 @@ namespace lfs::vis {
         reset();
     }
 
+    void VksplatViewportRenderer::releaseOutputSlot(const OutputSlot output_slot) {
+        if (!context_) {
+            return;
+        }
+
+        const std::size_t output_index = outputSlotIndex(output_slot);
+        for (auto& slot : output_slots_[output_index]) {
+            if (slot.image.image != VK_NULL_HANDLE) {
+                context_->imageBarriers().forgetImage(slot.image.image);
+            }
+            if (slot.depth_image.image != VK_NULL_HANDLE) {
+                context_->imageBarriers().forgetImage(slot.depth_image.image);
+            }
+            context_->destroyExternalImage(slot.image);
+            context_->destroyExternalImage(slot.depth_image);
+            slot = {};
+        }
+        latest_output_ring_slot_[output_index] = 0;
+        output_generations_[output_index] = 0;
+    }
+
+    void VksplatViewportRenderer::releasePreviewResources() {
+        std::lock_guard<std::mutex> readback_lock(readback_mutex_);
+        if (!context_) {
+            return;
+        }
+
+        try {
+            renderer_.waitForPendingBatch();
+        } catch (const std::exception& e) {
+            LOG_WARN("VkSplat preview resource release skipped while render batch is pending: {}", e.what());
+            return;
+        }
+        if (!context_->waitForSubmittedFrames()) {
+            LOG_WARN("VkSplat preview resource release skipped while submitted frames are pending: {}",
+                     context_->lastError());
+            return;
+        }
+        for (std::size_t ring_slot = 0; ring_slot < ring_completion_values_.size(); ++ring_slot) {
+            if (auto ok = waitForRingSlot(ring_slot, "preview resource release"); !ok) {
+                LOG_WARN("VkSplat preview resource release skipped: {}", ok.error());
+                return;
+            }
+        }
+
+        releaseOutputSlot(OutputSlot::Preview);
+        releasePrivateScratchBuffers();
+        releaseSharedScratchArena();
+        drainRetiredScratchBuffers(false);
+        logVramBreakdownIfChanged("preview_release");
+    }
+
+    void VksplatViewportRenderer::releaseSceneResources() {
+        std::lock_guard<std::mutex> readback_lock(readback_mutex_);
+        if (!context_) {
+            return;
+        }
+
+        bool safe_to_release = true;
+        try {
+            renderer_.waitForPendingBatch();
+        } catch (const std::exception& e) {
+            LOG_WARN("VkSplat scene resource release falling back to device idle: {}", e.what());
+            safe_to_release = false;
+        }
+        if (safe_to_release && !context_->waitForSubmittedFrames()) {
+            LOG_WARN("VkSplat scene resource release falling back to device idle: {}",
+                     context_->lastError());
+            safe_to_release = false;
+        }
+        if (!safe_to_release && !context_->deviceWaitIdle()) {
+            LOG_WARN("VkSplat scene resource release failed to idle device: {}", context_->lastError());
+            return;
+        }
+
+        detachManagedBuffers();
+        for (std::size_t ring_slot = 0; ring_slot < kInputRingSize; ++ring_slot) {
+            releaseInputSlot(*context_, ring_slot);
+            releaseOpacityCopySlot(*context_, ring_slot);
+            auto& overlay = cuda_overlays_[ring_slot];
+            overlay.interop.reset();
+            context_->destroyExternalBuffer(overlay.buffer);
+            overlay = {};
+        }
+        cuda_selection_query_.interop.reset();
+        context_->destroyExternalBuffer(cuda_selection_query_.buffer);
+        cuda_selection_query_ = {};
+        for (auto& snap : ring_uploaded_) {
+            snap = {};
+        }
+        buffers_.num_splats = 0;
+        buffers_.num_indices = 0;
+        buffers_.is_unsorted_1 = true;
+        current_input_sh_degree_ = -1;
+
+        releasePrivateScratchBuffers();
+        releaseSharedScratchArena();
+        drainRetiredScratchBuffers(false);
+        logVramBreakdownIfChanged("scene_release");
+    }
+
     void VksplatViewportRenderer::reset() {
         std::lock_guard<std::mutex> readback_lock(readback_mutex_);
         if (context_ && context_->device() != VK_NULL_HANDLE) {
@@ -3192,8 +3293,90 @@ namespace lfs::vis {
         return {};
     }
 
+    std::expected<glm::ivec2, std::string> VksplatViewportRenderer::latestOutputImageSize(
+        const OutputSlot output_slot) const {
+        std::lock_guard<std::mutex> readback_lock(readback_mutex_);
+        if (!context_) {
+            return std::unexpected("VkSplat output size requested before renderer initialization");
+        }
+
+        const auto& output = output_slots_[outputSlotIndex(output_slot)][latestOutputRingSlot(output_slot)];
+        if (output.image.image == VK_NULL_HANDLE ||
+            output.size.x <= 0 ||
+            output.size.y <= 0) {
+            return std::unexpected("VkSplat output size requested for an empty output slot");
+        }
+        if (output.image.format != VK_FORMAT_R8G8B8A8_UNORM) {
+            return std::unexpected("VkSplat output readback only supports RGBA8 output images");
+        }
+        return output.size;
+    }
+
     std::expected<std::shared_ptr<lfs::core::Tensor>, std::string>
     VksplatViewportRenderer::readOutputImage(VulkanContext& context, const OutputSlot output_slot) const {
+        const auto size = latestOutputImageSize(output_slot);
+        if (!size) {
+            return std::unexpected(size.error());
+        }
+
+        auto tensor = lfs::core::Tensor::empty(
+            {static_cast<std::size_t>(size->y), static_cast<std::size_t>(size->x), std::size_t{3}},
+            lfs::core::Device::CPU,
+            lfs::core::DataType::Float32);
+        if (!tensor.is_valid()) {
+            return std::unexpected("VkSplat output readback failed to allocate CPU float RGB tensor");
+        }
+
+        auto ok = readOutputImageIntoCpuHwc(context, output_slot, tensor, 0, 0);
+        if (!ok) {
+            return std::unexpected(ok.error());
+        }
+        return std::make_shared<lfs::core::Tensor>(std::move(tensor));
+    }
+
+    std::expected<std::shared_ptr<lfs::core::Tensor>, std::string>
+    VksplatViewportRenderer::readOutputImageRgb8(VulkanContext& context, const OutputSlot output_slot) const {
+        const auto size = latestOutputImageSize(output_slot);
+        if (!size) {
+            return std::unexpected(size.error());
+        }
+
+        auto tensor = lfs::core::Tensor::empty(
+            {static_cast<std::size_t>(size->y), static_cast<std::size_t>(size->x), std::size_t{3}},
+            lfs::core::Device::CPU,
+            lfs::core::DataType::UInt8);
+        if (!tensor.is_valid()) {
+            return std::unexpected("VkSplat output readback failed to allocate CPU uint8 RGB tensor");
+        }
+
+        auto ok = readOutputImageIntoCpuHwc(context, output_slot, tensor, 0, 0);
+        if (!ok) {
+            return std::unexpected(ok.error());
+        }
+        return std::make_shared<lfs::core::Tensor>(std::move(tensor));
+    }
+
+    std::expected<void, std::string> VksplatViewportRenderer::readOutputImageIntoCpuHwc(
+        VulkanContext& context,
+        const OutputSlot output_slot,
+        lfs::core::Tensor& destination,
+        const int destination_x,
+        const int destination_y) const {
+        if (!destination.is_valid() ||
+            destination.device() != lfs::core::Device::CPU ||
+            destination.ndim() != 3 ||
+            destination.size(2) != 3 ||
+            !destination.is_contiguous()) {
+            return std::unexpected("VkSplat output readback destination must be a contiguous CPU HWC RGB tensor");
+        }
+        if (destination.dtype() != lfs::core::DataType::Float32 &&
+            destination.dtype() != lfs::core::DataType::UInt8) {
+            return std::unexpected("VkSplat output readback destination must be float32 or uint8 RGB");
+        }
+        if (destination_x < 0 || destination_y < 0) {
+            return std::unexpected("VkSplat output readback destination offset is negative");
+        }
+
         std::lock_guard<std::mutex> readback_lock(readback_mutex_);
         if (!context_) {
             return std::unexpected("VkSplat output readback requested before renderer initialization");
@@ -3215,6 +3398,14 @@ namespace lfs::vis {
         }
         if (output.image.format != VK_FORMAT_R8G8B8A8_UNORM) {
             return std::unexpected("VkSplat output readback only supports RGBA8 output images");
+        }
+        const int destination_width = static_cast<int>(destination.size(1));
+        const int destination_height = static_cast<int>(destination.size(0));
+        if (destination_x > destination_width ||
+            destination_y > destination_height ||
+            output.size.x > destination_width - destination_x ||
+            output.size.y > destination_height - destination_y) {
+            return std::unexpected("VkSplat output readback destination region is too small");
         }
 
         if (!context.waitForSubmittedFrames()) {
@@ -3337,26 +3528,48 @@ namespace lfs::vis {
             return std::unexpected(vkError("vmaInvalidateAllocation(VkSplat readback)", result));
         }
 
-        const auto* const rgba =
-            static_cast<const std::uint8_t*>(staging.allocation_info.pMappedData);
-        const int width = output.size.x;
-        const int height = output.size.y;
-        const std::size_t pixel_count =
-            static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
-        std::vector<float> hwc(pixel_count * 3u);
-        for (std::size_t i = 0; i < pixel_count; ++i) {
-            const std::size_t src = i * 4u;
-            const std::size_t dst = i * 3u;
-            hwc[dst] = static_cast<float>(rgba[src]) / 255.0f;
-            hwc[dst + 1u] = static_cast<float>(rgba[src + 1u]) / 255.0f;
-            hwc[dst + 2u] = static_cast<float>(rgba[src + 2u]) / 255.0f;
+        const auto* const rgba = static_cast<const std::uint8_t*>(staging.allocation_info.pMappedData);
+        void* const destination_data = destination.data_ptr();
+        if (!rgba || !destination_data) {
+            return std::unexpected("VkSplat output readback has null mapped data");
         }
 
-        auto tensor = lfs::core::Tensor::from_vector(
-            hwc,
-            {static_cast<std::size_t>(height), static_cast<std::size_t>(width), std::size_t{3}},
-            lfs::core::Device::CPU);
-        return std::make_shared<lfs::core::Tensor>(std::move(tensor));
+        const std::size_t src_row_pixels = static_cast<std::size_t>(output.size.x);
+        const std::size_t dst_row_pixels = static_cast<std::size_t>(destination_width);
+        if (destination.dtype() == lfs::core::DataType::Float32) {
+            auto* const dst = static_cast<float*>(destination_data);
+            for (int row = 0; row < output.size.y; ++row) {
+                const auto* const src_row = rgba + static_cast<std::size_t>(row) * src_row_pixels * 4u;
+                auto* const dst_row =
+                    dst + ((static_cast<std::size_t>(destination_y + row) * dst_row_pixels +
+                            static_cast<std::size_t>(destination_x)) *
+                           3u);
+                for (int col = 0; col < output.size.x; ++col) {
+                    const std::size_t src = static_cast<std::size_t>(col) * 4u;
+                    const std::size_t dst_index = static_cast<std::size_t>(col) * 3u;
+                    dst_row[dst_index] = static_cast<float>(src_row[src]) / 255.0f;
+                    dst_row[dst_index + 1u] = static_cast<float>(src_row[src + 1u]) / 255.0f;
+                    dst_row[dst_index + 2u] = static_cast<float>(src_row[src + 2u]) / 255.0f;
+                }
+            }
+        } else {
+            auto* const dst = static_cast<std::uint8_t*>(destination_data);
+            for (int row = 0; row < output.size.y; ++row) {
+                const auto* const src_row = rgba + static_cast<std::size_t>(row) * src_row_pixels * 4u;
+                auto* const dst_row =
+                    dst + ((static_cast<std::size_t>(destination_y + row) * dst_row_pixels +
+                            static_cast<std::size_t>(destination_x)) *
+                           3u);
+                for (int col = 0; col < output.size.x; ++col) {
+                    const std::size_t src = static_cast<std::size_t>(col) * 4u;
+                    const std::size_t dst_index = static_cast<std::size_t>(col) * 3u;
+                    dst_row[dst_index] = src_row[src];
+                    dst_row[dst_index + 1u] = src_row[src + 1u];
+                    dst_row[dst_index + 2u] = src_row[src + 2u];
+                }
+            }
+        }
+        return {};
     }
 
     std::expected<float, std::string> VksplatViewportRenderer::sampleDepthAtPixel(

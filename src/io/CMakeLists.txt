@@ -256,7 +256,7 @@ target_link_libraries(lfs_io
         lfs_core_cuda          # Core CUDA utilities (lanczos_resize for nvcodec)
         assimp::assimp         # Multi-format mesh import
         usdVol                 # OpenUSD Gaussian ParticleField import
-        $<IF:$<PLATFORM_ID:Windows>,OpenMeshCore,OpenMeshCoreStatic>
+        OpenMeshCore
         spz_lib                # Niantic SPZ compressed format
 )
 

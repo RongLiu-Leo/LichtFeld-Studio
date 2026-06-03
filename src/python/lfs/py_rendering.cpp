@@ -269,6 +269,7 @@ namespace lfs::python {
                 options.max_width = 0;
                 options.images_folder = "images";
                 options.validate_only = false;
+                options.splat_tensor_allocator = rendering_manager->makeSplatTensorAllocator();
 
                 const auto asset_path = core::utf8_to_path(path);
                 std::error_code file_size_error;
@@ -285,7 +286,9 @@ namespace lfs::python {
                 auto ext = asset_path.extension().string();
                 std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
                 if (ext == ".ckpt" || ext == ".resume") {
-                    auto checkpoint_result = core::load_checkpoint_splat_data(asset_path);
+                    auto checkpoint_result = core::load_checkpoint_splat_data(
+                        asset_path,
+                        rendering_manager->makeSplatTensorAllocator());
                     if (!checkpoint_result) {
                         LOG_DEBUG(
                             "Checkpoint asset preview load failed for '{}': {}",
@@ -386,6 +389,152 @@ namespace lfs::python {
                 .run =
                     [path, width, height, focal_length_mm, rotation, translation, finish]() mutable {
                         finish(renderAssetPreviewOnViewerThread(path, width, height, focal_length_mm, rotation, translation));
+                    },
+                .cancel =
+                    [finish]() mutable {
+                        finish(std::nullopt);
+                    }});
+            if (!posted) {
+                return std::nullopt;
+            }
+
+            nb::gil_scoped_release release;
+            return future.get();
+        }
+
+        [[nodiscard]] std::optional<glm::mat3> tensorToVisualizerRotation(const PyTensor& py_tensor) {
+            const auto& tensor = py_tensor.tensor();
+            if (!tensor.is_valid() || tensor.ndim() != 2 || tensor.size(0) != 3 || tensor.size(1) != 3) {
+                return std::nullopt;
+            }
+
+            try {
+                const auto cpu = tensor.to(core::Device::CPU).to(core::DataType::Float32).contiguous();
+                const auto* const data = static_cast<const float*>(cpu.data_ptr());
+                if (!data) {
+                    return std::nullopt;
+                }
+
+                glm::mat3 rotation{};
+                for (int row = 0; row < 3; ++row) {
+                    for (int col = 0; col < 3; ++col) {
+                        const float value = data[row * 3 + col];
+                        if (!std::isfinite(value)) {
+                            return std::nullopt;
+                        }
+                        rotation[col][row] = value;
+                    }
+                }
+                return rotation;
+            } catch (const std::exception& e) {
+                LOG_DEBUG("render_view rotation conversion failed: {}", e.what());
+            } catch (...) {
+                LOG_DEBUG("render_view rotation conversion failed: unknown error");
+            }
+            return std::nullopt;
+        }
+
+        [[nodiscard]] std::optional<glm::vec3> tensorToVisualizerTranslation(const PyTensor& py_tensor) {
+            const auto& tensor = py_tensor.tensor();
+            if (!tensor.is_valid() || tensor.ndim() != 1 || tensor.size(0) != 3) {
+                return std::nullopt;
+            }
+
+            try {
+                const auto cpu = tensor.to(core::Device::CPU).to(core::DataType::Float32).contiguous();
+                const auto* const data = static_cast<const float*>(cpu.data_ptr());
+                if (!data) {
+                    return std::nullopt;
+                }
+
+                const glm::vec3 translation{data[0], data[1], data[2]};
+                if (!std::isfinite(translation.x) || !std::isfinite(translation.y) || !std::isfinite(translation.z)) {
+                    return std::nullopt;
+                }
+                return translation;
+            } catch (const std::exception& e) {
+                LOG_DEBUG("render_view translation conversion failed: {}", e.what());
+            } catch (...) {
+                LOG_DEBUG("render_view translation conversion failed: unknown error");
+            }
+            return std::nullopt;
+        }
+
+        [[nodiscard]] std::optional<core::Tensor> renderViewOnViewerThread(
+            const glm::mat3& rotation,
+            const glm::vec3& translation,
+            const int width,
+            const int height,
+            const float fov_degrees,
+            const bool rgb8_output) {
+            if (width <= 0 || height <= 0 || !std::isfinite(fov_degrees) || fov_degrees <= 0.0f) {
+                return std::nullopt;
+            }
+
+            auto* const viewer = get_visualizer();
+            auto* const rendering_manager = viewer ? viewer->getRenderingManager() : nullptr;
+            auto* const scene_manager = viewer ? viewer->getSceneManager() : nullptr;
+            if (!rendering_manager || !scene_manager) {
+                return std::nullopt;
+            }
+
+            auto image = rgb8_output
+                             ? rendering_manager->renderPreviewImageRgb8(
+                                   scene_manager,
+                                   rotation,
+                                   translation,
+                                   lfs::rendering::vFovToFocalLength(fov_degrees),
+                                   width,
+                                   height)
+                             : rendering_manager->renderPreviewImage(
+                                   scene_manager,
+                                   rotation,
+                                   translation,
+                                   lfs::rendering::vFovToFocalLength(fov_degrees),
+                                   width,
+                                   height);
+            if (rgb8_output) {
+                rendering_manager->releasePreviewImageResources();
+            }
+            if (!image || !image->is_valid()) {
+                return std::nullopt;
+            }
+            return *image;
+        }
+
+        [[nodiscard]] std::optional<core::Tensor> renderViewThreadSafe(
+            const glm::mat3& rotation,
+            const glm::vec3& translation,
+            const int width,
+            const int height,
+            const float fov_degrees,
+            const bool rgb8_output) {
+            auto invoke_render = [&]() -> std::optional<core::Tensor> {
+                return renderViewOnViewerThread(rotation, translation, width, height, fov_degrees, rgb8_output);
+            };
+
+            auto* const viewer = get_visualizer();
+            if (!viewer || viewer->isOnViewerThread()) {
+                return invoke_render();
+            }
+            if (!viewer->acceptsPostedWork()) {
+                return std::nullopt;
+            }
+
+            auto promise = std::make_shared<std::promise<std::optional<core::Tensor>>>();
+            auto future = promise->get_future();
+            auto completed = std::make_shared<std::atomic_bool>(false);
+
+            auto finish = [promise, completed](std::optional<core::Tensor> result) mutable {
+                if (!completed->exchange(true)) {
+                    promise->set_value(std::move(result));
+                }
+            };
+
+            const bool posted = viewer->postWork(vis::Visualizer::WorkItem{
+                .run =
+                    [rotation, translation, width, height, fov_degrees, rgb8_output, finish]() mutable {
+                        finish(renderViewOnViewerThread(rotation, translation, width, height, fov_degrees, rgb8_output));
                     },
                 .cancel =
                     [finish]() mutable {
@@ -927,13 +1076,60 @@ namespace lfs::python {
 
     std::optional<PyTensor> render_view(const PyTensor& rotation, const PyTensor& translation, int width, int height,
                                         float fov_degrees, const PyTensor* bg_color) {
-        (void)rotation;
-        (void)translation;
-        (void)width;
-        (void)height;
-        (void)fov_degrees;
         (void)bg_color;
-        return std::nullopt;
+
+        const auto rotation_matrix = tensorToVisualizerRotation(rotation);
+        const auto translation_vector = tensorToVisualizerTranslation(translation);
+        if (!rotation_matrix || !translation_vector) {
+            return std::nullopt;
+        }
+
+        auto image = renderViewThreadSafe(*rotation_matrix, *translation_vector, width, height, fov_degrees, false);
+        if (!image || !image->is_valid() || image->ndim() != 3) {
+            return std::nullopt;
+        }
+        if (image->size(0) <= 0 || image->size(1) <= 0 || image->size(2) != 3) {
+            return std::nullopt;
+        }
+
+        auto output = *image;
+        if (output.device() != core::Device::CPU) {
+            output = output.cpu();
+        }
+        if (output.dtype() != core::DataType::Float32) {
+            output = output.to(core::DataType::Float32);
+        }
+        output = output.contiguous();
+        return PyTensor(std::move(output), true);
+    }
+
+    std::optional<PyTensor> render_view_u8(const PyTensor& rotation, const PyTensor& translation, int width, int height,
+                                           float fov_degrees, const PyTensor* bg_color) {
+        (void)bg_color;
+
+        const auto rotation_matrix = tensorToVisualizerRotation(rotation);
+        const auto translation_vector = tensorToVisualizerTranslation(translation);
+        if (!rotation_matrix || !translation_vector) {
+            return std::nullopt;
+        }
+
+        auto image = renderViewThreadSafe(*rotation_matrix, *translation_vector, width, height, fov_degrees, true);
+        if (!image || !image->is_valid() || image->ndim() != 3) {
+            return std::nullopt;
+        }
+        if (image->size(0) <= 0 || image->size(1) <= 0 || image->size(2) != 3) {
+            return std::nullopt;
+        }
+
+        auto output = *image;
+        if (output.device() != core::Device::CPU) {
+            output = output.cpu();
+        }
+        if (output.dtype() != core::DataType::UInt8) {
+            output = output.to(core::DataType::UInt8);
+        }
+        output = output.contiguous();
+        return PyTensor(std::move(output), true);
     }
 
     std::optional<PyTensor> compute_screen_positions(const PyTensor& rotation, const PyTensor& translation, int width,
@@ -1073,10 +1269,27 @@ Args:
     width: Render width in pixels
     height: Render height in pixels
     fov: Vertical field of view in degrees (default: 60)
-    bg_color: Optional [3] RGB background color
+    bg_color: Accepted for compatibility; the Vulkan preview path uses current render settings
 
 Returns:
-    Tensor [H, W, 3] RGB image on CUDA, or None if scene not available
+    CPU Tensor [H, W, 3] RGB image, or None if no active visualizer scene is available
+)doc");
+
+        m.def("render_view_u8", &render_view_u8, nb::arg("rotation"), nb::arg("translation"), nb::arg("width"), nb::arg("height"),
+              nb::arg("fov") = DEFAULT_FOV, nb::arg("bg_color") = nb::none(),
+              R"doc(
+Render scene from arbitrary camera parameters as an 8-bit RGB image.
+
+Args:
+    rotation: [3, 3] camera-to-world rotation in visualizer coordinates
+    translation: [3] camera position in visualizer world coordinates
+    width: Render width in pixels
+    height: Render height in pixels
+    fov: Vertical field of view in degrees (default: 60)
+    bg_color: Accepted for compatibility; the Vulkan preview path uses current render settings
+
+Returns:
+    CPU uint8 Tensor [H, W, 3] RGB image, or None if no active visualizer scene is available
 )doc");
 
         m.def("compute_screen_positions", &compute_screen_positions, nb::arg("rotation"), nb::arg("translation"),

@@ -214,7 +214,7 @@ namespace lfs::vis {
     }
 
     void RenderingManager::handleSceneCleared() {
-        viewport_artifact_service_.clearViewportOutput();
+        releaseSceneRenderResources();
         invalidateCameraMetricsRequests(true);
         SplitViewService::ModeChangeResult result;
         {
@@ -224,7 +224,6 @@ namespace lfs::vis {
         }
         camera_interaction_service_.clearCurrentCamera();
         camera_interaction_service_.clearHoveredCamera();
-        frame_lifecycle_service_.resetModelTracking();
         applySplitModeChange(result);
         markDirty();
     }

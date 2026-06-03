@@ -259,9 +259,10 @@ namespace {
 
     [[nodiscard]] std::vector<float> appearance_row(const SplatData& splat, const size_t row) {
         std::vector<float> result = row_values(splat.sh0_raw().reshape({static_cast<int>(splat.size()), 3}), row);
-        if (splat.shN_raw().is_valid()) {
+        if (splat.max_sh_coeffs_rest() > 0) {
+            const Tensor shN = splat.shN_canonical();
             auto tail = row_values(
-                splat.shN_raw().reshape({static_cast<int>(splat.size()), static_cast<int>(splat.shN_raw().size(1) * 3)}),
+                shN.reshape({static_cast<int>(splat.size()), static_cast<int>(shN.size(1) * 3)}),
                 row);
             result.insert(result.end(), tail.begin(), tail.end());
         }

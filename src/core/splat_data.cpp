@@ -21,6 +21,61 @@ namespace {
     constexpr int MAX_SUPPORTED_SH_DEGREE = 3;
     constexpr size_t SH_CHANNELS = 3;
 
+    template <typename Index>
+    [[nodiscard]] std::vector<lfs::core::SplatData::FrozenRange> remap_frozen_ranges_after_keep(
+        const std::vector<lfs::core::SplatData::FrozenRange>& ranges,
+        const size_t old_size,
+        const std::vector<Index>& kept_indices) {
+        if (ranges.empty() || old_size == 0 || kept_indices.empty()) {
+            return {};
+        }
+
+        std::vector<unsigned char> old_frozen(old_size, 0);
+        for (const auto& range : ranges) {
+            if (range.count == 0 || range.start >= old_size) {
+                continue;
+            }
+            const size_t end = range.count > old_size - range.start
+                                   ? old_size
+                                   : range.start + range.count;
+            std::fill(old_frozen.begin() + static_cast<std::ptrdiff_t>(range.start),
+                      old_frozen.begin() + static_cast<std::ptrdiff_t>(end),
+                      1);
+        }
+
+        std::vector<lfs::core::SplatData::FrozenRange> remapped;
+        size_t range_start = 0;
+        while (range_start < kept_indices.size()) {
+            while (range_start < kept_indices.size()) {
+                const auto old_index = kept_indices[range_start];
+                if (old_index >= 0 &&
+                    static_cast<size_t>(old_index) < old_frozen.size() &&
+                    old_frozen[static_cast<size_t>(old_index)]) {
+                    break;
+                }
+                ++range_start;
+            }
+            if (range_start >= kept_indices.size()) {
+                break;
+            }
+
+            size_t range_end = range_start + 1;
+            while (range_end < kept_indices.size()) {
+                const auto old_index = kept_indices[range_end];
+                if (old_index < 0 ||
+                    static_cast<size_t>(old_index) >= old_frozen.size() ||
+                    !old_frozen[static_cast<size_t>(old_index)]) {
+                    break;
+                }
+                ++range_end;
+            }
+
+            remapped.push_back({range_start, range_end - range_start});
+            range_start = range_end;
+        }
+        return remapped;
+    }
+
     // Point cloud adaptor for nanoflann
     struct PointCloudAdaptor {
         const float* points;
@@ -496,12 +551,14 @@ namespace lfs::core {
           _deleted(std::move(other._deleted)),
           _deleted_count(other._deleted_count.load(std::memory_order_relaxed)),
           _tensor_allocator(std::move(other._tensor_allocator)),
-          lod_tree(std::move(other.lod_tree)) {
+          lod_tree(std::move(other.lod_tree)),
+          _frozen_ranges(std::move(other._frozen_ranges)) {
         // Reset the moved-from object
         other._active_sh_degree = 0;
         other._max_sh_degree = 0;
         other._scene_scale = 0.0f;
         other._deleted_count.store(0, std::memory_order_relaxed);
+        other._frozen_ranges.clear();
     }
 
     SplatData& SplatData::operator=(SplatData&& other) noexcept {
@@ -526,9 +583,29 @@ namespace lfs::core {
             _deleted_count.store(other._deleted_count.load(std::memory_order_relaxed),
                                  std::memory_order_relaxed);
             _tensor_allocator = std::move(other._tensor_allocator);
+            _frozen_ranges = std::move(other._frozen_ranges);
             other._deleted_count.store(0, std::memory_order_relaxed);
+            other._frozen_ranges.clear();
         }
         return *this;
+    }
+
+    void SplatData::remap_frozen_ranges_after_keep(
+        const size_t old_size,
+        const std::vector<int>& kept_old_indices) {
+        _frozen_ranges = ::remap_frozen_ranges_after_keep(
+            _frozen_ranges,
+            old_size,
+            kept_old_indices);
+    }
+
+    void SplatData::remap_frozen_ranges_after_keep(
+        const size_t old_size,
+        const std::vector<int64_t>& kept_old_indices) {
+        _frozen_ranges = ::remap_frozen_ranges_after_keep(
+            _frozen_ranges,
+            old_size,
+            kept_old_indices);
     }
 
     // ========== COMPUTED GETTERS ==========
@@ -856,6 +933,9 @@ namespace lfs::core {
         if (kept_indices.ndim() > 1)
             kept_indices = kept_indices.reshape({kept_numel});
         kept_indices = kept_indices.to(DataType::Int32);
+        const auto kept_indices_host = _frozen_ranges.empty()
+                                           ? std::vector<int>{}
+                                           : kept_indices.to_vector_int();
 
         // Gather kept rows for each parameter directly into a destination allocated
         // from the model's backing storage (Vulkan-external interop when set, the
@@ -905,6 +985,9 @@ namespace lfs::core {
 
         // Clear densification info
         _densification_info = Tensor();
+        if (!_frozen_ranges.empty()) {
+            remap_frozen_ranges_after_keep(old_size, kept_indices_host);
+        }
 
         // Clear deletion mask
         _deleted = Tensor();

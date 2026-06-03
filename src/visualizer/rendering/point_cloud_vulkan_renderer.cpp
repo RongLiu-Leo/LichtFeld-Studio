@@ -12,6 +12,7 @@
 #include <cstring>
 #include <format>
 #include <glm/gtc/type_ptr.hpp>
+#include <mutex>
 #include <utility>
 #include <vk_mem_alloc.h>
 
@@ -105,6 +106,27 @@ namespace lfs::vis {
                 static_cast<std::size_t>(allocation_info.size));
             return true;
         }
+
+        struct ScopedStagingBuffer {
+            VmaAllocator allocator = VK_NULL_HANDLE;
+            VkBuffer buffer = VK_NULL_HANDLE;
+            VmaAllocation allocation = VK_NULL_HANDLE;
+            VmaAllocationInfo allocation_info{};
+            std::string vram_scope;
+            std::string vram_label;
+
+            ~ScopedStagingBuffer() {
+                if (allocator != VK_NULL_HANDLE && buffer != VK_NULL_HANDLE) {
+                    if (!vram_scope.empty() && !vram_label.empty()) {
+                        lfs::diagnostics::VramProfiler::instance().recordCurrentBytes(
+                            vram_scope,
+                            vram_label,
+                            0);
+                    }
+                    vmaDestroyBuffer(allocator, buffer, allocation);
+                }
+            }
+        };
 
         bool stageBufferUpload(VmaAllocator allocator,
                                VkCommandBuffer cb,
@@ -326,6 +348,7 @@ namespace lfs::vis {
         VkCommandPool command_pool = VK_NULL_HANDLE;
         VkCommandBuffer command_buffer = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
+        std::mutex command_mutex;
 
         bool initialized = false;
 
@@ -1096,6 +1119,7 @@ namespace lfs::vis {
 
         std::expected<RenderResult, std::string> doRender(const RenderRequest& req,
                                                           OutputSlot output_slot) {
+            std::lock_guard<std::mutex> command_lock(command_mutex);
             const std::size_t slot_idx = static_cast<std::size_t>(output_slot);
             if (slot_idx >= kSlotCount) {
                 return std::unexpected<std::string>("invalid output_slot");
@@ -1290,6 +1314,168 @@ namespace lfs::vis {
             result.flip_y = false;
             return result;
         }
+
+        std::expected<std::shared_ptr<lfs::core::Tensor>, std::string> readOutputImage(
+            VulkanContext& ctx,
+            OutputSlot output_slot) {
+            std::lock_guard<std::mutex> command_lock(command_mutex);
+            if (!initialized || context == nullptr) {
+                return std::unexpected<std::string>("Point-cloud output readback requested before renderer initialization");
+            }
+            if (&ctx != context) {
+                return std::unexpected<std::string>("Point-cloud output readback received a different Vulkan context");
+            }
+
+            const std::size_t slot_idx = static_cast<std::size_t>(output_slot);
+            if (slot_idx >= kSlotCount) {
+                return std::unexpected<std::string>("invalid output_slot");
+            }
+            auto& slot = slots[slot_idx];
+            if (slot.color_image == VK_NULL_HANDLE || slot.size.x <= 0 || slot.size.y <= 0) {
+                return std::unexpected<std::string>("Point-cloud output readback requested for an empty output slot");
+            }
+
+            if (!ctx.waitForSubmittedFrames()) {
+                return std::unexpected<std::string>(ctx.lastError());
+            }
+            VkResult r = vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
+            if (r != VK_SUCCESS) {
+                return std::unexpected<std::string>(vkError("vkWaitForFences(readback prewait)", r));
+            }
+            for (auto& s : pending_stagings) {
+                destroyBuffer(allocator, s);
+            }
+            pending_stagings.clear();
+
+            const VkDeviceSize byte_count =
+                static_cast<VkDeviceSize>(slot.size.x) *
+                static_cast<VkDeviceSize>(slot.size.y) *
+                static_cast<VkDeviceSize>(4);
+            if (byte_count == 0) {
+                return std::unexpected<std::string>("Point-cloud output readback has zero bytes");
+            }
+
+            ScopedStagingBuffer staging{};
+            staging.allocator = allocator;
+            VkBufferCreateInfo buffer_info{};
+            buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            buffer_info.size = byte_count;
+            buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            VmaAllocationCreateInfo alloc_info{};
+            alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+            alloc_info.flags =
+                VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
+                VMA_ALLOCATION_CREATE_MAPPED_BIT;
+            r = vmaCreateBuffer(
+                allocator,
+                &buffer_info,
+                &alloc_info,
+                &staging.buffer,
+                &staging.allocation,
+                &staging.allocation_info);
+            if (r != VK_SUCCESS || staging.buffer == VK_NULL_HANDLE) {
+                return std::unexpected<std::string>(vkError("vmaCreateBuffer(point-cloud readback)", r));
+            }
+            staging.vram_scope = "vulkan.point_cloud.readback_buffer";
+            staging.vram_label = std::format("rgba:{}x{}", slot.size.x, slot.size.y);
+            lfs::diagnostics::VramProfiler::instance().recordCurrentBytes(
+                staging.vram_scope,
+                staging.vram_label,
+                static_cast<std::size_t>(staging.allocation_info.size));
+            if (staging.allocation_info.pMappedData == nullptr) {
+                return std::unexpected<std::string>("Point-cloud readback staging buffer is not host-mapped");
+            }
+
+            r = vkResetCommandBuffer(command_buffer, 0);
+            if (r != VK_SUCCESS) {
+                return std::unexpected<std::string>(vkError("vkResetCommandBuffer(point-cloud readback)", r));
+            }
+
+            VkCommandBufferBeginInfo begin_info{};
+            begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            r = vkBeginCommandBuffer(command_buffer, &begin_info);
+            if (r != VK_SUCCESS) {
+                return std::unexpected<std::string>(vkError("vkBeginCommandBuffer(point-cloud readback)", r));
+            }
+
+            const VkImageLayout restore_layout =
+                slot.color_layout != VK_IMAGE_LAYOUT_UNDEFINED
+                    ? slot.color_layout
+                    : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            ctx.imageBarriers().transitionImage(command_buffer,
+                                                slot.color_image,
+                                                VK_IMAGE_ASPECT_COLOR_BIT,
+                                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+            VkBufferImageCopy copy_region{};
+            copy_region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            copy_region.imageSubresource.layerCount = 1;
+            copy_region.imageExtent = {
+                static_cast<std::uint32_t>(slot.size.x),
+                static_cast<std::uint32_t>(slot.size.y),
+                1};
+            vkCmdCopyImageToBuffer(command_buffer,
+                                   slot.color_image,
+                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   staging.buffer,
+                                   1,
+                                   &copy_region);
+
+            ctx.imageBarriers().transitionImage(command_buffer,
+                                                slot.color_image,
+                                                VK_IMAGE_ASPECT_COLOR_BIT,
+                                                restore_layout);
+            slot.color_layout = restore_layout;
+
+            r = vkEndCommandBuffer(command_buffer);
+            if (r != VK_SUCCESS) {
+                return std::unexpected<std::string>(vkError("vkEndCommandBuffer(point-cloud readback)", r));
+            }
+
+            r = vkResetFences(device, 1, &fence);
+            if (r != VK_SUCCESS) {
+                return std::unexpected<std::string>(vkError("vkResetFences(point-cloud readback)", r));
+            }
+            VkSubmitInfo submit_info{};
+            submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            submit_info.commandBufferCount = 1;
+            submit_info.pCommandBuffers = &command_buffer;
+            r = vkQueueSubmit(ctx.graphicsQueue(), 1, &submit_info, fence);
+            if (r != VK_SUCCESS) {
+                return std::unexpected<std::string>(vkError("vkQueueSubmit(point-cloud readback)", r));
+            }
+            r = vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
+            if (r != VK_SUCCESS) {
+                return std::unexpected<std::string>(vkError("vkWaitForFences(point-cloud readback)", r));
+            }
+
+            r = vmaInvalidateAllocation(allocator, staging.allocation, 0, byte_count);
+            if (r != VK_SUCCESS) {
+                return std::unexpected<std::string>(vkError("vmaInvalidateAllocation(point-cloud readback)", r));
+            }
+
+            const auto* const rgba = static_cast<const std::uint8_t*>(staging.allocation_info.pMappedData);
+            const int width = slot.size.x;
+            const int height = slot.size.y;
+            const std::size_t pixel_count =
+                static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+            std::vector<float> hwc(pixel_count * 3u);
+            for (std::size_t i = 0; i < pixel_count; ++i) {
+                const std::size_t src = i * 4u;
+                const std::size_t dst = i * 3u;
+                hwc[dst] = static_cast<float>(rgba[src]) / 255.0f;
+                hwc[dst + 1u] = static_cast<float>(rgba[src + 1u]) / 255.0f;
+                hwc[dst + 2u] = static_cast<float>(rgba[src + 2u]) / 255.0f;
+            }
+
+            auto tensor = lfs::core::Tensor::from_vector(
+                hwc,
+                {static_cast<std::size_t>(height), static_cast<std::size_t>(width), std::size_t{3}},
+                lfs::core::Device::CPU);
+            return std::make_shared<lfs::core::Tensor>(std::move(tensor));
+        }
     };
 
     PointCloudVulkanRenderer::PointCloudVulkanRenderer()
@@ -1304,6 +1490,11 @@ namespace lfs::vis {
             return std::unexpected<std::string>(r.error());
         }
         return impl_->doRender(request, output_slot);
+    }
+
+    std::expected<std::shared_ptr<lfs::core::Tensor>, std::string>
+    PointCloudVulkanRenderer::readOutputImage(VulkanContext& context, OutputSlot output_slot) {
+        return impl_->readOutputImage(context, output_slot);
     }
 
     void PointCloudVulkanRenderer::reset() {

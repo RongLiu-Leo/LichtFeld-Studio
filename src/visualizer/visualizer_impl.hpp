@@ -49,6 +49,8 @@ namespace lfs::vis {
     } // namespace tools
 
     class LFS_VIS_API VisualizerImpl : public Visualizer {
+        friend class gui::GuiManager;
+
     public:
         explicit VisualizerImpl(const ViewerOptions& options);
         ~VisualizerImpl() override;

@@ -481,6 +481,7 @@ namespace lfs::vis {
                 state.pip_preview_scale = s.pip_preview_scale;
                 state.show_film_strip = s.show_film_strip;
                 state.equirectangular = s.equirectangular;
+                state.sequence_fps = s.sequence_fps;
             }
 
             s.show_camera_path = state.show_camera_path;
@@ -492,6 +493,7 @@ namespace lfs::vis {
             s.pip_preview_scale = state.pip_preview_scale;
             s.show_film_strip = state.show_film_strip;
             s.equirectangular = state.equirectangular;
+            s.sequence_fps = state.sequence_fps;
             const auto sel = gm->sequencer().selectedKeyframe();
             s.selected_keyframe = sel.has_value() ? static_cast<int>(*sel) : -1;
             sequencer_ui_initialized_ = true;
@@ -1341,6 +1343,9 @@ namespace lfs::vis {
             store_dirty = app_store().store().drain_dirty_into_frame();
         }
 
+        if (gui_manager_)
+            gui_manager_->sequencerUI().tickPlaybackBeforeSceneRender();
+
         const bool is_training = trainer_manager_ && trainer_manager_->isRunning();
         const FrameDemand frame_demand = collectFrameDemand(viewport_export_locked, store_dirty);
         if (gui_frame_rendered_ && !frame_demand.shouldRenderFrame()) {
@@ -1409,9 +1414,10 @@ namespace lfs::vis {
         if (gui_manager_) {
             LOG_TIMER("VisualizerImpl::render.gui_frame_total_with_swapchain_wait");
             gui_manager_->render();
+        } else {
+            processRenderWorkQueue();
         }
 
-        processRenderWorkQueue();
         python::flush_signals();
         gui_frame_rendered_ = true;
         update_work_processed_ = false;

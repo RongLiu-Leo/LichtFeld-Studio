@@ -29,6 +29,7 @@
 #include <RmlUi/Core/Matrix4.h>
 #include <RmlUi/Debugger.h>
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cctype>
 #include <cmath>
@@ -209,24 +210,25 @@ namespace lfs::vis::gui {
     }
 
     void RmlUIManager::ensureCjkFontsLoaded() {
-        if (cjk_fonts_loaded_ || !initialized_)
+        if (cjk_fonts_loaded_ || cjk_fonts_load_attempted_ || !initialized_)
             return;
+        cjk_fonts_load_attempted_ = true;
 
         struct CjkSpec {
             const char* asset;
             const char* family;
         };
-        const CjkSpec specs[] = {
+        constexpr std::array<CjkSpec, 2> specs = {{
             {"fonts/NotoSansJP-Regular.ttf", "Noto Sans JP"},
             {"fonts/NotoSansKR-Regular.ttf", "Noto Sans KR"},
-        };
+        }};
 
         struct LoadedFont {
             std::filesystem::path path;
             std::vector<std::byte> bytes;
         };
-        std::array<std::future<LoadedFont>, 2> futures;
-        for (std::size_t i = 0; i < 2; ++i) {
+        std::array<std::future<LoadedFont>, specs.size()> futures;
+        for (std::size_t i = 0; i < specs.size(); ++i) {
             const char* asset = specs[i].asset;
             futures[i] = std::async(std::launch::async, [asset]() {
                 LoadedFont out;
@@ -247,12 +249,12 @@ namespace lfs::vis::gui {
             });
         }
 
-        bool all_loaded = true;
-        for (std::size_t i = 0; i < 2; ++i) {
+        bool any_loaded = false;
+        font_blobs_.reserve(font_blobs_.size() + specs.size());
+        for (std::size_t i = 0; i < specs.size(); ++i) {
             LoadedFont loaded = futures[i].get();
             if (loaded.bytes.empty()) {
                 LOG_WARN("RmlUI: failed to read {}", specs[i].asset);
-                all_loaded = false;
                 continue;
             }
             font_blobs_.push_back(std::move(loaded.bytes));
@@ -262,12 +264,13 @@ namespace lfs::vis::gui {
             if (Rml::LoadFontFace(data, specs[i].family, Rml::Style::FontStyle::Normal,
                                   Rml::Style::FontWeight::Normal, true)) {
                 LOG_INFO("RmlUI: loaded CJK font {}", loaded.path.string());
+                any_loaded = true;
             } else {
                 LOG_WARN("RmlUI: failed to register {}", loaded.path.string());
-                all_loaded = false;
+                font_blobs_.pop_back();
             }
         }
-        cjk_fonts_loaded_ = all_loaded;
+        cjk_fonts_loaded_ = any_loaded;
     }
 
     void RmlUIManager::shutdown() {
@@ -292,6 +295,9 @@ namespace lfs::vis::gui {
         vulkan_queue_.clear();
         vulkan_foreground_queue_.clear();
         context_names_.clear();
+        font_blobs_.clear();
+        cjk_fonts_loaded_ = false;
+        cjk_fonts_load_attempted_ = false;
         text_input_handler_.reset();
         system_interface_.reset();
         resize_deferring_ = false;

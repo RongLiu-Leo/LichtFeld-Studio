@@ -16,11 +16,13 @@
 #include "viewport_region_utils.hpp"
 #include "viewport_request_builder.hpp"
 #include "vksplat_viewport_renderer.hpp"
+#include "vulkan_external_tensor.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <expected>
 #include <format>
+#include <optional>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
@@ -46,6 +48,24 @@ namespace lfs::vis {
             return error.find("shared scratch") != std::string_view::npos &&
                    (error.find("busy") != std::string_view::npos ||
                     error.find("capacity insufficient") != std::string_view::npos);
+        }
+
+        [[nodiscard]] std::optional<std::pair<size_t, size_t>>
+        plyComparisonPairForOffset(const size_t node_count, const size_t offset) {
+            if (node_count < 2) {
+                return std::nullopt;
+            }
+
+            size_t remaining = offset % ((node_count * (node_count - 1)) / 2);
+            for (size_t left = 0; left + 1 < node_count; ++left) {
+                const size_t row_count = node_count - left - 1;
+                if (remaining < row_count) {
+                    return std::pair<size_t, size_t>{left, left + 1 + remaining};
+                }
+                remaining -= row_count;
+            }
+
+            return std::nullopt;
         }
 
         [[nodiscard]] std::vector<ViewportInteractionPanel> buildVulkanInteractionPanels(
@@ -1113,49 +1133,58 @@ namespace lfs::vis {
                 }
             }
         } else if (splitViewUsesPLYComparison(settings_.split_view_mode) && scene_manager && has_visible_gaussian_model) {
-            const auto visible_nodes = scene_manager->getScene().getVisibleNodes();
-            if (visible_nodes.size() >= 2) {
-                const size_t left_idx = settings_.split_view_offset % visible_nodes.size();
-                const size_t right_idx = (settings_.split_view_offset + 1) % visible_nodes.size();
-                std::vector<bool> left_mask(visible_nodes.size(), false);
-                std::vector<bool> right_mask(visible_nodes.size(), false);
-                left_mask[left_idx] = true;
-                right_mask[right_idx] = true;
-
-                auto left = render_panel_image(
-                    context.viewport,
-                    render_size,
-                    std::nullopt,
-                    std::optional<std::vector<bool>>(left_mask),
-                    nullptr,
-                    nullptr,
-                    VksplatViewportRenderer::OutputSlot::SplitLeft);
-                auto right = render_panel_image(
-                    context.viewport,
-                    render_size,
-                    std::nullopt,
-                    std::optional<std::vector<bool>>(right_mask),
-                    nullptr,
-                    nullptr,
-                    VksplatViewportRenderer::OutputSlot::SplitRight);
-                if (left && right) {
-                    pending_split_view.enabled = true;
-                    pending_split_view.split_position = settings_.split_position;
-                    pending_split_view.background = settings_.background_color;
-                    pending_split_view.content_rect = {0, 0, render_size.x, render_size.y};
-                    pending_split_view.left = make_split_panel(*left, 0.0f, settings_.split_position, false);
-                    pending_split_view.right = make_split_panel(*right, settings_.split_position, 1.0f, false);
-                    rendered_metadata = makeSplitMetadata(left->metadata, right->metadata, settings_.split_position);
-                    rendered_split_info = SplitViewInfo{
-                        .enabled = true,
-                        .mode_label = "Split View",
-                        .detail_label = std::format("{} | {}",
-                                                    visible_nodes[left_idx]->name,
-                                                    visible_nodes[right_idx]->name),
-                        .left_name = visible_nodes[left_idx]->name,
-                        .right_name = visible_nodes[right_idx]->name};
+            const auto visible_nodes = scene_manager->getScene().getVisibleSplatNodeSlots();
+            const auto pair = plyComparisonPairForOffset(visible_nodes.size(), settings_.split_view_offset);
+            if (pair) {
+                const auto& left_node = visible_nodes[pair->first];
+                const auto& right_node = visible_nodes[pair->second];
+                const size_t slot_count = std::max(frame_ctx.scene_state.model_transforms.size(),
+                                                   frame_ctx.scene_state.node_visibility_mask.size());
+                if (!left_node.node || !right_node.node ||
+                    left_node.slot_index >= slot_count ||
+                    right_node.slot_index >= slot_count) {
+                    render_error = "PLY comparison render slots are unavailable";
                 } else {
-                    render_error = left ? right.error() : left.error();
+                    std::vector<bool> left_mask(slot_count, false);
+                    std::vector<bool> right_mask(slot_count, false);
+                    left_mask[left_node.slot_index] = true;
+                    right_mask[right_node.slot_index] = true;
+
+                    auto left = render_panel_image(
+                        context.viewport,
+                        render_size,
+                        std::nullopt,
+                        std::optional<std::vector<bool>>(left_mask),
+                        nullptr,
+                        nullptr,
+                        VksplatViewportRenderer::OutputSlot::SplitLeft);
+                    auto right = render_panel_image(
+                        context.viewport,
+                        render_size,
+                        std::nullopt,
+                        std::optional<std::vector<bool>>(right_mask),
+                        nullptr,
+                        nullptr,
+                        VksplatViewportRenderer::OutputSlot::SplitRight);
+                    if (left && right) {
+                        pending_split_view.enabled = true;
+                        pending_split_view.split_position = settings_.split_position;
+                        pending_split_view.background = settings_.background_color;
+                        pending_split_view.content_rect = {0, 0, render_size.x, render_size.y};
+                        pending_split_view.left = make_split_panel(*left, 0.0f, settings_.split_position, false);
+                        pending_split_view.right = make_split_panel(*right, settings_.split_position, 1.0f, false);
+                        rendered_metadata = makeSplitMetadata(left->metadata, right->metadata, settings_.split_position);
+                        rendered_split_info = SplitViewInfo{
+                            .enabled = true,
+                            .mode_label = "Split View",
+                            .detail_label = std::format("{} | {}",
+                                                        left_node.node->name,
+                                                        right_node.node->name),
+                            .left_name = left_node.node->name,
+                            .right_name = right_node.node->name};
+                    } else {
+                        render_error = left ? right.error() : left.error();
+                    }
                 }
             }
         }
@@ -1330,7 +1359,20 @@ namespace lfs::vis {
                 metadata.flip_y = render_result->flip_y;
                 viewport_artifact_service_.clearViewportOutput();
                 viewport_artifact_service_.setLazyCapture(
-                    []() -> std::shared_ptr<lfs::core::Tensor> { return {}; },
+                    [this]() -> std::shared_ptr<lfs::core::Tensor> {
+                        if (!point_cloud_vulkan_renderer_ || !last_vulkan_context_) {
+                            return {};
+                        }
+                        auto image = point_cloud_vulkan_renderer_->readOutputImage(
+                            *last_vulkan_context_,
+                            PointCloudVulkanRenderer::OutputSlot::Main);
+                        if (!image) {
+                            LOG_ERROR("Failed to capture point-cloud Vulkan viewport image: {}",
+                                      image.error());
+                            return {};
+                        }
+                        return std::move(*image);
+                    },
                     metadata,
                     render_result->size);
 
@@ -1809,6 +1851,34 @@ namespace lfs::vis {
                 .image_generation = vulkan_viewport_image_generation_,
                 .size = vulkan_viewport_image_size_,
                 .flip_y = vulkan_viewport_image_flip_y_};
+    }
+
+    lfs::io::SplatTensorAllocator RenderingManager::makeSplatTensorAllocator() const {
+        if (!last_vulkan_context_ || !last_vulkan_context_->externalMemoryInteropEnabled()) {
+            return {};
+        }
+        return [context = last_vulkan_context_](lfs::core::TensorShape shape,
+                                                const size_t capacity,
+                                                const lfs::core::DataType dtype,
+                                                const std::string_view name) -> lfs::core::Tensor {
+            const std::string debug_name{name};
+            auto tensor = makeVulkanExternalTensor(
+                *context,
+                std::move(shape),
+                dtype,
+                capacity,
+                debug_name.c_str(),
+                nullptr,
+                false);
+            if (!tensor) {
+                throw lfs::core::TensorError(std::format(
+                    "Vulkan-external thumbnail splat tensor allocation failed for '{}': {}",
+                    debug_name,
+                    tensor.error()));
+            }
+            tensor->set_name(debug_name);
+            return std::move(*tensor);
+        };
     }
 
 } // namespace lfs::vis

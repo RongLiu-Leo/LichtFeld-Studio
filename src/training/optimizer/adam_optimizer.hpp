@@ -67,6 +67,8 @@ namespace lfs::training {
         uint8_t* exp_avg_sq_q = nullptr;
         float* exp_avg_scale = nullptr;
         float* exp_avg_sq_scale = nullptr;
+        const bool* frozen_mask = nullptr;
+        int frozen_mask_size = 0;
         int n_elements = 0;
         int n_attributes = 0;
         float step_size = 0.0f;
@@ -102,6 +104,7 @@ namespace lfs::training {
         void step(int iteration);
         FastGSFusedAdamState prepare_fastgs_fused_adam(int iteration);
         void commit_fastgs_fused_adam(int iteration);
+        void set_frozen_mask(lfs::core::Tensor mask);
 
         // Gradient management
         void allocate_gradients();
@@ -158,6 +161,7 @@ namespace lfs::training {
         AdamConfig config_;
         lfs::core::SplatData& splat_data_;
         std::unordered_map<std::string, AdamParamState> states_;
+        lfs::core::Tensor frozen_mask_;
         int64_t fused_step_iteration_ = -1;
         bool last_step_zeroed_gradients_ = false;
 
@@ -177,6 +181,8 @@ namespace lfs::training {
                                    size_t moment_capacity, size_t prim_capacity);
         void quantize_float_moments(ParamType type, AdamParamState& state, lfs::core::Tensor&& exp_avg, lfs::core::Tensor&& exp_avg_sq);
         size_t scale_row_count(ParamType type) const;
+        const bool* frozen_mask_ptr() const;
+        int frozen_mask_size() const;
 
         // Translate a primitive-row delta into the actual tensor growth along dim 0.
         // shN (1D swizzled): delta = swizzled_float_count(N + n_new) - swizzled_float_count(N).

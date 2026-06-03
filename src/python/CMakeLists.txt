@@ -263,14 +263,15 @@ endif()
 
 target_link_libraries(lfs_py PRIVATE
     ${LFS_PY_INTERNAL_LINK_LIBS}
-    $<IF:$<PLATFORM_ID:Windows>,OpenMeshCore,OpenMeshCoreStatic>
-    $<IF:$<PLATFORM_ID:Windows>,OpenMeshTools,OpenMeshToolsStatic>
+    OpenMeshCore
+    OpenMeshTools
     OpenImageIO::OpenImageIO
     CUDA::cudart
     CUDA::curand
     ${CMAKE_DL_LIBS}
     imgui::imgui
     implot::implot
+    GPUOpen::VulkanMemoryAllocator
     $<IF:$<PLATFORM_ID:Windows>,RmlUi::RmlUi,lfs_rmlui>
 )
 

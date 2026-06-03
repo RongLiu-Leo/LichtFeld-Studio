@@ -111,6 +111,9 @@ namespace lfs::vis {
             VulkanContext& context,
             const RenderRequest& request,
             OutputSlot output_slot = OutputSlot::Main);
+        [[nodiscard]] std::expected<std::shared_ptr<lfs::core::Tensor>, std::string> readOutputImage(
+            VulkanContext& context,
+            OutputSlot output_slot = OutputSlot::Main);
 
         void reset();
 

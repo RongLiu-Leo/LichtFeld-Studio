@@ -631,10 +631,26 @@ namespace lfs::core {
         [[nodiscard]] float compute_voxel_size(const NativeRows& rows, int target_count) {
             float min[3], max[3];
             compute_bounds(rows, min, max);
-            float volume = (max[0] - min[0]) * (max[1] - min[1]) * (max[2] - min[2]);
-            if (volume <= 0.0f)
-                volume = 1.0f;
-            return std::pow(volume / std::max(1, target_count), 1.0f / 3.0f) * 1.2f;
+            float volume = 1.0f;
+            int active_dims = 0;
+            for (int axis = 0; axis < 3; ++axis) {
+                const float extent = max[axis] - min[axis];
+                if (extent > 1e-6f) {
+                    volume *= extent;
+                    ++active_dims;
+                }
+            }
+            if (active_dims == 0)
+                return 1.0f;
+            return std::pow(volume / std::max(1, target_count), 1.0f / static_cast<float>(active_dims)) * 1.2f;
+        }
+
+        [[nodiscard]] int pass_target_count_for(const int current_count,
+                                                const int final_target_count,
+                                                const float lod_base) {
+            const float base = std::max(lod_base, 1.01f);
+            const int lod_target = static_cast<int>(std::ceil(static_cast<float>(current_count) / base));
+            return std::clamp(std::max(final_target_count, lod_target), 1, std::max(1, current_count - 1));
         }
 
         struct VoxelKey {
@@ -677,15 +693,18 @@ namespace lfs::core {
 
             groups.reserve(cells.size());
             for (auto& [key, indices] : cells) {
+                std::sort(indices.begin(), indices.end());
                 groups.push_back(std::move(indices));
             }
+            std::sort(groups.begin(), groups.end(), [](const auto& lhs, const auto& rhs) {
+                return lhs.front() < rhs.front();
+            });
             return groups;
         }
 
         [[nodiscard]] NativeRows merge_voxel_groups(
             const NativeRows& input,
             const std::vector<std::vector<int>>& groups,
-            float voxel_size,
             std::vector<int>& keep_idx,
             SimplifyHistoryState* history,
             int pass_index) {
@@ -711,9 +730,6 @@ namespace lfs::core {
             out.rotation.resize(static_cast<size_t>(out.count) * 4);
             out.opacity.resize(static_cast<size_t>(out.count));
             out.appearance.resize(static_cast<size_t>(out.count) * static_cast<size_t>(out.app_dim));
-
-            const float filter2 = (0.5f * voxel_size) * (0.5f * voxel_size);
-
             // Rebuild current_node_ids from the output of this pass
             std::vector<int32_t> next_node_ids;
             if (history)
@@ -807,14 +823,12 @@ namespace lfs::core {
                         sigma[static_cast<size_t>(a)] += weights[g] * sig[static_cast<size_t>(a)];
                 }
 
-                // Add isotropic spatial regularization (filter2) to the blended covariance
-                sigma[0] += filter2;
-                sigma[4] += filter2;
-                sigma[8] += filter2;
-
                 sigma[1] = sigma[3] = 0.5f * (sigma[1] + sigma[3]);
                 sigma[2] = sigma[6] = 0.5f * (sigma[2] + sigma[6]);
                 sigma[5] = sigma[7] = 0.5f * (sigma[5] + sigma[7]);
+                sigma[0] += kEpsCov;
+                sigma[4] += kEpsCov;
+                sigma[8] += kEpsCov;
 
                 std::array<float, 3> scaling_raw{};
                 std::array<float, 4> rotation{};
@@ -953,7 +967,11 @@ namespace lfs::core {
 
                     float bounds_min[3], bounds_max[3];
                     compute_bounds(current, bounds_min, bounds_max);
-                    float voxel_size = compute_voxel_size(current, target_count);
+                    const int pass_target_count = pass_target_count_for(
+                        current.count,
+                        target_count,
+                        options.lod_base);
+                    float voxel_size = compute_voxel_size(current, pass_target_count);
 
                     // If we're not reducing enough, increase voxel size
                     bool reduced = false;
@@ -976,7 +994,7 @@ namespace lfs::core {
                                              pass_prefix + "merging " + std::to_string(merge_count) + " voxels"))
                             return std::unexpected("Cancelled");
 
-                        current = merge_voxel_groups(current, groups, voxel_size, keep_idx, history, pass);
+                        current = merge_voxel_groups(current, groups, keep_idx, history, pass);
                         reduced = true;
                     }
 

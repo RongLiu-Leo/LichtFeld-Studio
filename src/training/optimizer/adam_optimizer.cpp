@@ -87,6 +87,22 @@ namespace lfs::training {
         : config_(config),
           splat_data_(splat_data) {}
 
+    void AdamOptimizer::set_frozen_mask(lfs::core::Tensor mask) {
+        if (mask.is_valid()) {
+            if (mask.dtype() != lfs::core::DataType::Bool || mask.ndim() != 1) {
+                throw std::runtime_error("AdamOptimizer frozen mask must be a 1D bool tensor");
+            }
+            if (mask.device() != lfs::core::Device::CUDA) {
+                mask = mask.cuda();
+            }
+            if (!mask.is_contiguous()) {
+                mask = mask.contiguous();
+            }
+            mask.set_name("adam.frozen_mask");
+        }
+        frozen_mask_ = std::move(mask);
+    }
+
     void AdamOptimizer::step(const int iteration) {
         LFS_TRACE("kernel.adam.step");
         if (fused_step_iteration_ == iteration) {
@@ -229,6 +245,18 @@ namespace lfs::training {
     // contiguous params (shape[0] == N) and swizzled shN (separate 1D moment buffer, scale = N).
     size_t AdamOptimizer::scale_row_count(ParamType /*type*/) const {
         return static_cast<size_t>(splat_data_.size());
+    }
+
+    const bool* AdamOptimizer::frozen_mask_ptr() const {
+        return frozen_mask_.is_valid() && frozen_mask_.numel() > 0
+                   ? frozen_mask_.ptr<bool>()
+                   : nullptr;
+    }
+
+    int AdamOptimizer::frozen_mask_size() const {
+        return frozen_mask_.is_valid()
+                   ? static_cast<int>(frozen_mask_.numel())
+                   : 0;
     }
 
     void AdamOptimizer::alloc_quantized_state(ParamType type, AdamParamState& state,
@@ -419,6 +447,9 @@ namespace lfs::training {
         lfs::core::waitForCUDAStream(execution_stream, state.exp_avg_scale.stream());
         lfs::core::waitForCUDAStream(execution_stream, state.exp_avg_sq_scale.stream());
         lfs::core::waitForCUDAStream(execution_stream, state.grad.stream());
+        if (frozen_mask_.is_valid()) {
+            lfs::core::waitForCUDAStream(execution_stream, frozen_mask_.stream());
+        }
 
         if (type == ParamType::ShN) {
             const auto layout_rest = static_cast<uint32_t>(splat_data_.max_sh_coeffs_rest());
@@ -430,6 +461,8 @@ namespace lfs::training {
                 state.exp_avg_sq.ptr<uint8_t>(),
                 state.exp_avg_sq_scale.ptr<float>(),
                 state.grad.ptr<float>(),
+                frozen_mask_ptr(),
+                frozen_mask_size(),
                 static_cast<int>(scale_row_count(type)),
                 slots,
                 param_lr,
@@ -456,6 +489,8 @@ namespace lfs::training {
             state.exp_avg_sq.ptr<uint8_t>(),
             state.exp_avg_sq_scale.ptr<float>(),
             state.grad.ptr<float>(),
+            frozen_mask_ptr(),
+            frozen_mask_size(),
             static_cast<int>(state.size),
             static_cast<int>(feature_dim),
             param_lr,
@@ -514,6 +549,8 @@ namespace lfs::training {
             out.exp_avg_sq_q = state.exp_avg_sq.ptr<uint8_t>();
             out.exp_avg_scale = state.exp_avg_scale.ptr<float>();
             out.exp_avg_sq_scale = state.exp_avg_sq_scale.ptr<float>();
+            out.frozen_mask = frozen_mask_ptr();
+            out.frozen_mask_size = frozen_mask_size();
             out.n_elements = static_cast<int>(param.numel());
             out.n_attributes = n_attributes;
             out.step_size = static_cast<float>(get_param_lr(type) * bias_correction1_rcp);

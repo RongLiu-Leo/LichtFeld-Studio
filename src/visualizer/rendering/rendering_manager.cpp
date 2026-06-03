@@ -148,6 +148,54 @@ namespace lfs::vis {
         return settings_.lod_enabled;
     }
 
+    void RenderingManager::releaseSceneModelResources() {
+        clearVulkanMeshFrame();
+
+        point_cloud_colors_cache_ = {};
+        point_cloud_colors_cache_key_ = nullptr;
+        point_cloud_colors_cache_size_ = 0;
+        ++point_cloud_data_revision_;
+        ++point_cloud_preview_selection_revision_;
+
+        if (vksplat_viewport_renderer_) {
+            vksplat_viewport_renderer_->releaseSceneResources();
+        }
+        if (point_cloud_vulkan_renderer_) {
+            point_cloud_vulkan_renderer_->reset();
+        }
+        frame_lifecycle_service_.resetModelTracking();
+    }
+
+    void RenderingManager::releaseSceneRenderResources() {
+        viewport_artifact_service_.clearViewportOutput();
+        vulkan_viewport_image_.reset();
+        vulkan_viewport_image_generation_ = 0;
+        vulkan_external_viewport_image_ = VK_NULL_HANDLE;
+        vulkan_external_viewport_image_view_ = VK_NULL_HANDLE;
+        vulkan_external_viewport_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+        vulkan_external_viewport_image_generation_ = 0;
+        split_view_image_generation_ = 0;
+        vulkan_viewport_image_size_ = {0, 0};
+        vulkan_viewport_image_flip_y_ = false;
+
+        clearVulkanMeshFrame();
+
+        point_cloud_colors_cache_ = {};
+        point_cloud_colors_cache_key_ = nullptr;
+        point_cloud_colors_cache_size_ = 0;
+        ++point_cloud_data_revision_;
+        ++point_cloud_preview_selection_revision_;
+
+        if (vksplat_viewport_renderer_) {
+            vksplat_viewport_renderer_->reset();
+        }
+        if (point_cloud_vulkan_renderer_) {
+            point_cloud_vulkan_renderer_->reset();
+        }
+        frame_lifecycle_service_.resetModelTracking();
+        lfs::core::Tensor::trim_memory_pool();
+    }
+
     void RenderingManager::updateSettings(const RenderSettings& new_settings) {
         updateSettings(new_settings, DirtyFlag::ALL);
     }

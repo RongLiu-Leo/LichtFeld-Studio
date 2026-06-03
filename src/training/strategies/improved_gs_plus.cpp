@@ -310,7 +310,7 @@ namespace lfs::training {
         }
 
         gaussian_scores.div_(static_cast<float>(num_views));
-        return gaussian_scores;
+        return zero_frozen_scores(*_splat_data, gaussian_scores);
     }
 
     void ImprovedGSPlus::ensure_error_score_shape() {
@@ -331,7 +331,12 @@ namespace lfs::training {
             return;
         }
 
-        const auto active_indices = get_active_indices();
+        auto active_indices = get_active_indices();
+        if (auto frozen_mask = make_frozen_mask(*_splat_data, static_cast<size_t>(current_size), _splat_data->means().device());
+            frozen_mask.is_valid() && active_indices.numel() > 0) {
+            auto trainable = frozen_mask.index_select(0, active_indices).logical_not();
+            active_indices = active_indices.masked_select(trainable);
+        }
         const int64_t total_active = static_cast<int64_t>(active_indices.numel());
         if (total_active == 0) {
             return;
@@ -582,7 +587,17 @@ namespace lfs::training {
         const float reset_value = 0.1;
         const float logit_reset_value = std::log(reset_value / (1.0f - reset_value));
 
-        _splat_data->opacity_raw().clamp_max_(logit_reset_value);
+        auto& raw_opacity = _splat_data->opacity_raw();
+        if (auto frozen_mask = make_frozen_mask(*_splat_data, _splat_data->size(), raw_opacity.device());
+            frozen_mask.is_valid()) {
+            if (raw_opacity.ndim() == 2) {
+                frozen_mask = frozen_mask.unsqueeze(-1);
+            }
+            auto reset_mask = (raw_opacity > logit_reset_value).logical_and(frozen_mask.logical_not());
+            raw_opacity.masked_fill_(reset_mask, logit_reset_value);
+        } else {
+            raw_opacity.clamp_max_(logit_reset_value);
+        }
 
         auto* state = _optimizer->get_state_mutable(ParamType::Opacity);
         if (state) {
@@ -631,6 +646,7 @@ namespace lfs::training {
                     _error_score_max.ptr<float>(),
                     error_row,
                     _error_score_max.numel());
+                zero_frozen_scores_inplace(*_splat_data, _error_score_max);
             }
 
             _splat_data->_densification_info.zero_();
@@ -711,7 +727,8 @@ namespace lfs::training {
     }
 
     void ImprovedGSPlus::remove_gaussians(const lfs::core::Tensor& mask) {
-        int mask_sum = mask.to(lfs::core::DataType::Int32).sum().template item<int>();
+        const auto prune_mask = exclude_frozen_from_mask(*_splat_data, mask);
+        int mask_sum = prune_mask.to(lfs::core::DataType::Int32).sum().template item<int>();
 
         if (mask_sum == 0) {
             LOG_DEBUG("No Gaussians to remove");
@@ -719,7 +736,7 @@ namespace lfs::training {
         }
 
         LOG_DEBUG("Removing {} Gaussians", mask_sum);
-        remove(mask);
+        remove(prune_mask);
     }
 
     void ImprovedGSPlus::reserve_optimizer_capacity(size_t capacity) {
@@ -822,6 +839,7 @@ namespace lfs::training {
             auto active_mask = _free_mask.slice(0, 0, prune_mask.numel()).logical_not();
             prune_mask = prune_mask.logical_and(active_mask);
         }
+        prune_mask = exclude_frozen_from_mask(*_splat_data, prune_mask);
         remove(prune_mask);
     }
 
@@ -829,15 +847,25 @@ namespace lfs::training {
         if (!_free_mask.is_valid() || indices.numel() == 0) {
             return;
         }
+        auto target_indices = indices;
+        if (auto frozen_mask = make_frozen_mask(*_splat_data, _splat_data->size(), indices.device());
+            frozen_mask.is_valid()) {
+            auto trainable = frozen_mask.index_select(0, indices).logical_not();
+            target_indices = indices.masked_select(trainable);
+            if (target_indices.numel() == 0) {
+                return;
+            }
+        }
         // Mark the given indices as free
-        auto true_vals = lfs::core::Tensor::ones_bool({static_cast<size_t>(indices.numel())}, indices.device());
-        _free_mask.index_put_(indices, true_vals);
+        auto true_vals = lfs::core::Tensor::ones_bool({static_cast<size_t>(target_indices.numel())}, target_indices.device());
+        _free_mask.index_put_(target_indices, true_vals);
     }
 
     void ImprovedGSPlus::remove(const lfs::core::Tensor& is_prune) {
         // Soft deletion: mark slots as free instead of resizing tensors
         // This avoids expensive tensor reallocations during training
-        const lfs::core::Tensor prune_indices = is_prune.nonzero().squeeze(-1);
+        const auto prune_mask = exclude_frozen_from_mask(*_splat_data, is_prune);
+        const lfs::core::Tensor prune_indices = prune_mask.nonzero().squeeze(-1);
         const int64_t num_pruned = prune_indices.numel();
 
         if (num_pruned == 0) {
@@ -931,6 +959,11 @@ namespace lfs::training {
         // Find free slot indices within current size
         auto active_region = _free_mask.slice(0, 0, current_size);
         auto free_indices = active_region.nonzero().squeeze(-1);
+        if (auto frozen_mask = make_frozen_mask(*_splat_data, current_size, free_indices.device());
+            frozen_mask.is_valid() && free_indices.numel() > 0) {
+            auto trainable = frozen_mask.index_select(0, free_indices).logical_not();
+            free_indices = free_indices.masked_select(trainable);
+        }
         const int64_t num_free = free_indices.numel();
 
         if (num_free == 0) {

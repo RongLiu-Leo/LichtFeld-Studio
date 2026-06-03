@@ -9,6 +9,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -51,6 +52,12 @@ namespace lfs::vis {
             VkImageView swapchain_image_view = VK_NULL_HANDLE;
             VkImageView depth_stencil_image_view = VK_NULL_HANDLE;
             VkExtent2D extent{};
+        };
+
+        struct WindowCapture {
+            int width = 0;
+            int height = 0;
+            std::vector<std::uint8_t> rgba;
         };
 
 #ifdef _WIN32
@@ -148,6 +155,7 @@ namespace lfs::vis {
 
         [[nodiscard]] bool beginFrame(const VkClearValue& clear_value, Frame& frame);
         [[nodiscard]] bool endFrame();
+        [[nodiscard]] std::expected<WindowCapture, std::string> captureActiveFrameRgba();
         [[nodiscard]] bool waitForCurrentFrameSlot();
         [[nodiscard]] bool waitForSubmittedFrames();
         [[nodiscard]] bool deviceWaitIdle();
@@ -236,6 +244,7 @@ namespace lfs::vis {
         bool createDebugMessenger();
         bool createPipelineCache();
         bool recreateSwapchain();
+        bool finishActiveRendering(VkCommandBuffer command_buffer);
 
         void destroyDebugMessenger();
         void destroyAllocator();
@@ -332,6 +341,7 @@ namespace lfs::vis {
 
         bool framebuffer_resized_ = false;
         bool frame_active_ = false;
+        bool frame_rendering_active_ = false;
         bool frame_suboptimal_ = false;
         bool debug_utils_enabled_ = false;
         bool validation_enabled_ = false;

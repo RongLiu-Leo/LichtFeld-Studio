@@ -14,7 +14,7 @@ namespace lfs::vis {
         }
 
         void applyGaussianCropBox(lfs::rendering::GaussianFilterState& filters, const FrameContext& ctx) {
-            if (!ctx.scene_manager || !(ctx.settings.use_crop_box || ctx.settings.show_crop_box)) {
+            if (!(ctx.settings.use_crop_box || ctx.settings.show_crop_box)) {
                 return;
             }
 
@@ -36,11 +36,11 @@ namespace lfs::vis {
                 .inverse = cb.data->inverse,
                 .desaturate =
                     ctx.settings.show_crop_box && !ctx.settings.use_crop_box && ctx.settings.desaturate_cropping,
-                .parent_node_index = ctx.scene_manager->getScene().getVisibleNodeIndex(cb.parent_splat_id)};
+                .parent_node_index = cb.parent_node_index};
         }
 
         void applyPointCloudCropBox(lfs::rendering::PointCloudFilterState& filters, const FrameContext& ctx) {
-            if (!ctx.scene_manager || !(ctx.settings.use_crop_box || ctx.settings.show_crop_box)) {
+            if (!(ctx.settings.use_crop_box || ctx.settings.show_crop_box)) {
                 return;
             }
 
@@ -64,13 +64,13 @@ namespace lfs::vis {
         }
 
         void applyGaussianEllipsoid(lfs::rendering::GaussianFilterState& filters, const FrameContext& ctx) {
-            if (!ctx.scene_manager || !(ctx.settings.use_ellipsoid || ctx.settings.show_ellipsoid)) {
+            if (!(ctx.settings.use_ellipsoid || ctx.settings.show_ellipsoid)) {
                 return;
             }
 
-            const auto& scene = ctx.scene_manager->getScene();
             const auto& visible_ellipsoids = ctx.scene_state.ellipsoids;
-            const core::NodeId selected_ellipsoid_id = ctx.scene_manager->getSelectedNodeEllipsoidId();
+            const core::NodeId selected_ellipsoid_id =
+                ctx.scene_manager ? ctx.scene_manager->getSelectedNodeEllipsoidId() : core::NULL_NODE;
             for (const auto& el : visible_ellipsoids) {
                 if (!el.data) {
                     continue;
@@ -86,7 +86,7 @@ namespace lfs::vis {
                     .desaturate = ctx.settings.show_ellipsoid &&
                                   !ctx.settings.use_ellipsoid &&
                                   ctx.settings.desaturate_cropping,
-                    .parent_node_index = scene.getVisibleNodeIndex(el.parent_splat_id)};
+                    .parent_node_index = el.parent_node_index};
                 return;
             }
         }

@@ -1225,10 +1225,26 @@ def render_view(rotation: Tensor, translation: Tensor, width: int, height: int, 
         width: Render width in pixels
         height: Render height in pixels
         fov: Vertical field of view in degrees (default: 60)
-        bg_color: Optional [3] RGB background color
+        bg_color: Accepted for compatibility; the Vulkan preview path uses current render settings
 
     Returns:
-        Tensor [H, W, 3] RGB image on CUDA, or None if scene not available
+        CPU Tensor [H, W, 3] RGB image, or None if no active visualizer scene is available
+    """
+
+def render_view_u8(rotation: Tensor, translation: Tensor, width: int, height: int, fov: float = 60.0, bg_color: Tensor | None = None) -> Tensor | None:
+    """
+    Render scene from arbitrary camera parameters as an 8-bit RGB image.
+
+    Args:
+        rotation: [3, 3] camera-to-world rotation in visualizer coordinates
+        translation: [3] camera position in visualizer world coordinates
+        width: Render width in pixels
+        height: Render height in pixels
+        fov: Vertical field of view in degrees (default: 60)
+        bg_color: Accepted for compatibility; the Vulkan preview path uses current render settings
+
+    Returns:
+        CPU uint8 Tensor [H, W, 3] RGB image, or None if no active visualizer scene is available
     """
 
 def compute_screen_positions(rotation: Tensor, translation: Tensor, width: int, height: int, fov: float = 60.0) -> Tensor | None:

@@ -176,6 +176,10 @@ namespace fast_lfs::rasterization::kernels {
         const float eps) {
         if (!param.enabled || param.n_attributes <= 0)
             return;
+        if (param.frozen_mask != nullptr &&
+            primitive_idx < static_cast<uint>(param.frozen_mask_size) &&
+            param.frozen_mask[primitive_idx])
+            return;
         const uint n_attr = static_cast<uint>(param.n_attributes);
         const uint base = primitive_idx * n_attr;
         if (base >= static_cast<uint>(param.n_elements))
@@ -292,6 +296,10 @@ namespace fast_lfs::rasterization::kernels {
         const uint sh_layout_slots) {
         const FusedAdamParam& p = fused_adam.shN;
         if (!p.enabled || n_slots_to_update == 0u || sh_layout_slots == 0u)
+            return;
+        if (p.frozen_mask != nullptr &&
+            primitive_idx < static_cast<uint>(p.frozen_mask_size) &&
+            p.frozen_mask[primitive_idx])
             return;
 
         float4* param4 = reinterpret_cast<float4*>(p.param);

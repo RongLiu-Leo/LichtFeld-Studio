@@ -162,10 +162,12 @@ namespace lfs::training {
         if (!_error_score_max.is_valid() ||
             _error_score_max.ndim() != 1 ||
             _error_score_max.numel() != n) {
-            return Tensor::ones({n}, _splat_data->means().device());
+            return zero_frozen_scores(
+                *_splat_data,
+                Tensor::ones({n}, _splat_data->means().device()));
         }
 
-        return _error_score_max.clamp_min(1e-12f);
+        return zero_frozen_scores(*_splat_data, _error_score_max.clamp_min(1e-12f));
     }
 
     int MCMC::relocate_gs() {
@@ -192,6 +194,7 @@ namespace lfs::training {
                 opacities,
                 _splat_data->rotation_raw(),
                 _params->min_opacity);
+            dead_mask = exclude_frozen_from_mask(*_splat_data, dead_mask);
             dead_indices = dead_mask.nonzero().squeeze(-1);
             n_dead = dead_indices.numel();
         }
@@ -217,6 +220,10 @@ namespace lfs::training {
             // Get source tensors (contiguous)
             Tensor opacities_contig = opacities.contiguous();
             const Tensor sampling_weights = get_sampling_weights();
+            const auto alive_weights = sampling_weights.index_select(0, alive_indices);
+            if (alive_weights.count_nonzero() == 0) {
+                return 0;
+            }
             Tensor scaling_raw_contig = _splat_data->scaling_raw().contiguous(); // Pass raw scaling, kernel applies exp()
 
             // Allocate outputs
@@ -403,6 +410,9 @@ namespace lfs::training {
             auto scaling_raw_contig = _splat_data->scaling_raw().contiguous(); // Pass raw scaling, kernel applies exp()
             auto opacities_contig = opacities.contiguous();
             const auto sampling_weights = get_sampling_weights();
+            if (sampling_weights.count_nonzero() == 0) {
+                return 0;
+            }
 
             // Allocate output tensors
             sampled_idxs = Tensor::empty({n_new}, Device::CUDA, DataType::Int64);
@@ -513,12 +523,19 @@ namespace lfs::training {
             return 0;
         }
 
-        const int n_new = sampled_idxs.numel();
-        if (n_new == 0)
-            return 0;
-
         // Ensure indices are Int64 (test may pass Int32)
         Tensor sampled_idxs_i64 = (sampled_idxs.dtype() == DataType::Int64) ? sampled_idxs : sampled_idxs.to(DataType::Int64);
+
+        const size_t required = _splat_data->size();
+        if (auto frozen_mask = make_frozen_mask(*_splat_data, required, sampled_idxs_i64.device());
+            frozen_mask.is_valid()) {
+            auto trainable = frozen_mask.index_select(0, sampled_idxs_i64).logical_not();
+            sampled_idxs_i64 = sampled_idxs_i64.masked_select(trainable);
+        }
+
+        const int n_new = sampled_idxs_i64.numel();
+        if (n_new == 0)
+            return 0;
 
         // Get opacities
         auto opacities = _splat_data->get_opacity();
@@ -528,7 +545,6 @@ namespace lfs::training {
         auto sampled_scales = _splat_data->get_scaling().index_select(0, sampled_idxs_i64);
 
         // Ensure cached ones buffer covers current model size
-        const size_t required = _splat_data->size();
         if (!_ones_int32.is_valid() || _ones_int32.numel() < required) {
             _ones_int32 = Tensor::ones({required}, Device::CUDA, DataType::Int32);
         }
@@ -630,12 +646,18 @@ namespace lfs::training {
         // Call CUDA add_noise kernel (uses first size() elements of buffer)
         {
             LOG_TIMER("inject_noise_cuda_kernel");
+            const auto frozen_mask = make_frozen_mask(
+                *_splat_data,
+                static_cast<size_t>(_splat_data->size()),
+                Device::CUDA);
             mcmc::launch_add_noise_kernel(
                 _splat_data->opacity_raw().ptr<float>(),
                 _splat_data->scaling_raw().ptr<float>(),
                 _splat_data->rotation_raw().ptr<float>(),
                 _noise_buffer.ptr<float>(),
                 _splat_data->means().ptr<float>(),
+                frozen_mask.is_valid() ? frozen_mask.ptr<bool>() : nullptr,
+                frozen_mask.is_valid() ? frozen_mask.numel() : 0,
                 current_lr,
                 _splat_data->size());
         }
@@ -745,7 +767,8 @@ namespace lfs::training {
             return;
         }
 
-        const int n_remove = mask.to(DataType::Int32).sum().template item<int>();
+        const auto prune_mask = exclude_frozen_from_mask(*_splat_data, mask);
+        const int n_remove = prune_mask.to(DataType::Int32).sum().template item<int>();
 
         LOG_INFO("MCMC::remove_gaussians called: mask size={}, n_remove={}, current size={}",
                  mask.numel(), n_remove, _splat_data->size());
@@ -758,7 +781,7 @@ namespace lfs::training {
         LOG_DEBUG("MCMC: Removing {} Gaussians", n_remove);
         LFS_COUNTER_ADD("strategy.mcmc.pruned", n_remove);
 
-        const Tensor prune_indices = mask.nonzero().squeeze(-1);
+        const Tensor prune_indices = prune_mask.nonzero().squeeze(-1);
 
         set_deleted_mask_rows(*_splat_data, prune_indices, true);
 

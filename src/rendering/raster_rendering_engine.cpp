@@ -622,10 +622,13 @@ namespace lfs::rendering {
             const Tensor& positions_source,
             const Tensor& colors_source,
             const PointCloudRenderRequest& request) {
-            if (request.frame_view.size.x <= 0 || request.frame_view.size.y <= 0 ||
-                request.frame_view.size.x > MAX_VIEWPORT_SIZE ||
-                request.frame_view.size.y > MAX_VIEWPORT_SIZE) {
+            if (request.frame_view.size.x <= 0 || request.frame_view.size.y <= 0) {
                 return std::unexpected("Invalid viewport dimensions");
+            }
+            const auto width_pixels = static_cast<std::size_t>(request.frame_view.size.x);
+            const auto height_pixels = static_cast<std::size_t>(request.frame_view.size.y);
+            if (width_pixels > std::numeric_limits<std::size_t>::max() / height_pixels) {
+                return std::unexpected("Viewport dimensions overflow pixel count");
             }
             if (!positions_source.is_valid() || positions_source.ndim() != 2 || positions_source.size(1) != 3) {
                 return std::unexpected("Point cloud positions must have shape [N, 3]");

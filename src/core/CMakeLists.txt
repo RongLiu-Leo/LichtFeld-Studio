@@ -102,7 +102,7 @@ target_link_libraries(lfs_core
         lfs_tensor_kernels
         taywee::args
         OpenImageIO::OpenImageIO
-        $<IF:$<PLATFORM_ID:Windows>,OpenMeshCore,OpenMeshCoreStatic>
+        OpenMeshCore
 )
 
 # OpenMP for tensor multi-threaded operations

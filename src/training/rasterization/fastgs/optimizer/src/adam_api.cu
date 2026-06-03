@@ -59,6 +59,8 @@ namespace fast_lfs::optimizer {
         std::uint8_t* exp_avg_sq_q,
         float* exp_avg_sq_scale,
         const float* param_grad,
+        const bool* frozen_mask,
+        const int frozen_mask_size,
         const int n_rows,
         const int row_size,
         const float lr,
@@ -79,9 +81,10 @@ namespace fast_lfs::optimizer {
             throw std::runtime_error("n_rows and row_size must be positive");
         }
 
-        adam_step_quantized(param, exp_avg_q, exp_avg_scale, exp_avg_sq_q, exp_avg_sq_scale,
-                            param_grad, n_rows, row_size, lr, beta1, beta2, eps,
-                            bias_correction1_rcp, bias_correction2_sqrt_rcp, stream);
+        adam_step_quantized(
+            param, exp_avg_q, exp_avg_scale, exp_avg_sq_q, exp_avg_sq_scale,
+            param_grad, frozen_mask, frozen_mask_size, n_rows, row_size, lr, beta1, beta2, eps,
+            bias_correction1_rcp, bias_correction2_sqrt_rcp, stream);
     }
 
     void adam_step_quantized_swizzled_raw(
@@ -91,6 +94,8 @@ namespace fast_lfs::optimizer {
         std::uint8_t* exp_avg_sq_q,
         float* exp_avg_sq_scale,
         const float* param_grad,
+        const bool* frozen_mask,
+        const int frozen_mask_size,
         const int n_primitives,
         const int slots_per_primitive,
         const float lr,
@@ -111,9 +116,10 @@ namespace fast_lfs::optimizer {
             throw std::runtime_error("n_primitives and slots_per_primitive must be positive");
         }
 
-        adam_step_quantized_swizzled(param, exp_avg_q, exp_avg_scale, exp_avg_sq_q, exp_avg_sq_scale,
-                                     param_grad, n_primitives, slots_per_primitive, lr, beta1, beta2, eps,
-                                     bias_correction1_rcp, bias_correction2_sqrt_rcp, stream);
+        adam_step_quantized_swizzled(
+            param, exp_avg_q, exp_avg_scale, exp_avg_sq_q, exp_avg_sq_scale,
+            param_grad, frozen_mask, frozen_mask_size, n_primitives, slots_per_primitive,
+            lr, beta1, beta2, eps, bias_correction1_rcp, bias_correction2_sqrt_rcp, stream);
     }
 
     void quantize_adam_moments_raw(
