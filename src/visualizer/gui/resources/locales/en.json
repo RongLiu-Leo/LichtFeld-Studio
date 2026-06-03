@@ -1081,7 +1081,7 @@
     "export_merged": "Export Merged...",
     "rad_customize_lod": "Customize Level of Detail",
     "rad_lod_levels": "Level of Detail Levels",
-    "no_lod_settings": "No Level of Detail settings (using defaults)",
+    "no_lod_settings": "No Level of Detail (flat export)",
     "rad_flip_y": "Flip Y axis",
     "colmap_writes_sparse": "Writes cameras.bin, images.bin, and points3D.bin",
     "colmap_no_sparse": "No COLMAP sparse folder found",

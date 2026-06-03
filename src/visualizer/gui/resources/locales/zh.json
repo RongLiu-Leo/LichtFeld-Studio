@@ -895,7 +895,7 @@
     "export_merged": "导出合并的...",
     "rad_customize_lod": "自定义Level of Detail",
     "rad_lod_levels": "Level of Detail级别",
-    "no_lod_settings": "无Level of Detail设置（使用默认值）",
+    "no_lod_settings": "无Level of Detail（平面导出）",
     "rad_flip_y": "翻转Y轴",
     "colmap_writes_sparse": "写入 cameras.bin、images.bin 和 points3D.bin",
     "colmap_no_sparse": "未找到 COLMAP sparse 文件夹",

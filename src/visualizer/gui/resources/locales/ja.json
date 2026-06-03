@@ -1065,7 +1065,7 @@
     "export_merged": "結合してエクスポート...",
     "rad_customize_lod": "Level of Detailをカスタマイズ",
     "rad_lod_levels": "Level of Detailレベル",
-    "no_lod_settings": "Level of Detail設定なし（デフォルトを使用）",
+    "no_lod_settings": "Level of Detailなし（フラットエクスポート）",
     "rad_flip_y": "Y軸を反転",
     "colmap_writes_sparse": "cameras.bin、images.bin、points3D.binを書き込みます",
     "colmap_no_sparse": "COLMAP sparseフォルダーが見つかりません",

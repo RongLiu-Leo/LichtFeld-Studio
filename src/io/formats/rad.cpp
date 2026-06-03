@@ -1585,13 +1585,15 @@ namespace lfs::io {
                     throw std::runtime_error("CANCELLED");
                 }
 
-                // 0.3: Building LOD (always report, even if using defaults)
-                if (!report_progress(0.3f, "Building LOD...")) {
-                    throw std::runtime_error("CANCELLED");
-                }
+                // 0.3: Building LOD only when explicitly requested
+                if (!lod_ratios_.empty()) {
+                    if (!report_progress(0.3f, "Building LOD...")) {
+                        throw std::runtime_error("CANCELLED");
+                    }
 
-                if (auto lod_packed = build_lod(*export_source, lod_ratios_)) {
-                    packed = std::move(*lod_packed);
+                    if (auto lod_packed = build_lod(*export_source, lod_ratios_)) {
+                        packed = std::move(*lod_packed);
+                    }
                 }
 
                 // 0.4: Preparing chunks
@@ -2586,7 +2588,7 @@ namespace lfs::io {
 
             // Backward compatibility: use default three-level LOD
             static std::optional<PackedSplatData> build_three_level_lod(const SplatData& source) {
-                return build_lod(source, {}); // Empty ratios = use defaults
+                return build_lod(source, {}); // Empty ratios triggers default {0.2, 0.5, 1.0}
             }
 
             std::pair<RadChunkMeta, std::vector<uint8_t>> encode_chunk(

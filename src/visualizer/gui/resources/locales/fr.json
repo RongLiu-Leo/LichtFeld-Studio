@@ -1065,7 +1065,7 @@
     "export_merged": "Exporter Fusionné...",
     "rad_customize_lod": "Personnaliser Level of Detail",
     "rad_lod_levels": "Niveaux Level of Detail",
-    "no_lod_settings": "Pas de paramètres Level of Detail (utilisation des valeurs par défaut)",
+    "no_lod_settings": "Pas de paramètres Level of Detail (export plat)",
     "rad_flip_y": "Inverser l'axe Y",
     "colmap_writes_sparse": "Écrit cameras.bin, images.bin et points3D.bin",
     "colmap_no_sparse": "Aucun dossier sparse COLMAP trouvé",
