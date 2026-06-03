@@ -15,10 +15,10 @@
 #include "io/loader.hpp"
 #include "sequencer/rml_sequencer_panel.hpp"
 #include "sequencer/sequencer_controller.hpp"
-#include <core/export.hpp>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <core/export.hpp>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
