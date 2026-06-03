@@ -58,6 +58,7 @@ set(CORE_SOURCES
         reactive_store.cpp
         scene.cpp
         splat_simplify.cpp
+        bhatt_lod.cpp
         splat_data.cpp
         splat_data_mirror.cpp
         splat_data_transform.cpp
