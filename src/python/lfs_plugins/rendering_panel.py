@@ -1212,8 +1212,7 @@ class RenderingPanel(Panel):
         lf.simplify_splats(
             self._simplify_source_name,
             ratio=self._compute_simplify_ratio(),
-            knn_k=self._compute_simplify_knn_k(),
-            merge_cap=self._compute_simplify_merge_cap(),
+            lod_base=self._compute_simplify_lod_base(),
             opacity_prune_threshold=self._compute_simplify_opacity_prune_threshold(),
         )
         self._sync_simplify_task_state(force=True)

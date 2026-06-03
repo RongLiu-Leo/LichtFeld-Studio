@@ -319,8 +319,7 @@ def test_rendering_rml_exposes_simplify_tooltips_and_locale_labels():
 
     assert 'data-tooltip="tooltip.simplify_source"' in content
     assert 'data-tooltip="tooltip.simplify_target"' in content
-    assert 'data-tooltip="tooltip.simplify_knn_k"' in content
-    assert 'data-tooltip="tooltip.simplify_merge_cap"' in content
+    assert 'data-tooltip="tooltip.simplify_lod_base"' in content
     assert 'data-tooltip="tooltip.simplify_opacity_prune"' in content
     assert 'data-tooltip="tooltip.simplify_output"' in content
     assert 'data-tooltip="tooltip.simplify_apply"' in content
@@ -334,8 +333,7 @@ def test_rendering_rml_exposes_simplify_tooltips_and_locale_labels():
     assert "{{label_simplify_source}}" in content
     assert "{{label_simplify_select_source}}" in content
     assert "{{label_simplify_target}}" in content
-    assert "{{label_simplify_knn_k}}" in content
-    assert "{{label_simplify_merge_cap}}" in content
+    assert "{{label_simplify_lod_base}}" in content
     assert "{{label_simplify_opacity_prune}}" in content
     assert "{{label_simplify_original}}" in content
     assert "{{label_simplify_target_stat}}" in content

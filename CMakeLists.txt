@@ -841,6 +841,9 @@ if(UNIX)
                 "$ORIGIN/lib"
                 "${CUDAToolkit_LIBRARY_DIR}"
         )
+        if(TARGET OpenMeshCore)
+            list(APPEND _lichtfeld_runtime_rpath_common "$<TARGET_FILE_DIR:OpenMeshCore>")
+        endif()
         set(_lichtfeld_runtime_rpath_release "${_lichtfeld_runtime_rpath_common}")
         set(_lichtfeld_runtime_rpath_debug "${_lichtfeld_runtime_rpath_common}")
         if(DEFINED VCPKG_TARGET_TRIPLET)

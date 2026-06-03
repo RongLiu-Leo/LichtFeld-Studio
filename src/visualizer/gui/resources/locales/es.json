@@ -259,7 +259,8 @@
     "lod_cone_foveation": "Factor de penalización periférica Level of Detail (1.0 = sin penalización)",
     "lod_cone_inner_degrees": "Ángulo interior del cono en grados (sin penalización dentro de este ángulo)",
     "lod_cone_outer_degrees": "Ángulo exterior del cono en grados (penalización completa más allá de este ángulo)",
-    "lod_debug_mode": "Colorear splats según su nivel de Level of Detail para depuración"
+    "lod_debug_mode": "Colorear splats según su nivel de Level of Detail para depuración",
+    "simplify_lod_base": "Base LOD usada para elegir los niveles de simplificación por pasada"
   },
   "rendering_panel": {
     "fov_format": "FOV: {hfov:.1f}° H / {vfov:.1f}° V",
@@ -275,6 +276,7 @@
     "simplify_source": "Fuente",
     "simplify_select_source": "Seleccione un nodo splat",
     "simplify_target": "Objetivo",
+    "simplify_lod_base": "Base LOD",
     "simplify_knn_k": "kNN K",
     "simplify_merge_cap": "Límite de fusión",
     "simplify_opacity_prune": "Poda de opacidad",
