@@ -16,8 +16,8 @@
 #endif
 
 namespace {
-constexpr size_t kRasterBatchSize = 1024;
-constexpr size_t kMinBatchedRasterAverageTileInstances = 1024;
+    constexpr size_t kRasterBatchSize = 1024;
+    constexpr size_t kMinBatchedRasterAverageTileInstances = 1024;
 } // namespace
 
 VulkanGSRenderer::VulkanGSRenderer()
@@ -379,7 +379,7 @@ void VulkanGSRenderer::executeComputeTileRanges(
             buffers.sorted_keys().deviceBuffer,
             resizeDeviceBuffer(buffers.tile_ranges, num_tiles + 1),
             buffers.index_buffer_offset.deviceBuffer,
-	        });
+        });
 }
 
 void VulkanGSRenderer::executeBatchedRasterizeForward(
@@ -514,8 +514,8 @@ void VulkanGSRenderer::executeRasterizeForward(
                             {overlay_params, TRANSFER_COMPUTE_SHADER_WRITE},
                             {transform_indices, TRANSFER_COMPUTE_SHADER_WRITE},
                             {model_transforms, TRANSFER_COMPUTE_SHADER_WRITE},
-	                        },
-	                        COMPUTE_SHADER_READ);
+                        },
+                        COMPUTE_SHADER_READ);
 
     const size_t num_tiles = static_cast<size_t>(uniforms.grid_height) * uniforms.grid_width;
     const bool use_batched_raster =
