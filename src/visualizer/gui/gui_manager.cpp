@@ -129,6 +129,10 @@ namespace lfs::vis::gui {
 
     namespace {
         const FrameInputBuffer* s_frame_input = nullptr;
+        constexpr auto kInteractiveTrainingPauseWait = std::chrono::milliseconds(300);
+        constexpr auto kInteractiveTransitionGuardDuration = std::chrono::milliseconds(1200);
+        constexpr auto kInteractiveIdleToggleMinInterval = std::chrono::milliseconds(750);
+        constexpr auto kInteractiveTrainingToggleMinInterval = std::chrono::milliseconds(3000);
 
         void capturePressedKeysForRebinding(InputController& input_controller,
                                             const FrameInputBuffer& input) {
@@ -3576,6 +3580,11 @@ namespace lfs::vis::gui {
     }
 
     void GuiManager::shutdown() {
+        endInteractiveTransitionGuard();
+        ui_toggle_pending_ = false;
+        fullscreen_toggle_pending_ = false;
+        interactive_transition_guard_until_ = {};
+
         if (dev_resource_watch_.scan_future.valid())
             dev_resource_watch_.scan_future.wait();
 
@@ -4760,11 +4769,300 @@ namespace lfs::vis::gui {
         vulkan_viewport_pass_->record(command_buffer, extent, params);
     }
 
+    bool GuiManager::drainVulkanFramesForInteractiveTransition(
+        WindowManager& window_manager,
+        const char* const transition_name) {
+        auto* const vulkan_context = window_manager.getVulkanContext();
+        if (!vulkan_context) {
+            return true;
+        }
+
+        const auto drain_start = std::chrono::steady_clock::now();
+        if (vulkan_context->waitForSubmittedFrames()) {
+            LOG_DEBUG("Vulkan frame drain before {} transition complete: elapsed_ms={:.1f}",
+                      transition_name,
+                      std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - drain_start)
+                          .count());
+            return true;
+        }
+
+        LOG_WARN("Skipping {} transition because Vulkan frame drain failed after {:.1f} ms: {}",
+                 transition_name,
+                 std::chrono::duration<double, std::milli>(
+                     std::chrono::steady_clock::now() - drain_start)
+                     .count(),
+                 vulkan_context->lastError());
+        return false;
+    }
+
+    void GuiManager::applyInteractiveTransitionCooldown(
+        std::chrono::steady_clock::time_point& next_allowed_at,
+        const std::chrono::steady_clock::time_point now,
+        const bool training_active) {
+        next_allowed_at =
+            now + (training_active ? kInteractiveTrainingToggleMinInterval
+                                   : kInteractiveIdleToggleMinInterval);
+        interactive_transition_guard_until_ =
+            std::max(interactive_transition_guard_until_,
+                     now + kInteractiveTransitionGuardDuration);
+    }
+
+    void GuiManager::queueUiVisibilityToggle() {
+        if (!viewer_) {
+            return;
+        }
+
+        if (viewer_->isOnViewerThread()) {
+            requestUiVisibilityToggle();
+            return;
+        }
+
+        const bool posted = viewer_->postWork(VisualizerImpl::WorkItem{
+            .run = [this] {
+                requestUiVisibilityToggle();
+            },
+            .cancel = {},
+        });
+        if (!posted) {
+            LOG_DEBUG("Dropping UI visibility transition request because the viewer is shutting down");
+        }
+    }
+
+    void GuiManager::requestUiVisibilityToggle() {
+        auto* const wm = viewer_ ? viewer_->getWindowManager() : nullptr;
+        if (!wm) {
+            return;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        const auto cooldown_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                ui_toggle_next_allowed_at_ > now ? ui_toggle_next_allowed_at_ - now
+                                                 : std::chrono::steady_clock::duration::zero())
+                .count();
+        LOG_DEBUG("Request UI visibility transition: pending={}, ui_hidden={}, cooldown_remaining_ms={}",
+                  ui_toggle_pending_,
+                  ui_hidden_,
+                  cooldown_ms);
+        if (ui_toggle_pending_) {
+            wm->wakeEventLoop();
+            return;
+        }
+
+        ui_toggle_pending_ = true;
+        wm->wakeEventLoop();
+    }
+
+    void GuiManager::updateUiVisibilityTransition() {
+        if (!ui_toggle_pending_) {
+            return;
+        }
+
+        auto* const wm = viewer_ ? viewer_->getWindowManager() : nullptr;
+        if (!wm) {
+            ui_toggle_pending_ = false;
+            return;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now < ui_toggle_next_allowed_at_) {
+            return;
+        }
+
+        ui_toggle_pending_ = false;
+        beginInteractiveTransitionGuard();
+        if (!drainVulkanFramesForInteractiveTransition(*wm, "UI visibility")) {
+            ui_toggle_pending_ = true;
+            ui_toggle_next_allowed_at_ = now + kInteractiveTrainingToggleMinInterval;
+            LOG_WARN("UI visibility transition deferred after Vulkan drain failure: next_retry_ms={}, guard_kept_active=true, guard_remaining_ms={}",
+                     kInteractiveTrainingToggleMinInterval.count(),
+                     std::chrono::duration_cast<std::chrono::milliseconds>(
+                         interactive_transition_guard_until_ > std::chrono::steady_clock::now()
+                             ? interactive_transition_guard_until_ - std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::duration::zero())
+                         .count());
+            return;
+        }
+
+        auto* const trainer = viewer_ ? viewer_->getTrainerManager() : nullptr;
+        const bool training_active = trainer && trainer->isRunning();
+        ui_hidden_ = !ui_hidden_;
+
+        applyInteractiveTransitionCooldown(ui_toggle_next_allowed_at_,
+                                           std::chrono::steady_clock::now(),
+                                           training_active);
+        LOG_DEBUG("UI visibility transition applied: ui_hidden_after={}, training_active={}, next_allowed_in_ms={}",
+                  ui_hidden_,
+                  training_active,
+                  (training_active ? kInteractiveTrainingToggleMinInterval
+                                   : kInteractiveIdleToggleMinInterval)
+                      .count());
+    }
+
+    void GuiManager::queueFullscreenToggle() {
+        if (!viewer_) {
+            return;
+        }
+
+        if (viewer_->isOnViewerThread()) {
+            requestFullscreenToggle();
+            return;
+        }
+
+        const bool posted = viewer_->postWork(VisualizerImpl::WorkItem{
+            .run = [this] {
+                requestFullscreenToggle();
+            },
+            .cancel = {},
+        });
+        if (!posted) {
+            LOG_DEBUG("Dropping fullscreen transition request because the viewer is shutting down");
+        }
+    }
+
+    void GuiManager::requestFullscreenToggle() {
+        auto* const wm = viewer_ ? viewer_->getWindowManager() : nullptr;
+        if (!wm) {
+            return;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        const auto cooldown_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                fullscreen_toggle_next_allowed_at_ > now ? fullscreen_toggle_next_allowed_at_ - now
+                                                         : std::chrono::steady_clock::duration::zero())
+                .count();
+        LOG_DEBUG("Request fullscreen transition: pending={}, current={}, target={}, cooldown_remaining_ms={}",
+                  fullscreen_toggle_pending_,
+                  wm->isFullscreen(),
+                  !wm->isFullscreen(),
+                  cooldown_ms);
+        if (fullscreen_toggle_pending_) {
+            wm->wakeEventLoop();
+            return;
+        }
+
+        fullscreen_target_state_ = !wm->isFullscreen();
+        fullscreen_toggle_pending_ = true;
+        wm->wakeEventLoop();
+    }
+
+    void GuiManager::updateFullscreenTransition() {
+        if (!fullscreen_toggle_pending_) {
+            return;
+        }
+
+        auto* const wm = viewer_ ? viewer_->getWindowManager() : nullptr;
+        if (!wm) {
+            fullscreen_toggle_pending_ = false;
+            return;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now < fullscreen_toggle_next_allowed_at_) {
+            return;
+        }
+
+        fullscreen_toggle_pending_ = false;
+        if (wm->isFullscreen() == fullscreen_target_state_) {
+            LOG_DEBUG("Fullscreen transition already satisfied: target={}", fullscreen_target_state_);
+            return;
+        }
+
+        beginInteractiveTransitionGuard();
+        if (!drainVulkanFramesForInteractiveTransition(*wm, "fullscreen")) {
+            fullscreen_toggle_pending_ = true;
+            fullscreen_toggle_next_allowed_at_ = now + kInteractiveTrainingToggleMinInterval;
+            LOG_WARN("Fullscreen transition deferred after Vulkan drain failure: target={}, next_retry_ms={}, guard_kept_active=true, guard_remaining_ms={}",
+                     fullscreen_target_state_,
+                     kInteractiveTrainingToggleMinInterval.count(),
+                     std::chrono::duration_cast<std::chrono::milliseconds>(
+                         interactive_transition_guard_until_ > std::chrono::steady_clock::now()
+                             ? interactive_transition_guard_until_ - std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::duration::zero())
+                         .count());
+            return;
+        }
+
+        auto* const trainer = viewer_ ? viewer_->getTrainerManager() : nullptr;
+        const bool training_active = trainer && trainer->isRunning();
+        wm->setFullscreen(fullscreen_target_state_);
+
+        applyInteractiveTransitionCooldown(fullscreen_toggle_next_allowed_at_,
+                                           std::chrono::steady_clock::now(),
+                                           training_active);
+        LOG_DEBUG("Fullscreen transition applied: target={}, training_active={}, next_allowed_in_ms={}",
+                  fullscreen_target_state_,
+                  training_active,
+                  (training_active ? kInteractiveTrainingToggleMinInterval
+                                   : kInteractiveIdleToggleMinInterval)
+                      .count());
+    }
+
+    void GuiManager::beginInteractiveTransitionGuard() {
+        const auto now = std::chrono::steady_clock::now();
+        interactive_transition_guard_until_ =
+            now + kInteractiveTransitionGuardDuration;
+
+        if (interactive_transition_resume_training_) {
+            return;
+        }
+
+        auto* const trainer = viewer_ ? viewer_->getTrainerManager() : nullptr;
+        if (!trainer || !trainer->isRunning()) {
+            return;
+        }
+
+        const auto pause_result = trainer->pauseTrainingTemporaryAndWait(kInteractiveTrainingPauseWait);
+        interactive_transition_resume_training_ = pause_result.resume_required;
+        if (!pause_result.synchronized) {
+            LOG_WARN("Vulkan UI transition proceeding without a synchronized training pause");
+        }
+    }
+
+    void GuiManager::updateInteractiveTransitionGuard() {
+        if (!interactive_transition_resume_training_) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now < interactive_transition_guard_until_) {
+            return;
+        }
+
+        endInteractiveTransitionGuard();
+    }
+
+    void GuiManager::endInteractiveTransitionGuard() {
+        if (!interactive_transition_resume_training_) {
+            return;
+        }
+
+        interactive_transition_resume_training_ = false;
+        auto* const trainer = viewer_ ? viewer_->getTrainerManager() : nullptr;
+        if (trainer && trainer->isRunning()) {
+            trainer->resumeTrainingTemporary();
+            LOG_TRACE("Training resumed after Vulkan UI transition guard");
+        }
+    }
+
+    void GuiManager::updateInteractiveTransitions() {
+        updateFullscreenTransition();
+        updateUiVisibilityTransition();
+        updateInteractiveTransitionGuard();
+    }
+
+    bool GuiManager::isInteractiveTransitionSettling() const {
+        return std::chrono::steady_clock::now() < interactive_transition_guard_until_;
+    }
+
     void GuiManager::render() {
         auto* window_manager = viewer_ ? viewer_->getWindowManager() : nullptr;
         auto* vulkan_context = (vulkan_gui_ && window_manager) ? window_manager->getVulkanContext() : nullptr;
-        if (vulkan_gui_ && !vulkan_context)
+        if (vulkan_gui_ && !vulkan_context) {
+            updateInteractiveTransitionGuard();
             return;
+        }
 
         std::optional<::lfs::core::ScopedTimer> cpu_ui_before_vulkan_timer;
         if (vulkan_gui_) {
@@ -5795,7 +6093,13 @@ namespace lfs::vis::gui {
                 rmlui_manager_.clearVulkanQueue();
                 clearLineRendererCommands();
                 if (!vulkan_context->lastError().empty()) {
-                    LOG_WARN("Vulkan GUI frame begin failed: {}", vulkan_context->lastError());
+                    LOG_WARN("Vulkan GUI frame begin failed: {} (ui_hidden={}, fullscreen_pending={}, ui_pending={}, settling={}, resume_training_pending={})",
+                             vulkan_context->lastError(),
+                             ui_hidden_,
+                             fullscreen_toggle_pending_,
+                             ui_toggle_pending_,
+                             isInteractiveTransitionSettling(),
+                             interactive_transition_resume_training_);
                 }
                 if (viewer_) {
                     viewer_->processRenderWorkQueue();
@@ -5806,12 +6110,14 @@ namespace lfs::vis::gui {
                 --ui_layout_settle_frames_;
 
             persistImGuiSettingsIfNeeded();
+            updateInteractiveTransitionGuard();
             return;
         }
 
         if (!vulkan_gui_ && viewer_) {
             viewer_->processRenderWorkQueue();
         }
+        updateInteractiveTransitionGuard();
     }
 
     void GuiManager::renderSelectionOverlays(const UIContext& ctx) {
@@ -6357,7 +6663,7 @@ namespace lfs::vis::gui {
         });
 
         ui::ToggleUI::when([this](const auto&) {
-            ui_hidden_ = !ui_hidden_;
+            queueUiVisibilityToggle();
         });
 
         ui::ToggleVramHud::when([this](const auto&) {
@@ -6366,9 +6672,7 @@ namespace lfs::vis::gui {
         });
 
         ui::ToggleFullscreen::when([this](const auto&) {
-            if (auto* wm = viewer_->getWindowManager()) {
-                wm->toggleFullscreen();
-            }
+            queueFullscreenToggle();
         });
 
         internal::DisplayScaleChanged::when([this](const auto& e) {
@@ -6721,6 +7025,15 @@ namespace lfs::vis::gui {
     }
 
     bool GuiManager::needsAnimationFrame() const {
+        const auto now = std::chrono::steady_clock::now();
+        const bool ui_toggle_due =
+            ui_toggle_pending_ && now >= ui_toggle_next_allowed_at_;
+        const bool fullscreen_toggle_due =
+            fullscreen_toggle_pending_ && now >= fullscreen_toggle_next_allowed_at_;
+        if (ui_toggle_due || fullscreen_toggle_due || interactive_transition_resume_training_ ||
+            now < interactive_transition_guard_until_) {
+            return true;
+        }
         if (isViewportExportLocked())
             return true;
         if (startup_overlay_.needsAnimationFrame())
@@ -6733,7 +7046,7 @@ namespace lfs::vis::gui {
             return true;
         if (ui_layout_settle_frames_ > 0)
             return true;
-        if (isVramHudPublishDue(std::chrono::steady_clock::now()))
+        if (isVramHudPublishDue(now))
             return true;
         if (rml_viewport_overlay_.needsAnimationFrame())
             return true;

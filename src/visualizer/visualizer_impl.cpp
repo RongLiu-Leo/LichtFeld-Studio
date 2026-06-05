@@ -1292,6 +1292,12 @@ namespace lfs::vis {
             }
         }
 
+        if (gui_manager_) {
+            gui_manager_->updateInteractiveTransitions();
+        }
+        const bool interactive_transition_settling =
+            gui_manager_ && gui_manager_->isInteractiveTransitionSettling();
+
         // Get viewport region from GUI. This accounts for menu/tool/status panels and must be
         // shared by every graphics backend so camera aspect and render resolution match the viewport.
         ViewportRegion viewport_region;
@@ -1349,7 +1355,7 @@ namespace lfs::vis {
             return;
         }
 
-        if (!viewport_export_locked) {
+        if (!viewport_export_locked && !interactive_transition_settling) {
             if (frame_demand.python_redraw && gui_manager_)
                 gui_manager_->syncVisiblePanelsBeforeSceneRender();
 
@@ -1397,6 +1403,13 @@ namespace lfs::vis {
                     gui_manager_->clearVulkanDepthBlitImage();
                 }
             }
+        } else if (interactive_transition_settling) {
+            LOG_DEBUG("Skipping Vulkan viewport render during interactive transition settle: scene_dirty={}, gui_animation={}, input_event={}, render_work={}, store_dirty={}",
+                      frame_demand.scene_dirty,
+                      frame_demand.gui_animation,
+                      frame_demand.input_event,
+                      frame_demand.render_work,
+                      frame_demand.store_dirty);
         }
         if (gui_manager_) {
             LOG_TIMER("VisualizerImpl::render.gui_frame_total_with_swapchain_wait");

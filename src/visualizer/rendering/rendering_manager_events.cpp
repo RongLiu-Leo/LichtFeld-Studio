@@ -161,10 +161,8 @@ namespace lfs::vis {
     }
 
     void RenderingManager::handleWindowResized() {
-        LOG_DEBUG("Window resized, clearing render cache");
-        markDirty(DirtyFlag::VIEWPORT | DirtyFlag::CAMERA);
-        viewport_artifact_service_.clearViewportOutput();
-        frame_lifecycle_service_.resetViewportSize();
+        LOG_DEBUG("RenderingManager window resize: deferring viewport refresh");
+        markDirty(frame_lifecycle_service_.deferViewportRefresh());
     }
 
     void RenderingManager::handleGridSettingsChanged(const ui::GridSettingsChanged& event) {
