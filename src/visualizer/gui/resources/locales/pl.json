@@ -585,13 +585,7 @@
     "writing_spz": "Zapisywanie SPZ",
     "complete": "Ukończono",
     "failed": "Niepowodzenie",
-    "select_at_least_one": "Wybierz co najmniej jeden model",
-    "tooltip": {
-      "rad_lod_input": "Procent Level of Detail (1-100). Domyślnie: 100",
-      "rad_lod_add": "Dodaj ten poziom Level of Detail",
-      "rad_lod_remove": "Usuń ten poziom Level of Detail",
-      "rad_lod_select": "Wybierz poziom Level of Detail do usunięcia"
-    }
+    "select_at_least_one": "Wybierz co najmniej jeden model"
   },
   "common": {
     "ok": "OK",
@@ -1063,8 +1057,6 @@
     "no_models": "Brak modeli w scenie",
     "sh_degree": "SH DEGREE",
     "export_merged": "Eksportuj Połączony...",
-    "rad_customize_lod": "Dostosuj Level of Detail",
-    "rad_lod_levels": "Poziomy Level of Detail",
     "no_lod_settings": "Brak ustawień Level of Detail (eksport płaski)",
     "rad_flip_y": "Odwróć oś Y",
     "colmap_writes_sparse": "Zapisuje cameras.bin, images.bin i points3D.bin",

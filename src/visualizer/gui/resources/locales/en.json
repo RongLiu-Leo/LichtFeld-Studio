@@ -587,13 +587,7 @@
     "writing_spz": "Writing SPZ",
     "complete": "Complete",
     "failed": "Failed",
-    "select_at_least_one": "Select at least one model",
-    "tooltip": {
-      "rad_lod_input": "Level of Detail percentage (1-100). Default: 100",
-      "rad_lod_add": "Add this Level of Detail level",
-      "rad_lod_remove": "Remove this Level of Detail level",
-      "rad_lod_select": "Select Level of Detail level to remove"
-    }
+    "select_at_least_one": "Select at least one model"
   },
   "common": {
     "ok": "OK",
@@ -1079,8 +1073,6 @@
     "no_models": "No models in scene",
     "sh_degree": "SH DEGREE",
     "export_merged": "Export Merged...",
-    "rad_customize_lod": "Customize Level of Detail",
-    "rad_lod_levels": "Level of Detail Levels",
     "no_lod_settings": "No Level of Detail (flat export)",
     "rad_flip_y": "Flip Y axis",
     "colmap_writes_sparse": "Writes cameras.bin, images.bin, and points3D.bin",

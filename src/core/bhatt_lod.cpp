@@ -15,6 +15,10 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <queue>
+#include <stdexcept>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace lfs::core {
@@ -367,21 +371,7 @@ void decompose_sigma_to_raw_scale_quat(const std::array<float, 9>& sigma,
     return workset;
 }
 
-constexpr float MERGE_BASE = 1.5f;
-
-[[nodiscard]] size_t next_power_of_2(size_t n) {
-    if (n <= 1) return 1;
-    n--;
-    n |= n >> 1;
-    n |= n >> 2;
-    n |= n >> 4;
-    n |= n >> 8;
-    n |= n >> 16;
-    if constexpr (sizeof(size_t) == 8) {
-        n |= n >> 32;
-    }
-    return n + 1;
-}
+constexpr float MERGE_BASE = 2.00f;
 
 static uint64_t hash_cell(int64_t x, int64_t y, int64_t z) {
     uint64_t h = 0x9e3779b97f4a7c15ULL;
@@ -391,60 +381,53 @@ static uint64_t hash_cell(int64_t x, int64_t y, int64_t z) {
     return h;
 }
 
-struct SpatialGrid {
-    std::vector<uint32_t> heads;
-    std::vector<uint32_t> next;
-    size_t num_buckets = 0;
+struct ActiveEntry {
+    float neg_feature_size = 0.0f;
+    uint32_t index = 0;
 
-    void build(const BhattLodWorkset& ws, const std::vector<uint32_t>& active_indices, float step) {
-        num_buckets = next_power_of_2(active_indices.size() * 2);
-        heads.assign(num_buckets, 0);
-        next.resize(active_indices.size());
-
-        for (size_t i = 0; i < active_indices.size(); ++i) {
-            uint32_t splat_idx = active_indices[i];
-            int64_t gx, gy, gz;
-            ws.grid_cell(splat_idx, step, gx, gy, gz);
-            uint64_t h = hash_cell(gx, gy, gz);
-            size_t bucket = h & (num_buckets - 1);
-
-            next[i] = heads[bucket];
-            heads[bucket] = static_cast<uint32_t>(i + 1);
+    bool operator<(const ActiveEntry& other) const {
+        if (neg_feature_size != other.neg_feature_size) {
+            return neg_feature_size < other.neg_feature_size;
         }
-    }
-
-    void query_neighbors(size_t idx, float step, const BhattLodWorkset& ws,
-                         const std::vector<uint32_t>& active_indices,
-                         std::vector<uint32_t>& out_neighbors) const {
-        int64_t gx, gy, gz;
-        ws.grid_cell(idx, step, gx, gy, gz);
-
-        for (int dz = -1; dz <= 1; ++dz) {
-            for (int dy = -1; dy <= 1; ++dy) {
-                for (int dx = -1; dx <= 1; ++dx) {
-                    uint64_t h = hash_cell(gx + dx, gy + dy, gz + dz);
-                    size_t bucket = h & (num_buckets - 1);
-                    uint32_t link = heads[bucket];
-                    while (link != 0) {
-                        uint32_t active_idx = link - 1;
-                        uint32_t splat_idx = active_indices[active_idx];
-                        if (splat_idx != idx) {
-                            out_neighbors.push_back(splat_idx);
-                        }
-                        link = next[active_idx];
-                    }
-                }
-            }
-        }
+        return index < other.index;
     }
 };
 
-struct MatchEdge {
-    uint32_t a;
-    uint32_t b;
-    float similarity;
-    bool operator<(const MatchEdge& other) const { return similarity > other.similarity; }
+struct CellKey {
+    int64_t x = 0;
+    int64_t y = 0;
+    int64_t z = 0;
+
+    bool operator==(const CellKey& other) const {
+        return x == other.x && y == other.y && z == other.z;
+    }
 };
+
+struct CellKeyHash {
+    size_t operator()(const CellKey& key) const {
+        return static_cast<size_t>(hash_cell(key.x, key.y, key.z));
+    }
+};
+
+using CellMap = std::unordered_map<CellKey, std::vector<uint32_t>, CellKeyHash>;
+
+[[nodiscard]] CellKey cell_for(const BhattLodWorkset& ws, const size_t idx, const float step) {
+    CellKey key;
+    ws.grid_cell(idx, step, key.x, key.y, key.z);
+    return key;
+}
+
+void erase_from_cell(CellMap& cells, const CellKey& key, const uint32_t idx) {
+    auto it = cells.find(key);
+    if (it == cells.end()) {
+        return;
+    }
+    auto& entries = it->second;
+    entries.erase(std::remove(entries.begin(), entries.end(), idx), entries.end());
+    if (entries.empty()) {
+        cells.erase(it);
+    }
+}
 
 } // namespace
 
@@ -724,6 +707,8 @@ size_t BhattLodWorkset::merge_nodes(size_t a, size_t node_b, float filter_size) 
     std::array<float, 9> total_cov{};
     for (int i = 0; i < 9; ++i) total_cov[i] = 0.0f;
 
+    const float filter2 = (0.5f * filter_size) * (0.5f * filter_size);
+
     auto add_cov = [&](size_t idx, float weight) {
         std::array<float, 9> R;
         quat_to_rotmat(qw[idx], qx[idx], qy[idx], qz[idx], R);
@@ -735,15 +720,15 @@ size_t BhattLodWorkset::merge_nodes(size_t a, size_t node_b, float filter_size) 
         const float dx = center_x[idx] - center_x[new_idx];
         const float dy = center_y[idx] - center_y[new_idx];
         const float dz = center_z[idx] - center_z[new_idx];
-        cov[0] += dx * dx;  // xx
-        cov[1] += dx * dy;       // xy
-        cov[2] += dx * dz;       // xz
-        cov[3] += dx * dy;       // yx
-        cov[4] += dy * dy;  // yy
-        cov[5] += dy * dz;       // yz
-        cov[6] += dx * dz;       // zx
-        cov[7] += dy * dz;       // zy
-        cov[8] += dz * dz;  // zz
+        cov[0] += dx * dx + filter2;  // xx
+        cov[1] += dx * dy;            // xy
+        cov[2] += dx * dz;            // xz
+        cov[3] += dx * dy;            // yx
+        cov[4] += dy * dy + filter2;  // yy
+        cov[5] += dy * dz;            // yz
+        cov[6] += dx * dz;            // zx
+        cov[7] += dy * dz;            // zy
+        cov[8] += dz * dz + filter2;  // zz
         for (int i = 0; i < 9; ++i) total_cov[i] += weight * cov[i];
     };
 
@@ -859,111 +844,99 @@ std::expected<std::unique_ptr<SplatData>, std::string> build_bhatt_lod(
         const float min_feature_size = workset.feature_size[order[0]];
         const int16_t level_min = static_cast<int16_t>(std::ceil(std::log(std::max(min_feature_size, 1e-12f)) / std::log(MERGE_BASE)));
 
-        std::vector<uint32_t> active_indices;
-        active_indices.reserve(workset.capacity);
+        std::vector<ActiveEntry> active_entries;
+        active_entries.reserve(workset.capacity);
 
         size_t frontier = 0;
-        for (int16_t level = level_min; ; ++level) {
+        int level = level_min;
+        for (; ; ++level) {
             const float step = std::pow(MERGE_BASE, level);
 
             // Add new splats to active set
             while (frontier < order.size() && workset.feature_size[order[frontier]] <= step) {
-                active_indices.push_back(static_cast<uint32_t>(order[frontier]));
+                const auto idx = static_cast<uint32_t>(order[frontier]);
+                active_entries.push_back({-workset.feature_size[idx], idx});
                 ++frontier;
             }
 
-            // Build grid once per level
-            SpatialGrid grid;
-            grid.build(workset, active_indices, step);
-
-            // Match rounds
-            while (true) {
-                // Find best neighbor for each active splat in parallel
-                std::vector<uint32_t> best_neighbor(active_indices.size(), std::numeric_limits<uint32_t>::max());
-                std::vector<float> best_sim(active_indices.size(), -1.0f);
-
-                tbb::parallel_for(tbb::blocked_range<size_t>(0, active_indices.size()),
-                    [&](const tbb::blocked_range<size_t>& range) {
-                        std::vector<uint32_t> neighbors;
-                        neighbors.reserve(64);
-                        for (size_t i = range.begin(); i != range.end(); ++i) {
-                            uint32_t idx = active_indices[i];
-                            if (workset.is_active[idx] == 0) continue;
-                            neighbors.clear();
-                            grid.query_neighbors(idx, step, workset, active_indices, neighbors);
-                            uint32_t best = std::numeric_limits<uint32_t>::max();
-                            float best_s = -1.0f;
-                            for (uint32_t nb : neighbors) {
-                                if (workset.is_active[nb] == 0) continue;
-                                float s = workset.similarity(idx, nb);
-                                if (s > best_s) {
-                                    best_s = s;
-                                    best = nb;
-                                }
-                            }
-                            if (best != std::numeric_limits<uint32_t>::max()) {
-                                best_neighbor[i] = best;
-                                best_sim[i] = best_s;
-                            }
-                        }
-                    });
-
-                // Gather edges
-                std::vector<MatchEdge> edges;
-                edges.reserve(active_indices.size() / 2);
-                for (size_t i = 0; i < active_indices.size(); ++i) {
-                    if (best_neighbor[i] != std::numeric_limits<uint32_t>::max()) {
-                        edges.push_back({active_indices[i], best_neighbor[i], best_sim[i]});
-                    }
-                }
-
-                if (edges.empty()) break;
-
-                // Sort edges by similarity descending
-                std::sort(edges.begin(), edges.end());
-
-                // Greedy independent set
-                std::vector<uint8_t> matched(workset.current_count, 0);
-                std::vector<std::pair<uint32_t, uint32_t>> accepted_pairs;
-                accepted_pairs.reserve(edges.size());
-                for (const auto& edge : edges) {
-                    if (!matched[edge.a] && !matched[edge.b]) {
-                        matched[edge.a] = 1;
-                        matched[edge.b] = 1;
-                        accepted_pairs.push_back({edge.a, edge.b});
-                    }
-                }
-
-                if (accepted_pairs.empty()) break;
-
-                // Merge accepted pairs in parallel
-                std::vector<uint32_t> new_indices(accepted_pairs.size());
-                tbb::parallel_for(tbb::blocked_range<size_t>(0, accepted_pairs.size()),
-                    [&](const tbb::blocked_range<size_t>& range) {
-                        for (size_t i = range.begin(); i != range.end(); ++i) {
-                            new_indices[i] = static_cast<uint32_t>(workset.merge_nodes(accepted_pairs[i].first, accepted_pairs[i].second, step));
-                        }
-                    });
-
-                // Mark merged nodes as inactive
-                for (const auto& pair : accepted_pairs) {
-                    workset.is_active[pair.first] = 0;
-                    workset.is_active[pair.second] = 0;
-                }
-
-                // Update active set: keep unmatched active nodes + new merged nodes
-                std::vector<uint32_t> new_active;
-                new_active.reserve(active_indices.size());
-                for (auto idx : active_indices) {
-                    if (!matched[idx]) new_active.push_back(idx);
-                }
-                for (auto idx : new_indices) {
-                    new_active.push_back(idx);
-                }
-                active_indices = std::move(new_active);
+            std::priority_queue<ActiveEntry> active;
+            for (const auto& entry : active_entries) {
+                active.push(entry);
             }
 
-            if (frontier >= order.size() && active_indices.size() <= 1) break;
+            CellMap cells;
+            cells.reserve(active_entries.size() * 2 + 1);
+            for (const auto& entry : active_entries) {
+                if (workset.is_active[entry.index] != 0) {
+                    cells[cell_for(workset, entry.index, step)].push_back(entry.index);
+                }
+            }
+
+            std::vector<ActiveEntry> next_active;
+            next_active.reserve(active_entries.size());
+
+            size_t merges_this_level = 0;
+            while (!active.empty()) {
+                const ActiveEntry entry = active.top();
+                active.pop();
+
+                const uint32_t idx = entry.index;
+                if (workset.is_active[idx] == 0) {
+                    continue;
+                }
+
+                const CellKey grid = cell_for(workset, idx, step);
+                uint32_t best_neighbor = std::numeric_limits<uint32_t>::max();
+                CellKey best_cell{};
+                float best_similarity = -std::numeric_limits<float>::infinity();
+
+                for (int dz = -1; dz <= 1; ++dz) {
+                    for (int dy = -1; dy <= 1; ++dy) {
+                        for (int dx = -1; dx <= 1; ++dx) {
+                            const CellKey neighbor_cell{grid.x + dx, grid.y + dy, grid.z + dz};
+                            auto it = cells.find(neighbor_cell);
+                            if (it == cells.end()) {
+                                continue;
+                            }
+                            for (const uint32_t neighbor : it->second) {
+                                if (neighbor == idx || workset.is_active[neighbor] == 0) {
+                                    continue;
+                                }
+                                const float similarity = workset.similarity(idx, neighbor);
+                                if (similarity > best_similarity) {
+                                    best_similarity = similarity;
+                                    best_neighbor = neighbor;
+                                    best_cell = neighbor_cell;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (best_neighbor == std::numeric_limits<uint32_t>::max()) {
+                    next_active.push_back(entry);
+                    continue;
+                }
+
+                const auto merged = static_cast<uint32_t>(workset.merge_nodes(idx, best_neighbor, 0.0f));
+                workset.is_active[idx] = 0;
+                erase_from_cell(cells, grid, idx);
+                workset.is_active[best_neighbor] = 0;
+                erase_from_cell(cells, best_cell, best_neighbor);
+                ++merges_this_level;
+
+                const float feature_size = workset.feature_size[merged];
+                const ActiveEntry merged_entry{-feature_size, merged};
+                if (feature_size > step) {
+                    next_active.push_back(merged_entry);
+                } else {
+                    cells[cell_for(workset, merged, step)].push_back(merged);
+                    active.push(merged_entry);
+                }
+            }
+
+            active_entries = std::move(next_active);
+            if (frontier >= order.size() && active_entries.size() <= 1) break;
         }
 
         // Pruning and SplatData construction
@@ -973,6 +946,9 @@ std::expected<std::unique_ptr<SplatData>, std::string> build_bhatt_lod(
 
         // Step 1: Post-order pruning to select output nodes
         std::vector<uint8_t> to_output(workset.current_count, 0);
+        for (size_t i = 0; i < workset.initial_count; ++i) {
+            to_output[i] = 1;
+        }
         std::vector<std::vector<uint32_t>> output_children(workset.current_count);
 
         struct Pruner {
@@ -982,7 +958,7 @@ std::expected<std::unique_ptr<SplatData>, std::string> build_bhatt_lod(
             std::vector<std::vector<uint32_t>>& output_children;
 
             float run(size_t idx) {
-                float my_size = ws.feature_size[idx];
+                const float my_size = ws.area[idx] * ws.opacity[idx];
 
                 std::vector<size_t> children;
                 if (ws.child_a[idx] >= 0) children.push_back(ws.child_a[idx]);
@@ -1019,43 +995,84 @@ std::expected<std::unique_ptr<SplatData>, std::string> build_bhatt_lod(
             }
         };
 
+        const size_t root_index = workset.current_count - 1;
+        to_output[root_index] = 1; // Force root to be output before pruning, matching Spark.
         Pruner pruner{workset, lod_base, to_output, output_children};
-        pruner.run(workset.current_count - 1);
-        to_output[workset.current_count - 1] = 1; // Force root to be output
+        pruner.run(root_index);
+        LOG_INFO("build_bhatt_lod: pruning complete");
 
-        // Step 2: DFS to build flat buffer with contiguous children
+        // Step 2: Build a flat buffer where every node's direct children occupy
+        // the contiguous range [child_start, child_start + child_count).
         std::vector<uint32_t> old_indices;
         std::vector<uint16_t> out_child_count;
         std::vector<uint32_t> out_child_start;
         std::vector<uint8_t> out_lod_level;
 
-        struct DfsBuilder {
+        struct FlatTreeBuilder {
             std::vector<uint32_t>& old_indices;
             std::vector<uint16_t>& out_child_count;
             std::vector<uint32_t>& out_child_start;
             std::vector<uint8_t>& out_lod_level;
+            const std::vector<uint8_t>& to_output;
             const std::vector<std::vector<uint32_t>>& output_children;
 
-            void run(size_t old_idx, uint8_t level) {
-                size_t my_new_idx = old_indices.size();
+            size_t append_node(size_t old_idx, uint8_t level) {
+                if (old_idx >= to_output.size() || !to_output[old_idx]) {
+                    throw std::runtime_error("build_bhatt_lod: attempted to emit non-output LOD node");
+                }
+
+                const size_t new_idx = old_indices.size();
                 old_indices.push_back(static_cast<uint32_t>(old_idx));
                 out_child_count.push_back(0);
                 out_child_start.push_back(0);
                 out_lod_level.push_back(level);
+                return new_idx;
+            }
 
-                if (!output_children[old_idx].empty()) {
-                    out_child_start[my_new_idx] = static_cast<uint32_t>(old_indices.size());
-                    out_child_count[my_new_idx] = static_cast<uint16_t>(output_children[old_idx].size());
-
-                    for (uint32_t child_old : output_children[old_idx]) {
-                        run(child_old, level + 1);
-                    }
+            void expand_node(size_t new_idx, size_t old_idx, uint8_t level) {
+                const auto& children = output_children[old_idx];
+                if (children.empty()) {
+                    return;
                 }
+                if (children.size() > std::numeric_limits<uint16_t>::max()) {
+                    throw std::runtime_error(
+                        "build_bhatt_lod: LOD node has too many children: old_idx=" +
+                        std::to_string(old_idx) +
+                        " level=" +
+                        std::to_string(level) +
+                        " child_count=" +
+                        std::to_string(children.size()));
+                }
+
+                out_child_start[new_idx] = static_cast<uint32_t>(old_indices.size());
+                out_child_count[new_idx] = static_cast<uint16_t>(children.size());
+
+                std::vector<size_t> child_new_indices;
+                child_new_indices.reserve(children.size());
+                for (uint32_t child_old : children) {
+                    child_new_indices.push_back(append_node(child_old, static_cast<uint8_t>(level + 1)));
+                }
+
+                for (size_t i = 0; i < children.size(); ++i) {
+                    expand_node(child_new_indices[i], children[i], static_cast<uint8_t>(level + 1));
+                }
+            }
+
+            void run(size_t root_old_idx) {
+                const size_t root_new_idx = append_node(root_old_idx, 0);
+                expand_node(root_new_idx, root_old_idx, 0);
             }
         };
 
-        DfsBuilder dfs{old_indices, out_child_count, out_child_start, out_lod_level, output_children};
-        dfs.run(workset.current_count - 1, 0);
+        FlatTreeBuilder flat_tree{
+            old_indices,
+            out_child_count,
+            out_child_start,
+            out_lod_level,
+            to_output,
+            output_children,
+        };
+        flat_tree.run(root_index);
 
         // Step 3: Build SplatData
         const size_t output_count = old_indices.size();

@@ -585,13 +585,7 @@
     "writing_spz": "Schreibe SPZ",
     "complete": "Abgeschlossen",
     "failed": "Fehlgeschlagen",
-    "select_at_least_one": "Mindestens ein Modell auswählen",
-    "tooltip": {
-      "rad_lod_input": "Level of Detail-Prozentsatz (1-100). Standard: 100",
-      "rad_lod_add": "Diese Level of Detail-Stufe hinzufügen",
-      "rad_lod_remove": "Diese Level of Detail-Stufe entfernen",
-      "rad_lod_select": "Level of Detail-Stufe zum Entfernen auswählen"
-    }
+    "select_at_least_one": "Mindestens ein Modell auswählen"
   },
   "common": {
     "ok": "OK",
@@ -1063,8 +1057,6 @@
     "no_models": "Keine Modelle in der Szene",
     "sh_degree": "SH GRAD",
     "export_merged": "Zusammengeführt exportieren...",
-    "rad_customize_lod": "Level of Detail anpassen",
-    "rad_lod_levels": "Level of Detail-Stufen",
     "no_lod_settings": "Keine Level of Detail-Einstellungen (flacher Export)",
     "rad_flip_y": "Y-Achse spiegeln",
     "colmap_writes_sparse": "Schreibt cameras.bin, images.bin und points3D.bin",

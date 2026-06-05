@@ -139,8 +139,7 @@ namespace lfs::app {
             const SplatData& splat,
             const std::filesystem::path& output,
             const param::OutputFormat format,
-            const int sog_iterations,
-            const std::vector<float>& rad_lod_levels) {
+            const int sog_iterations) {
             switch (format) {
             case param::OutputFormat::PLY:
                 return lfs::io::save_ply(splat, {.output_path = output, .binary = true});
@@ -155,7 +154,7 @@ namespace lfs::app {
             case param::OutputFormat::USDC:
                 return lfs::io::save_usd(splat, {.output_path = output});
             case param::OutputFormat::RAD:
-                return lfs::io::save_rad(splat, {.output_path = output, .lod_ratios = rad_lod_levels});
+                return lfs::io::save_rad(splat, {.output_path = output});
             }
             return lfs::io::save_ply(splat, {.output_path = output, .binary = true});
         }
@@ -190,7 +189,7 @@ namespace lfs::app {
                 std::println("  Set SH degree {}", params.sh_degree);
             }
 
-            const auto result = saveSplat(*splat, output, params.format, params.sog_iterations, params.rad_lod_levels);
+            const auto result = saveSplat(*splat, output, params.format, params.sog_iterations);
 
             if (!result) {
                 LOG_ERROR("Save failed: {}", result.error().format());
@@ -245,7 +244,7 @@ namespace lfs::app {
             bool ok = true;
             for (const auto& output : outputs) {
                 std::println("  Saving: {}", path_to_utf8(output.path));
-                const auto result = saveSplat(**splat, output.path, output.format, params.sog_iterations, params.rad_lod_levels);
+                const auto result = saveSplat(**splat, output.path, output.format, params.sog_iterations);
                 if (!result) {
                     LOG_ERROR("Save failed: {}", result.error().format());
                     std::println(stderr, "  Error: {}", result.error().message);

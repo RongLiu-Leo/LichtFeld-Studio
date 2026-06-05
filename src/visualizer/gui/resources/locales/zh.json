@@ -415,13 +415,7 @@
     "writing_spz": "写入SPZ",
     "complete": "完成",
     "failed": "失败",
-    "select_at_least_one": "至少选择一个模型",
-    "tooltip": {
-      "rad_lod_input": "Level of Detail百分比 (1-100)。默认: 100",
-      "rad_lod_add": "添加此Level of Detail级别",
-      "rad_lod_remove": "移除此Level of Detail级别",
-      "rad_lod_select": "选择要移除的Level of Detail级别"
-    }
+    "select_at_least_one": "至少选择一个模型"
   },
   "common": {
     "ok": "确定",
@@ -893,8 +887,6 @@
     "no_models": "场景中无模型",
     "sh_degree": "SH Degree",
     "export_merged": "导出合并的...",
-    "rad_customize_lod": "自定义Level of Detail",
-    "rad_lod_levels": "Level of Detail级别",
     "no_lod_settings": "无Level of Detail（平面导出）",
     "rad_flip_y": "翻转Y轴",
     "colmap_writes_sparse": "写入 cameras.bin、images.bin 和 points3D.bin",

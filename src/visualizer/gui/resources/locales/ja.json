@@ -585,13 +585,7 @@
     "writing_spz": "SPZを書き込み中",
     "complete": "完了",
     "failed": "失敗",
-    "select_at_least_one": "少なくとも1つのモデルを選択してください",
-    "tooltip": {
-      "rad_lod_input": "Level of Detailパーセンテージ (1-100)。デフォルト: 100",
-      "rad_lod_add": "このLevel of Detailレベルを追加",
-      "rad_lod_remove": "このLevel of Detailレベルを削除",
-      "rad_lod_select": "削除するLevel of Detailレベルを選択"
-    }
+    "select_at_least_one": "少なくとも1つのモデルを選択してください"
   },
   "common": {
     "ok": "OK",
@@ -1063,8 +1057,6 @@
     "no_models": "シーンにモデルがありません",
     "sh_degree": "SH Degree",
     "export_merged": "結合してエクスポート...",
-    "rad_customize_lod": "Level of Detailをカスタマイズ",
-    "rad_lod_levels": "Level of Detailレベル",
     "no_lod_settings": "Level of Detailなし（フラットエクスポート）",
     "rad_flip_y": "Y軸を反転",
     "colmap_writes_sparse": "cameras.bin、images.bin、points3D.binを書き込みます",

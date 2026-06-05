@@ -585,13 +585,7 @@
     "writing_spz": "SPZ 쓰는 중",
     "complete": "완료",
     "failed": "실패",
-    "select_at_least_one": "최소 하나의 모델을 선택하세요",
-    "tooltip": {
-      "rad_lod_input": "Level of Detail 백분율 (1-100). 기본값: 100",
-      "rad_lod_add": "이 Level of Detail 레벨 추가",
-      "rad_lod_remove": "이 Level of Detail 레벨 제거",
-      "rad_lod_select": "제거할 Level of Detail 레벨 선택"
-    }
+    "select_at_least_one": "최소 하나의 모델을 선택하세요"
   },
   "common": {
     "ok": "확인",
@@ -1063,8 +1057,6 @@
     "no_models": "씬에 모델 없음",
     "sh_degree": "SH Degree",
     "export_merged": "병합하여보내기...",
-    "rad_customize_lod": "Level of Detail 사용자 정의",
-    "rad_lod_levels": "Level of Detail 레벨",
     "no_lod_settings": "Level of Detail 없음 (플랫보내기)",
     "rad_flip_y": "Y축 뒤집기",
     "colmap_writes_sparse": "cameras.bin, images.bin, points3D.bin을 씁니다",

@@ -1542,11 +1542,9 @@ namespace lfs::io {
         class RadEncoder {
         public:
             explicit RadEncoder(int compression_level = GZ_LEVEL,
-                                const std::vector<float>& lod_ratios = {},
                                 bool flip_y = false,
                                 ExportProgressCallback progress_callback = nullptr)
                 : compression_level_(compression_level),
-                  lod_ratios_(lod_ratios),
                   flip_y_(flip_y),
                   progress_callback_(std::move(progress_callback)) {}
 
@@ -1557,13 +1555,26 @@ namespace lfs::io {
                 }
 
                 std::optional<SplatData> visible_splat_data;
+                std::optional<SplatData> lod_splat_data;
                 const SplatData* export_source = &splat_data;
-                if (splat_data.has_deleted_mask() && splat_data.deleted().count_nonzero() > 0) {
+
+                const bool has_deleted = splat_data.has_deleted_mask() && splat_data.deleted().count_nonzero() > 0;
+
+                if (has_deleted) {
                     const Tensor keep_mask = splat_data.deleted().logical_not();
                     auto extracted = lfs::core::extract_by_mask(splat_data, keep_mask);
                     if (extracted.size() > 0) {
                         visible_splat_data = std::move(extracted);
                         export_source = &visible_splat_data.value();
+                    }
+                }
+
+                // Build LOD tree if the source doesn't have one.
+                if (!export_source->lod_tree || !export_source->lod_tree->has_tree()) {
+                    auto lod_result = lfs::core::build_bhatt_lod(*export_source);
+                    if (lod_result && (*lod_result)->lod_tree && (*lod_result)->lod_tree->has_tree()) {
+                        lod_splat_data = std::move(**lod_result);
+                        export_source = &lod_splat_data.value();
                     }
                 }
 
@@ -1579,19 +1590,8 @@ namespace lfs::io {
                     throw std::runtime_error("CANCELLED");
                 }
 
-                // 0.3: Building LOD only when explicitly requested
-                if (!lod_ratios_.empty()) {
-                    if (!report_progress(0.3f, "Building LOD...")) {
-                        throw std::runtime_error("CANCELLED");
-                    }
-
-                    if (auto lod_packed = build_lod(*export_source, lod_ratios_)) {
-                        packed = std::move(*lod_packed);
-                    }
-                }
-
-                // 0.4: Preparing chunks
-                if (!report_progress(0.4f, "Preparing chunks...")) {
+                // 0.3: Preparing chunks
+                if (!report_progress(0.3f, "Preparing chunks...")) {
                     throw std::runtime_error("CANCELLED");
                 }
 
@@ -1784,30 +1784,6 @@ namespace lfs::io {
                     packed.lod_tree = true;
                     packed.child_count = splat_data.lod_tree->child_count;
                     packed.child_start = splat_data.lod_tree->child_start;
-                }
-
-                return packed;
-            }
-
-            // Build LOD using Bhattacharyya-distance hierarchical tree.
-            // custom_ratios is ignored because bhatt_lod builds a single adaptive tree.
-            static std::optional<PackedSplatData> build_lod(const SplatData& source,
-                                                            const std::vector<float>& custom_ratios) {
-                (void)custom_ratios;
-
-                if (source.size() == 0) {
-                    return std::nullopt;
-                }
-
-                auto result = lfs::core::build_bhatt_lod(source, 1.25f, {});
-                if (!result || !result.value()) {
-                    LOG_WARN("RAD export: build_bhatt_lod failed, falling back to non-LOD");
-                    return std::nullopt;
-                }
-
-                PackedSplatData packed = pack_splat_data(*result.value());
-                if (packed.count == 0) {
-                    return std::nullopt;
                 }
 
                 return packed;
@@ -2144,7 +2120,6 @@ namespace lfs::io {
             }
 
             int compression_level_;
-            std::vector<float> lod_ratios_;
             bool flip_y_;
             ExportProgressCallback progress_callback_;
 
@@ -2444,7 +2419,7 @@ namespace lfs::io {
                     v = (v - 0.5f) / SH_C0;
                 }
 
-                bool lod_opacity_encoded = false;
+                bool lod_opacity_encoded = has_lod_tree;
                 if (meta.splat_encoding.has_value()) {
                     const auto& enc = meta.splat_encoding.value();
                     if (enc.is_object()) {
@@ -2597,7 +2572,6 @@ namespace lfs::io {
 
         // Encode
         RadEncoder encoder(compression_level,
-                           options.lod_ratios,
                            options.flip_y,
                            scale_export_progress(options.progress_callback, 0.0f, 0.95f));
         std::vector<uint8_t> data;

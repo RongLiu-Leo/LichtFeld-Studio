@@ -305,7 +305,6 @@ namespace lfs::core {
             int sh_degree = 3; // 0-3, -1 = keep original
             int sog_iterations = 10;
             bool overwrite = false;            // Skip overwrite prompts
-            std::vector<float> rad_lod_levels; // LOD levels for RAD format (as ratios, e.g., 0.5f = 50%)
         };
 
         // Parameters for the mesh2splat command
@@ -317,7 +316,6 @@ namespace lfs::core {
             Mesh2SplatOptions options;
             int sog_iterations = 10;
             bool overwrite = false;
-            std::vector<float> rad_lod_levels;
         };
 
         // Modern C++23 functions returning expected values
