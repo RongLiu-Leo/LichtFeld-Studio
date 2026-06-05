@@ -123,6 +123,7 @@ class _ElementStub:
         self.classes = set()
         self.attributes = {}
         self.listeners = []
+        self.select_calls = 0
 
     def set_class(self, name, active):
         if active:
@@ -138,6 +139,33 @@ class _ElementStub:
 
     def set_attribute(self, name, value):
         self.attributes[name] = value
+
+    def parent(self):
+        return self
+
+    def select(self):
+        self.select_calls += 1
+        return True
+
+    def emit(self, name, event=None):
+        event = event or _InputEventStub()
+        for event_name, callback in list(self.listeners):
+            if event_name == name:
+                callback(event)
+
+
+class _InputEventStub:
+    def __init__(self, *, linebreak=False):
+        self._linebreak = linebreak
+        self.propagation_stopped = False
+
+    def get_bool_parameter(self, name, default=False):
+        if name == "linebreak":
+            return self._linebreak
+        return default
+
+    def stop_propagation(self):
+        self.propagation_stopped = True
 
 
 class _DocumentStub:
@@ -223,11 +251,88 @@ def test_selection_depth_toggle_and_sliders_use_selection_api(selection_controls
     model.bound_events["selection_action"](None, None, ["toggle_depth"])
     assert state.depth_calls[-1] == (True, 0.25, 7.5, 1.35)
 
-    model.bound_binds["selection_depth_near_str"][1]("1.5")
+    model.bound_binds["selection_depth_near_value"][1]("1.5")
     assert state.depth_calls[-1] == (True, 1.5, 7.5, 1.35)
 
-    model.bound_binds["selection_depth_far_str"][1]("2.0")
+    model.bound_binds["selection_depth_far_value"][1]("2.0")
     assert state.depth_calls[-1] == (True, 1.5, 2.0, 1.35)
+
+
+def test_selection_depth_text_fields_commit_like_panel_inputs(selection_controls_module):
+    module, state = selection_controls_module
+    panel = module.SelectionControlsController()
+    model = _DataModelStub()
+    doc = _DocumentStub()
+
+    state.depth_enabled = True
+    panel.bind_model(model)
+    panel.mount(doc)
+    panel.update(doc)
+
+    near_getter, near_setter = model.bound_binds["selection_depth_near_str"]
+    far_getter, far_setter = model.bound_binds["selection_depth_far_str"]
+
+    doc.near.emit("focus")
+    near_setter("1")
+
+    assert doc.near.select_calls == 1
+    assert near_getter() == "1"
+    assert state.depth_calls == []
+
+    doc.near.emit("change", _InputEventStub(linebreak=True))
+
+    assert state.depth_calls[-1] == (True, 1.0, 7.5, 1.35)
+    assert near_getter() == "1.00"
+
+    far_setter("9")
+    assert far_getter() == "9"
+
+    doc.far.emit("blur")
+
+    assert state.depth_calls[-1] == (True, 1.0, 9.0, 1.35)
+    assert far_getter() == "9.00"
+
+
+def test_selection_depth_text_escape_reverts_pending_edit(selection_controls_module):
+    module, state = selection_controls_module
+    panel = module.SelectionControlsController()
+    model = _DataModelStub()
+    doc = _DocumentStub()
+
+    panel.bind_model(model)
+    panel.mount(doc)
+    panel.update(doc)
+
+    near_getter, near_setter = model.bound_binds["selection_depth_near_str"]
+    event = _InputEventStub()
+
+    doc.near.emit("focus")
+    near_setter("4")
+    doc.near.emit("escapecancel", event)
+
+    assert near_getter() == "0.25"
+    assert state.depth_calls == []
+    assert event.propagation_stopped
+
+
+def test_selection_depth_text_invalid_commit_reverts(selection_controls_module):
+    module, state = selection_controls_module
+    panel = module.SelectionControlsController()
+    model = _DataModelStub()
+    doc = _DocumentStub()
+
+    panel.bind_model(model)
+    panel.mount(doc)
+    panel.update(doc)
+
+    near_getter, near_setter = model.bound_binds["selection_depth_near_str"]
+
+    doc.near.emit("focus")
+    near_setter("not-a-number")
+    doc.near.emit("blur")
+
+    assert near_getter() == "0.25"
+    assert state.depth_calls == []
 
 
 def test_selection_actions_use_undoable_pipeline_and_history(selection_controls_module):

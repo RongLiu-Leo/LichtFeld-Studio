@@ -127,6 +127,12 @@ class SelectionControlsController:
         self._frustum_half_width = _DEFAULT_FRUSTUM_HALF_WIDTH
         self._last_state_key = None
         self._last_state_items = None
+        self._depth_text_bufs = {
+            "selection_depth_near_str": None,
+            "selection_depth_far_str": None,
+        }
+        self._editing_depth_text = set()
+        self._escape_revert = w.EscapeRevertController()
 
     def bind_model(self, model):
         model.bind_func("selection_depth_mode_active", lambda: self._depth_enabled)
@@ -150,8 +156,8 @@ class SelectionControlsController:
 
         model.bind(
             "selection_depth_near_str",
-            lambda: f"{self._depth_near:.2f}",
-            self._set_depth_near,
+            lambda: self._depth_text_value("selection_depth_near_str"),
+            lambda value: self._set_depth_text_value("selection_depth_near_str", value),
         )
         model.bind(
             "selection_depth_near_value",
@@ -162,8 +168,8 @@ class SelectionControlsController:
         model.bind_func("selection_depth_near_slider_max", lambda: f"{self._near_slider_bounds()[1]:.3f}")
         model.bind(
             "selection_depth_far_str",
-            lambda: f"{self._depth_far:.2f}",
-            self._set_depth_far,
+            lambda: self._depth_text_value("selection_depth_far_str"),
+            lambda value: self._set_depth_text_value("selection_depth_far_str", value),
         )
         model.bind(
             "selection_depth_far_value",
@@ -185,8 +191,8 @@ class SelectionControlsController:
         if wrap:
             wrap.set_class("hidden", True)
 
-        for input_id in ("selection-depth-near", "selection-depth-far"):
-            w.bind_select_all_on_focus(doc.get_element_by_id(input_id))
+        self._mount_depth_text_input(doc, "selection-depth-near", "selection_depth_near_str")
+        self._mount_depth_text_input(doc, "selection-depth-far", "selection_depth_far_str")
 
     def update(self, doc):
         dirty = False
@@ -208,6 +214,7 @@ class SelectionControlsController:
             return ",".join(dirty_reasons) if dirty else None
 
         self._refresh_state()
+        self._sync_depth_text_bufs()
         state_items = self._state_items()
         state_key = self._state_key(state_items)
         if state_key != self._last_state_key:
@@ -224,6 +231,8 @@ class SelectionControlsController:
         self._visible = False
         self._last_state_key = None
         self._last_state_items = None
+        self._editing_depth_text.clear()
+        self._escape_revert.clear()
 
     def _get_active_tool(self):
         value = _native_store_value("active_tool", _MISSING)
@@ -379,7 +388,75 @@ class SelectionControlsController:
                 or _ui_label("selection.update_depth_failed", "Could not update selection depth filter.")
             )
 
+        self._sync_depth_text_bufs()
         self._dirty_all()
+
+    def _mount_depth_text_input(self, doc, input_id, key):
+        w.bind_committed_text_input(
+            doc.get_element_by_id(input_id),
+            key,
+            escape_revert=self._escape_revert,
+            capture=lambda k=key: self._capture_depth_text_snapshot(k),
+            restore=lambda snapshot, k=key: self._restore_depth_text_snapshot(k, snapshot),
+            commit=self._commit_depth_text_key,
+            on_focus=self._begin_depth_text_edit,
+            on_blur=self._end_depth_text_edit,
+        )
+
+    def _depth_text_value(self, key):
+        value = self._depth_text_bufs.get(key)
+        if value is not None:
+            return value
+        return self._canonical_depth_text_value(key)
+
+    def _set_depth_text_value(self, key, value):
+        self._depth_text_bufs[key] = str(value)
+
+    def _begin_depth_text_edit(self, key):
+        self._editing_depth_text.add(key)
+
+    def _end_depth_text_edit(self, key):
+        self._editing_depth_text.discard(key)
+
+    def _capture_depth_text_snapshot(self, key):
+        return self._canonical_depth_text_value(key)
+
+    def _restore_depth_text_snapshot(self, key, snapshot):
+        self._depth_text_bufs[key] = str(snapshot or "")
+        if self._handle:
+            self._handle.dirty(key)
+
+    def _commit_depth_text_key(self, key):
+        value = self._depth_text_bufs.get(key)
+        if value is not None and value.strip():
+            parsed = _parse_float(value, None)
+            if parsed is None:
+                self._sync_depth_text_bufs(force=True)
+                return
+            if key == "selection_depth_near_str":
+                self._set_depth_near(parsed)
+            elif key == "selection_depth_far_str":
+                self._set_depth_far(parsed)
+
+        self._sync_depth_text_bufs(force=True)
+
+    def _sync_depth_text_bufs(self, force=False):
+        for key in self._depth_text_bufs:
+            if not force and key in self._editing_depth_text:
+                continue
+            canonical = self._canonical_depth_text_value(key)
+            if self._depth_text_bufs.get(key) == canonical:
+                continue
+            self._depth_text_bufs[key] = canonical
+            if self._handle:
+                self._handle.dirty(key)
+
+    def _canonical_depth_text_value(self, key):
+        if key == "selection_depth_near_str":
+            return f"{self._depth_near:.2f}"
+        if key == "selection_depth_far_str":
+            return f"{self._depth_far:.2f}"
+        return ""
 
     def _on_action(self, handle, event, args):
         del handle, event
