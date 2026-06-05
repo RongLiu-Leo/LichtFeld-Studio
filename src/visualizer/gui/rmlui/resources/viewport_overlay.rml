@@ -129,20 +129,6 @@
         </div>
 
         <div class="toolbar-hcenter toolbar-layer-primary">
-            <div id="primary-selection-toolbar" class="toolbar-container hidden"
-                 data-class-hidden="!show_selection_toolbar">
-                <div class="icon-btn"
-                     data-for="button : selection_mode_buttons"
-                     data-attr-id="button.button_id"
-                     data-class-selected="button.selected"
-                     data-attr-data-action="button.action_id"
-                     data-attr-data-shortcut="button.shortcut_text"
-                     data-attr-title="button.tooltip_text"
-                     data-attrif-disabled="!button.enabled"
-                     data-event-click="toolbar_action(button.action, button.value)">
-                    <img data-attr-src="button.icon_src" />
-                </div>
-            </div>
             <div id="primary-transform-toolbar" class="toolbar-container hidden"
                  data-class-hidden="!show_transform_toolbar">
                 <div class="icon-btn"
@@ -350,20 +336,6 @@
         </div>
 
         <div class="toolbar-hcenter toolbar-layer-primary">
-            <div id="secondary-selection-toolbar" class="toolbar-container hidden"
-                 data-class-hidden="!show_selection_toolbar">
-                <div class="icon-btn"
-                     data-for="button : selection_mode_buttons"
-                     data-attr-id="button.button_id"
-                     data-class-selected="button.selected"
-                     data-attr-data-action="button.action_id"
-                     data-attr-data-shortcut="button.shortcut_text"
-                     data-attr-title="button.tooltip_text"
-                     data-attrif-disabled="!button.enabled"
-                     data-event-click="toolbar_action(button.action, button.value)">
-                    <img data-attr-src="button.icon_src" />
-                </div>
-            </div>
             <div id="secondary-transform-toolbar" class="toolbar-container hidden"
                  data-class-hidden="!show_transform_toolbar">
                 <div class="icon-btn"
@@ -449,47 +421,19 @@
 
     <div id="selection-block" class="viewport-selection-overlay hidden">
         <div class="viewport-transform-panel viewport-selection-panel" data-tooltip="tooltip.selection_panel">
-            <div class="viewport-transform-header viewport-selection-header">
-                <div class="viewport-transform-meta viewport-selection-meta">
-                    <span class="viewport-transform-meta__tool" data-tooltip="tooltip.selection_tool">{{selection_tool_label}}</span>
-                    <span class="viewport-transform-meta__target" data-tooltip="tooltip.selection_mode">{{selection_mode_label}}</span>
-                </div>
-
-                <div class="viewport-selection-depth-fields" data-tooltip="tooltip.selection_depth_range">
-                    <div class="viewport-transform-axis viewport-selection-depth-axis" data-tooltip="tooltip.selection_depth_near">
-                        <span class="viewport-transform-axis-label">Near</span>
-                        <input type="range"
-                               class="setting-slider viewport-selection-slider"
-                               min="0"
-                               max="1000"
-                               data-attr-min="selection_depth_near_slider_min"
-                               data-attr-max="selection_depth_near_slider_max"
-                               step="0.05"
-                               data-value="selection_depth_near_value"
-                               data-attrif-disabled="!selection_has_scene" />
-                        <input type="text"
-                               class="number-input viewport-selection-depth-input"
-                               id="selection-depth-near"
-                               data-value="selection_depth_near_str"
-                               data-attrif-disabled="!selection_has_scene" />
-                    </div>
-                    <div class="viewport-transform-axis viewport-selection-depth-axis" data-tooltip="tooltip.selection_depth_far">
-                        <span class="viewport-transform-axis-label">Far</span>
-                        <input type="range"
-                               class="setting-slider viewport-selection-slider"
-                               min="0"
-                               max="1000"
-                               data-attr-min="selection_depth_far_slider_min"
-                               data-attr-max="selection_depth_far_slider_max"
-                               step="0.05"
-                               data-value="selection_depth_far_value"
-                               data-attrif-disabled="!selection_has_scene" />
-                        <input type="text"
-                               class="number-input viewport-selection-depth-input"
-                               id="selection-depth-far"
-                               data-value="selection_depth_far_str"
-                               data-attrif-disabled="!selection_has_scene" />
-                    </div>
+            <div class="viewport-selection-row">
+                <div class="viewport-selection-tool-group">
+                    <button class="icon-btn viewport-transform-option viewport-selection-tool"
+                            data-for="button : selection_mode_buttons"
+                            data-attr-id="button.button_id"
+                            data-class-selected="button.selected"
+                            data-attr-data-action="button.action_id"
+                            data-attr-data-shortcut="button.shortcut_text"
+                            data-attr-title="button.tooltip_text"
+                            data-attrif-disabled="!button.enabled"
+                            data-event-click="toolbar_action(button.action, button.value)">
+                        <img data-attr-src="button.icon_src" />
+                    </button>
                 </div>
 
                 <div class="viewport-transform-actions viewport-selection-actions">
@@ -550,6 +494,45 @@
                             data-event-click="selection_action('unselect')">
                         <img src="../icon/scene/x.png" />
                     </button>
+                </div>
+            </div>
+
+            <div class="viewport-selection-depth-fields"
+                 data-if="selection_depth_mode_active"
+                 data-tooltip="tooltip.selection_depth_range">
+                <div class="viewport-transform-axis viewport-selection-depth-axis" data-tooltip="tooltip.selection_depth_near">
+                    <span class="viewport-transform-axis-label">Near</span>
+                    <input type="range"
+                           class="setting-slider viewport-selection-slider"
+                           min="0"
+                           max="1000"
+                           data-attr-min="selection_depth_near_slider_min"
+                           data-attr-max="selection_depth_near_slider_max"
+                           step="0.05"
+                           data-value="selection_depth_near_value"
+                           data-attrif-disabled="!selection_has_scene" />
+                    <input type="text"
+                           class="number-input viewport-selection-depth-input"
+                           id="selection-depth-near"
+                           data-value="selection_depth_near_str"
+                           data-attrif-disabled="!selection_has_scene" />
+                </div>
+                <div class="viewport-transform-axis viewport-selection-depth-axis" data-tooltip="tooltip.selection_depth_far">
+                    <span class="viewport-transform-axis-label">Far</span>
+                    <input type="range"
+                           class="setting-slider viewport-selection-slider"
+                           min="0"
+                           max="1000"
+                           data-attr-min="selection_depth_far_slider_min"
+                           data-attr-max="selection_depth_far_slider_max"
+                           step="0.05"
+                           data-value="selection_depth_far_value"
+                           data-attrif-disabled="!selection_has_scene" />
+                    <input type="text"
+                           class="number-input viewport-selection-depth-input"
+                           id="selection-depth-far"
+                           data-value="selection_depth_far_str"
+                           data-attrif-disabled="!selection_has_scene" />
                 </div>
             </div>
         </div>
@@ -700,11 +683,19 @@
 
     <div id="transform-block" class="viewport-transform-overlay hidden">
         <div class="viewport-transform-panel" data-tooltip="tooltip.transform_panel">
-            <div class="viewport-transform-header">
-                <div class="viewport-transform-meta">
-                    <span class="viewport-transform-meta__tool" data-tooltip="tooltip.transform_tool">{{transform_tool_label}}</span>
-                    <span class="viewport-transform-meta__target" data-if="transform_is_single" data-tooltip="tooltip.transform_target">{{transform_node_name}}</span>
-                    <span class="viewport-transform-meta__target" data-if="transform_is_multi" data-tooltip="tooltip.transform_target">{{transform_multi_label}}</span>
+            <div class="viewport-transform-row">
+                <div class="viewport-transform-tool-group" data-if="transform_show_actions">
+                    <button class="icon-btn viewport-transform-option viewport-transform-tool"
+                            data-for="button : transform_tool_buttons"
+                            data-attr-id="button.button_id"
+                            data-class-selected="button.selected"
+                            data-attr-data-action="button.action_id"
+                            data-attr-data-shortcut="button.shortcut_text"
+                            data-attr-title="button.tooltip_text"
+                            data-attrif-disabled="!button.enabled"
+                            data-event-click="toolbar_action(button.action, button.value)">
+                        <img data-attr-src="button.icon_src" />
+                    </button>
                 </div>
 
                 <div class="viewport-transform-context" data-if="transform_show_actions">
@@ -738,6 +729,77 @@
                     </div>
                 </div>
 
+                <div class="viewport-transform-fields">
+                    <div class="viewport-transform-group" data-if="transform_show_translate" data-tooltip="tooltip.transform_position">
+                        <div class="viewport-transform-axis" data-tooltip="tooltip.transform_position_axis">
+                            <span class="viewport-transform-axis-label">X</span>
+                            <input type="text" class="number-input" id="transform-pos-x" data-value="transform_pos_x_str" />
+                            <button class="num-step-btn" data-event-mousedown="transform_num_step('pos_x', -1)">-</button>
+                            <button class="num-step-btn" data-event-mousedown="transform_num_step('pos_x', 1)">+</button>
+                        </div>
+                        <div class="viewport-transform-axis" data-tooltip="tooltip.transform_position_axis">
+                            <span class="viewport-transform-axis-label">Y</span>
+                            <input type="text" class="number-input" id="transform-pos-y" data-value="transform_pos_y_str" />
+                            <button class="num-step-btn" data-event-mousedown="transform_num_step('pos_y', -1)">-</button>
+                            <button class="num-step-btn" data-event-mousedown="transform_num_step('pos_y', 1)">+</button>
+                        </div>
+                        <div class="viewport-transform-axis" data-tooltip="tooltip.transform_position_axis">
+                            <span class="viewport-transform-axis-label">Z</span>
+                            <input type="text" class="number-input" id="transform-pos-z" data-value="transform_pos_z_str" />
+                            <button class="num-step-btn" data-event-mousedown="transform_num_step('pos_z', -1)">-</button>
+                            <button class="num-step-btn" data-event-mousedown="transform_num_step('pos_z', 1)">+</button>
+                        </div>
+                    </div>
+
+                    <div class="viewport-transform-group" data-if="transform_show_rotate" data-tooltip="tooltip.transform_rotation">
+                        <div class="viewport-transform-axis" data-tooltip="tooltip.transform_rotation_axis">
+                            <span class="viewport-transform-axis-label">X</span>
+                            <input type="text" class="number-input" id="transform-rot-x" data-value="transform_rot_x_str" />
+                            <button class="num-step-btn" data-event-mousedown="transform_num_step('rot_x', -1)">-</button>
+                            <button class="num-step-btn" data-event-mousedown="transform_num_step('rot_x', 1)">+</button>
+                        </div>
+                        <div class="viewport-transform-axis" data-tooltip="tooltip.transform_rotation_axis">
+                            <span class="viewport-transform-axis-label">Y</span>
+                            <input type="text" class="number-input" id="transform-rot-y" data-value="transform_rot_y_str" />
+                            <button class="num-step-btn" data-event-mousedown="transform_num_step('rot_y', -1)">-</button>
+                            <button class="num-step-btn" data-event-mousedown="transform_num_step('rot_y', 1)">+</button>
+                        </div>
+                        <div class="viewport-transform-axis" data-tooltip="tooltip.transform_rotation_axis">
+                            <span class="viewport-transform-axis-label">Z</span>
+                            <input type="text" class="number-input" id="transform-rot-z" data-value="transform_rot_z_str" />
+                            <button class="num-step-btn" data-event-mousedown="transform_num_step('rot_z', -1)">-</button>
+                            <button class="num-step-btn" data-event-mousedown="transform_num_step('rot_z', 1)">+</button>
+                        </div>
+                    </div>
+
+                    <div class="viewport-transform-group" data-if="transform_show_scale" data-tooltip="tooltip.transform_scale">
+                        <div class="viewport-transform-axis" data-tooltip="tooltip.transform_scale_uniform">
+                            <span class="viewport-transform-axis-label">U</span>
+                            <input type="text" class="number-input" id="transform-scale-u" data-value="transform_scale_u_str" />
+                            <button class="num-step-btn" data-event-mousedown="transform_num_step('scale_u', -1)">-</button>
+                            <button class="num-step-btn" data-event-mousedown="transform_num_step('scale_u', 1)">+</button>
+                        </div>
+                        <div class="viewport-transform-axis viewport-transform-axis--split" data-tooltip="tooltip.transform_scale_axis">
+                            <span class="viewport-transform-axis-label">X</span>
+                            <input type="text" class="number-input" id="transform-scale-x" data-value="transform_scale_x_str" />
+                            <button class="num-step-btn" data-event-mousedown="transform_num_step('scale_x', -1)">-</button>
+                            <button class="num-step-btn" data-event-mousedown="transform_num_step('scale_x', 1)">+</button>
+                        </div>
+                        <div class="viewport-transform-axis" data-tooltip="tooltip.transform_scale_axis">
+                            <span class="viewport-transform-axis-label">Y</span>
+                            <input type="text" class="number-input" id="transform-scale-y" data-value="transform_scale_y_str" />
+                            <button class="num-step-btn" data-event-mousedown="transform_num_step('scale_y', -1)">-</button>
+                            <button class="num-step-btn" data-event-mousedown="transform_num_step('scale_y', 1)">+</button>
+                        </div>
+                        <div class="viewport-transform-axis" data-tooltip="tooltip.transform_scale_axis">
+                            <span class="viewport-transform-axis-label">Z</span>
+                            <input type="text" class="number-input" id="transform-scale-z" data-value="transform_scale_z_str" />
+                            <button class="num-step-btn" data-event-mousedown="transform_num_step('scale_z', -1)">-</button>
+                            <button class="num-step-btn" data-event-mousedown="transform_num_step('scale_z', 1)">+</button>
+                        </div>
+                    </div>
+                </div>
+
                 <div class="viewport-transform-actions" data-if="transform_show_actions">
                     <button class="icon-btn viewport-transform-action"
                             data-tooltip="tooltip.transform_bake"
@@ -751,80 +813,6 @@
                             data-event-click="transform_action('reset')">
                         <img src="../icon/reset.png" />
                     </button>
-                </div>
-            </div>
-
-            <div class="viewport-transform-fields">
-                <div class="viewport-transform-group" data-if="transform_show_translate" data-tooltip="tooltip.transform_position">
-                    <span class="viewport-transform-group-label">Position</span>
-                    <div class="viewport-transform-axis" data-tooltip="tooltip.transform_position_axis">
-                        <span class="viewport-transform-axis-label">X</span>
-                        <input type="text" class="number-input" id="transform-pos-x" data-value="transform_pos_x_str" />
-                        <button class="num-step-btn" data-event-mousedown="transform_num_step('pos_x', -1)">-</button>
-                        <button class="num-step-btn" data-event-mousedown="transform_num_step('pos_x', 1)">+</button>
-                    </div>
-                    <div class="viewport-transform-axis" data-tooltip="tooltip.transform_position_axis">
-                        <span class="viewport-transform-axis-label">Y</span>
-                        <input type="text" class="number-input" id="transform-pos-y" data-value="transform_pos_y_str" />
-                        <button class="num-step-btn" data-event-mousedown="transform_num_step('pos_y', -1)">-</button>
-                        <button class="num-step-btn" data-event-mousedown="transform_num_step('pos_y', 1)">+</button>
-                    </div>
-                    <div class="viewport-transform-axis" data-tooltip="tooltip.transform_position_axis">
-                        <span class="viewport-transform-axis-label">Z</span>
-                        <input type="text" class="number-input" id="transform-pos-z" data-value="transform_pos_z_str" />
-                        <button class="num-step-btn" data-event-mousedown="transform_num_step('pos_z', -1)">-</button>
-                        <button class="num-step-btn" data-event-mousedown="transform_num_step('pos_z', 1)">+</button>
-                    </div>
-                </div>
-
-                <div class="viewport-transform-group" data-if="transform_show_rotate" data-tooltip="tooltip.transform_rotation">
-                    <span class="viewport-transform-group-label">Rotation</span>
-                    <div class="viewport-transform-axis" data-tooltip="tooltip.transform_rotation_axis">
-                        <span class="viewport-transform-axis-label">X</span>
-                        <input type="text" class="number-input" id="transform-rot-x" data-value="transform_rot_x_str" />
-                        <button class="num-step-btn" data-event-mousedown="transform_num_step('rot_x', -1)">-</button>
-                        <button class="num-step-btn" data-event-mousedown="transform_num_step('rot_x', 1)">+</button>
-                    </div>
-                    <div class="viewport-transform-axis" data-tooltip="tooltip.transform_rotation_axis">
-                        <span class="viewport-transform-axis-label">Y</span>
-                        <input type="text" class="number-input" id="transform-rot-y" data-value="transform_rot_y_str" />
-                        <button class="num-step-btn" data-event-mousedown="transform_num_step('rot_y', -1)">-</button>
-                        <button class="num-step-btn" data-event-mousedown="transform_num_step('rot_y', 1)">+</button>
-                    </div>
-                    <div class="viewport-transform-axis" data-tooltip="tooltip.transform_rotation_axis">
-                        <span class="viewport-transform-axis-label">Z</span>
-                        <input type="text" class="number-input" id="transform-rot-z" data-value="transform_rot_z_str" />
-                        <button class="num-step-btn" data-event-mousedown="transform_num_step('rot_z', -1)">-</button>
-                        <button class="num-step-btn" data-event-mousedown="transform_num_step('rot_z', 1)">+</button>
-                    </div>
-                </div>
-
-                <div class="viewport-transform-group" data-if="transform_show_scale" data-tooltip="tooltip.transform_scale">
-                    <span class="viewport-transform-group-label">Scale</span>
-                    <div class="viewport-transform-axis" data-tooltip="tooltip.transform_scale_uniform">
-                        <span class="viewport-transform-axis-label">U</span>
-                        <input type="text" class="number-input" id="transform-scale-u" data-value="transform_scale_u_str" />
-                        <button class="num-step-btn" data-event-mousedown="transform_num_step('scale_u', -1)">-</button>
-                        <button class="num-step-btn" data-event-mousedown="transform_num_step('scale_u', 1)">+</button>
-                    </div>
-                    <div class="viewport-transform-axis viewport-transform-axis--split" data-tooltip="tooltip.transform_scale_axis">
-                        <span class="viewport-transform-axis-label">X</span>
-                        <input type="text" class="number-input" id="transform-scale-x" data-value="transform_scale_x_str" />
-                        <button class="num-step-btn" data-event-mousedown="transform_num_step('scale_x', -1)">-</button>
-                        <button class="num-step-btn" data-event-mousedown="transform_num_step('scale_x', 1)">+</button>
-                    </div>
-                    <div class="viewport-transform-axis" data-tooltip="tooltip.transform_scale_axis">
-                        <span class="viewport-transform-axis-label">Y</span>
-                        <input type="text" class="number-input" id="transform-scale-y" data-value="transform_scale_y_str" />
-                        <button class="num-step-btn" data-event-mousedown="transform_num_step('scale_y', -1)">-</button>
-                        <button class="num-step-btn" data-event-mousedown="transform_num_step('scale_y', 1)">+</button>
-                    </div>
-                    <div class="viewport-transform-axis" data-tooltip="tooltip.transform_scale_axis">
-                        <span class="viewport-transform-axis-label">Z</span>
-                        <input type="text" class="number-input" id="transform-scale-z" data-value="transform_scale_z_str" />
-                        <button class="num-step-btn" data-event-mousedown="transform_num_step('scale_z', -1)">-</button>
-                        <button class="num-step-btn" data-event-mousedown="transform_num_step('scale_z', 1)">+</button>
-                    </div>
                 </div>
             </div>
 

@@ -22,18 +22,9 @@ _DEPTH_GAP = 0.01
 _DEPTH_SLIDER_HALF_WINDOW = 20.0
 _DEPTH_SLIDER_MIN_SPAN = 1.0
 _DEFAULT_DEPTH_NEAR = 0.0
-_DEFAULT_DEPTH_FAR = 5.3
+_DEFAULT_DEPTH_FAR = 15.0
 _DEFAULT_FRUSTUM_HALF_WIDTH = 1.35
 _MISSING = object()
-
-_MODE_LABELS = {
-    "centers": ("toolbar.brush_selection", "Brush"),
-    "rectangle": ("toolbar.rect_selection", "Rectangle"),
-    "polygon": ("toolbar.polygon_selection", "Polygon"),
-    "lasso": ("toolbar.lasso_selection", "Lasso"),
-    "rings": ("toolbar.ring_selection", "Rings"),
-    "color": ("toolbar.color_selection", "Color"),
-}
 
 
 def _ui_label(key: str, fallback: str) -> str:
@@ -98,8 +89,6 @@ def _execute_stage(stage):
 
 class SelectionControlsController:
     _DIRTY_FIELDS = (
-        "selection_tool_label",
-        "selection_mode_label",
         "selection_depth_mode_active",
         "selection_has_scene",
         "selection_has_selection",
@@ -140,8 +129,6 @@ class SelectionControlsController:
         self._last_state_items = None
 
     def bind_model(self, model):
-        model.bind_func("selection_tool_label", lambda: _ui_label("toolbar.selection", "Select"))
-        model.bind_func("selection_mode_label", self._mode_label)
         model.bind_func("selection_depth_mode_active", lambda: self._depth_enabled)
         model.bind_func("selection_has_scene", lambda: self._has_scene)
         model.bind_func("selection_has_selection", lambda: self._has_selection)
@@ -237,10 +224,6 @@ class SelectionControlsController:
         self._visible = False
         self._last_state_key = None
         self._last_state_items = None
-
-    def _mode_label(self):
-        key, fallback = _MODE_LABELS.get(self._active_mode, ("toolbar.selection", "Selection"))
-        return _ui_label(key, fallback)
 
     def _get_active_tool(self):
         value = _native_store_value("active_tool", _MISSING)
@@ -458,7 +441,6 @@ class SelectionControlsController:
             return
 
         field_map = {
-            "active_mode": ("selection_mode_label",),
             "has_scene": (
                 "selection_has_scene",
                 "selection_depth_near_str",

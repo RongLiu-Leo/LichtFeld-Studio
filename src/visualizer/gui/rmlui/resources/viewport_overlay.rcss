@@ -58,17 +58,31 @@ body {
 
 .toolbar-vertical .icon-btn {
     position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 30dp;
+    height: 30dp;
+    min-width: 30dp;
+    min-height: 30dp;
     margin: 1dp 0;
     padding: 3dp;
     border-width: 1dp;
     border-color: transparent;
     border-radius: 6dp;
+    box-sizing: border-box;
+    flex-shrink: 0;
     transition: background-color border-color 0.12s quadratic-out;
 }
 
 .toolbar-vertical .icon-btn.selected {
     padding: 3dp;
     border-width: 1dp;
+}
+
+.toolbar-vertical .icon-btn img {
+    width: 20dp;
+    height: 20dp;
 }
 
 .toolbar-hcenter {
@@ -84,12 +98,33 @@ body {
     pointer-events: auto;
 }
 
+.toolbar-hcenter .toolbar-container {
+    align-items: center;
+    padding: 5dp 6dp;
+    border-radius: 6dp;
+    box-sizing: border-box;
+}
+
 .toolbar-hcenter .icon-btn {
-    padding: 7dp;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 22dp;
+    height: 22dp;
+    min-width: 22dp;
+    min-height: 22dp;
+    padding: 2dp;
     border-width: 1dp;
     border-color: transparent;
     border-radius: 6dp;
+    box-sizing: border-box;
+    flex-shrink: 0;
     transition: background-color border-color 0.12s quadratic-out;
+}
+
+.toolbar-hcenter .icon-btn img {
+    width: 17dp;
+    height: 17dp;
 }
 
 .toolbar-layer-primary {
@@ -98,7 +133,7 @@ body {
 
 .viewport-selection-overlay {
     position: absolute;
-    top: 49dp;
+    top: 5dp;
     left: 52dp;
     right: 12dp;
     display: flex;
@@ -120,7 +155,7 @@ body {
 
 .viewport-transform-overlay {
     position: absolute;
-    top: 49dp;
+    top: 5dp;
     left: 52dp;
     right: 12dp;
     display: flex;
@@ -129,19 +164,9 @@ body {
     z-index: 9;
 }
 
-.viewport-selection-header {
-    flex-wrap: wrap;
-}
-
 .viewport-depth-header {
     flex-wrap: nowrap;
     align-items: center;
-}
-
-.viewport-transform-meta.viewport-selection-meta {
-    min-width: 88dp;
-    max-width: 128dp;
-    flex-grow: 0;
 }
 
 .viewport-transform-meta.viewport-depth-meta {
@@ -161,6 +186,14 @@ body {
     white-space: nowrap;
 }
 
+#depth-view-block .viewport-transform-meta.viewport-depth-meta {
+    min-height: 22dp;
+}
+
+#depth-view-block .viewport-transform-meta.viewport-depth-meta .viewport-transform-meta__tool {
+    line-height: 22dp;
+}
+
 .viewport-depth-mode-select {
     width: 112dp;
     min-width: 112dp;
@@ -173,6 +206,12 @@ body {
     flex-shrink: 0;
 }
 
+#depth-view-block .viewport-depth-mode-select {
+    height: 22dp;
+    min-height: 22dp;
+    line-height: 20dp;
+}
+
 .viewport-depth-mode-select selectvalue {
     height: 22dp;
     line-height: 22dp;
@@ -180,6 +219,11 @@ body {
     padding: 0 0 0 8dp;
     position: relative;
     top: 0;
+}
+
+#depth-view-block .viewport-depth-mode-select selectvalue {
+    height: 20dp;
+    line-height: 20dp;
 }
 
 .viewport-depth-mode-select selectarrow {
@@ -190,6 +234,11 @@ body {
     top: 0;
 }
 
+#depth-view-block .viewport-depth-mode-select selectarrow {
+    height: 20dp;
+    line-height: 20dp;
+}
+
 .viewport-selection-depth-fields {
     min-width: 0;
     display: flex;
@@ -198,6 +247,13 @@ body {
     flex-wrap: wrap;
     gap: 6dp;
     flex-grow: 1;
+}
+
+#selection-block .viewport-selection-depth-fields {
+    flex-wrap: nowrap;
+    gap: 5dp;
+    flex-grow: 0;
+    flex-shrink: 0;
 }
 
 .viewport-selection-depth-axis {
@@ -241,10 +297,20 @@ body {
     gap: 8dp;
 }
 
+#depth-view-block .viewport-depth-fields {
+    gap: 5dp;
+}
+
 .viewport-depth-axis {
     gap: 4dp;
     height: 24dp;
     min-height: 24dp;
+}
+
+#depth-view-block .viewport-depth-axis {
+    height: 22dp;
+    min-height: 22dp;
+    gap: 3dp;
 }
 
 .viewport-depth-axis > .viewport-transform-axis-label {
@@ -255,12 +321,22 @@ body {
     text-align: left;
 }
 
+#depth-view-block .viewport-depth-axis > .viewport-transform-axis-label {
+    line-height: 22dp;
+}
+
 .viewport-selection-slider.viewport-depth-slider {
     width: 128dp;
     min-width: 128dp;
     height: 24dp;
     min-height: 24dp;
     top: 3dp;
+}
+
+#depth-view-block .viewport-selection-slider.viewport-depth-slider {
+    height: 22dp;
+    min-height: 22dp;
+    top: 0;
 }
 
 .viewport-selection-depth-axis > .number-input.viewport-depth-input {
@@ -273,8 +349,15 @@ body {
     padding: 0 5dp;
 }
 
+#depth-view-block .viewport-selection-depth-axis > .number-input.viewport-depth-input {
+    height: 22dp;
+    min-height: 22dp;
+    line-height: 16dp;
+    padding: 2dp 5dp;
+}
+
 .viewport-selection-actions {
-    margin-left: auto;
+    margin-left: 0;
 }
 
 .viewport-depth-actions {
@@ -298,8 +381,21 @@ body {
     min-width: 600dp;
 }
 
+#selection-block .viewport-selection-panel {
+    min-width: 0;
+    padding: 5dp 6dp;
+    border-radius: 6dp;
+    gap: 4dp;
+}
+
 .viewport-transform-panel.viewport-depth-panel {
     min-width: 624dp;
+}
+
+#depth-view-block .viewport-depth-panel {
+    padding: 5dp 6dp;
+    border-radius: 6dp;
+    gap: 0;
 }
 
 .viewport-transform-panel.viewport-export-panel {
@@ -327,6 +423,34 @@ body {
     width: 686dp;
     min-width: 686dp;
     max-width: 686dp;
+}
+
+#transform-block .viewport-transform-panel {
+    min-width: 0;
+    padding: 5dp 6dp;
+    border-radius: 6dp;
+    gap: 0;
+}
+
+.viewport-transform-row,
+.viewport-selection-row {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-wrap: nowrap;
+    gap: 5dp;
+    min-width: 0;
+}
+
+.viewport-transform-tool-group,
+.viewport-selection-tool-group {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    padding: 0;
+    border-width: 1dp;
+    border-radius: 5dp;
+    flex-shrink: 0;
 }
 
 .viewport-export-overlay {
@@ -401,6 +525,27 @@ body {
 .viewport-transform-option img {
     width: 18dp;
     height: 18dp;
+}
+
+#transform-block .viewport-transform-option,
+#transform-block .viewport-transform-action,
+#selection-block .viewport-transform-option,
+#selection-block .viewport-transform-action,
+#depth-view-block .viewport-transform-action {
+    width: 22dp;
+    height: 22dp;
+    min-width: 22dp;
+    min-height: 22dp;
+    padding: 2dp;
+}
+
+#transform-block .viewport-transform-option img,
+#transform-block .viewport-transform-action img,
+#selection-block .viewport-transform-option img,
+#selection-block .viewport-transform-action img,
+#depth-view-block .viewport-transform-action img {
+    width: 17dp;
+    height: 17dp;
 }
 
 .viewport-export-fields {
@@ -600,18 +745,22 @@ body {
     min-width: 0;
 }
 
-.viewport-transform-group-label {
-    font-size: 11dp;
-    font-weight: bold;
-    white-space: nowrap;
-    flex-shrink: 0;
-}
-
 .viewport-transform-axis {
     display: flex;
     align-items: center;
     gap: 2dp;
     min-width: 0;
+    flex-shrink: 0;
+}
+
+#transform-block .viewport-transform-fields,
+#transform-block .viewport-transform-group {
+    flex-wrap: nowrap;
+    gap: 4dp;
+}
+
+#transform-block .viewport-transform-fields {
+    justify-content: flex-start;
     flex-shrink: 0;
 }
 
@@ -642,6 +791,23 @@ body {
     line-height: 20dp;
     margin-left: 0;
     box-sizing: border-box;
+}
+
+#transform-block .viewport-transform-axis-label {
+    width: 8dp;
+    min-width: 8dp;
+}
+
+#transform-block .viewport-transform-axis > .number-input {
+    width: 58dp;
+    min-width: 58dp;
+    height: 22dp;
+    min-height: 22dp;
+}
+
+#transform-block .viewport-transform-axis > .num-step-btn {
+    width: 20dp;
+    min-width: 20dp;
 }
 
 .viewport-transform-axis--split {
@@ -688,8 +854,8 @@ body {
 
 .toolbar-hcenter .toolbar-separator {
     width: 1dp;
-    height: 24dp;
-    margin: 4dp 5dp;
+    height: 22dp;
+    margin: 0 5dp;
 }
 
 .viewport-status-overlay {

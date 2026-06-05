@@ -19,6 +19,7 @@ def _install_lf_stub(monkeypatch):
         depth_enabled=False,
         depth_near=0.25,
         depth_far=7.5,
+        depth_read_error=False,
         depth_width=1.35,
         depth_calls=[],
         stage_calls=[],
@@ -56,13 +57,18 @@ def _install_lf_stub(monkeypatch):
         state.depth_width = float(width)
         state.depth_calls.append((state.depth_enabled, state.depth_near, state.depth_far, state.depth_width))
 
-    lf_stub.selection = SimpleNamespace(
-        get_depth_filter_range=lambda: (
+    def _get_depth_filter_range():
+        if state.depth_read_error:
+            raise RuntimeError("depth state unavailable")
+        return (
             state.depth_enabled,
             state.depth_near,
             state.depth_far,
             state.depth_width,
-        ),
+        )
+
+    lf_stub.selection = SimpleNamespace(
+        get_depth_filter_range=_get_depth_filter_range,
         set_depth_filter_range=_set_depth_filter_range,
     )
     lf_stub.pipeline = SimpleNamespace(
@@ -175,7 +181,7 @@ def test_selection_controls_show_for_selection_modes(selection_controls_module):
     panel.update(doc)
 
     assert "hidden" not in doc.wrap.classes
-    assert model.bound_funcs["selection_mode_label"]() == "Rectangle"
+    assert "selection_mode_label" not in model.bound_funcs
     assert model.bound_funcs["selection_has_scene"]() is True
     assert model.bound_funcs["selection_has_selection"]() is True
     assert model.bound_funcs["selection_can_undo"]() is True
@@ -189,8 +195,21 @@ def test_selection_controls_show_for_selection_modes(selection_controls_module):
     state.active_submode = "lasso"
     panel.update(doc)
 
-    assert model.bound_funcs["selection_mode_label"]() == "Lasso"
-    assert "selection_mode_label" in model.handle.dirty_calls
+    assert "selection_mode_label" not in model.handle.dirty_calls
+
+
+def test_selection_depth_fallback_far_defaults_to_15(selection_controls_module):
+    module, state = selection_controls_module
+    panel = module.SelectionControlsController()
+    model = _DataModelStub()
+
+    state.depth_read_error = True
+    panel.bind_model(model)
+    panel.update(_DocumentStub())
+
+    assert model.bound_binds["selection_depth_near_str"][0]() == "0.00"
+    assert model.bound_binds["selection_depth_far_str"][0]() == "15.00"
+    assert model.bound_funcs["selection_depth_far_slider_max"]() == "35.000"
 
 
 def test_selection_depth_toggle_and_sliders_use_selection_api(selection_controls_module):

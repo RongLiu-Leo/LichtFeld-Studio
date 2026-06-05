@@ -211,7 +211,6 @@ class _GizmoToolbarController:
                 ToolRegistry.clear_active()
             self._was_hidden = True
             return {
-                "show_selection_toolbar": False,
                 "show_transform_toolbar": False,
                 "show_mirror_toolbar": False,
                 "show_crop_toolbar": False,
@@ -239,6 +238,11 @@ class _GizmoToolbarController:
             active_tool_id = lf.ui.get_active_tool() or ""
         else:
             active_tool_id = active_tool_id or ""
+        selected_getter = getattr(lf, "get_selected_node_names", None)
+        try:
+            selected_nodes = tuple(selected_getter() or []) if callable(selected_getter) else ()
+        except Exception:
+            selected_nodes = ()
         tool_defs = ToolRegistry.get_all()
         tool_def = ToolRegistry.get(active_tool_id) if active_tool_id else None
         select_tool_def = ToolRegistry.get("builtin.select")
@@ -279,11 +283,9 @@ class _GizmoToolbarController:
         pivot_buttons = self._build_pivot_records(tool_def)
 
         return {
-            "show_selection_toolbar": (
-                active_tool_id == "builtin.select" and bool(selection_group_buttons) and bool(selection_mode_buttons)
-            ),
             "show_transform_toolbar": (
                 active_tool_id in self._TRANSFORM_TOOL_IDS and
+                not selected_nodes and
                 bool(transform_group_buttons) and
                 bool(transform_tool_buttons)
             ),
@@ -1048,7 +1050,6 @@ class _ViewportToolbarController:
     _BOOLEAN_FIELDS = (
         "show_render_controls",
         "show_render_toolbar",
-        "show_selection_toolbar",
         "show_transform_toolbar",
         "show_mirror_toolbar",
         "show_crop_toolbar",
@@ -1095,7 +1096,6 @@ class _ViewportToolbarController:
         self._last_toolbar_signature = None
         self._show_render_controls = False
         self._show_render_toolbar = False
-        self._show_selection_toolbar = False
         self._show_transform_toolbar = False
         self._show_mirror_toolbar = False
         self._show_crop_toolbar = False
@@ -1230,7 +1230,6 @@ class _ViewportToolbarController:
         dirty = False
         dirty |= self._sync_flag("show_render_controls", utility_state["show_render_controls"])
         dirty |= self._sync_flag("show_render_toolbar", show_render_toolbar)
-        dirty |= self._sync_flag("show_selection_toolbar", gizmo_state["show_selection_toolbar"] and not show_render_toolbar)
         dirty |= self._sync_flag("show_transform_toolbar", gizmo_state["show_transform_toolbar"] and not show_render_toolbar)
         dirty |= self._sync_flag("show_mirror_toolbar", gizmo_state["show_mirror_toolbar"] and not show_render_toolbar)
         dirty |= self._sync_flag("show_crop_toolbar", gizmo_state["show_crop_toolbar"] and not show_render_toolbar)
