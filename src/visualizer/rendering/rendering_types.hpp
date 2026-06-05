@@ -265,8 +265,8 @@ namespace lfs::vis {
         float lod_render_scale = 1.0f;
         float lod_behind_camera_penalty = 0.2f;
         float lod_cone_foveation = 0.4f;
-        float lod_cone_inner_degrees = 0.0f;
-        float lod_cone_outer_degrees = 0.0f;
+        float lod_cone_inner_degrees = 90.0f;
+        float lod_cone_outer_degrees = 120.0f;
         bool lod_debug_colors = false;      // Per-level color tinting
     };
 

@@ -36,6 +36,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -491,6 +492,8 @@ namespace lfs::vis {
         void setLodAvailable(bool available);
         void setLodEnabled(bool enabled);
         [[nodiscard]] bool isLodEnabled() const;
+        // Returns {selected_count, budget, level_histogram} for the current LOD controller
+        [[nodiscard]] std::tuple<size_t, size_t, std::vector<std::pair<uint8_t, size_t>>> getLodStats() const;
 
     private:
         enum class PreviewImageReadback {

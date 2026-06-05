@@ -161,7 +161,7 @@ namespace lfs::core {
             EVENT(SceneLoaded,
                   Scene* scene;
                   std::filesystem::path path;
-                  enum class Type{PLY, Dataset, SOG, SPZ, Checkpoint} type;
+                  enum class Type{PLY, Dataset, SOG, SPZ, RAD, Checkpoint} type;
                   size_t num_gaussians;
                   int checkpoint_iteration = 0;);
             EVENT(SceneCleared, bool from_history = false;);

@@ -143,9 +143,9 @@ namespace lfs::vis {
         float lod_max_splats = 1500000.0f;
         float lod_pixel_scale_limit = 0.0001f;
         float lod_render_scale = 1.0f;
-        float lod_cone_foveation = 1.0f;
-        float lod_cone_inner_degrees = 0.0f;
-        float lod_cone_outer_degrees = 0.0f;
+        float lod_cone_foveation = 0.4f;
+        float lod_cone_inner_degrees = 90.0f;
+        float lod_cone_outer_degrees = 120.0f;
     };
 
     using GetRenderSettingsCallback = std::function<std::optional<RenderSettingsProxy>()>;

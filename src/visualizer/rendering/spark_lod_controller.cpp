@@ -335,4 +335,23 @@ const std::vector<uint32_t>& SparkLodController::selectedIndices() const {
     return selected_indices_;
 }
 
+std::vector<std::pair<uint8_t, size_t>> SparkLodController::getLevelHistogram() const {
+    std::vector<std::pair<uint8_t, size_t>> result;
+    if (nodes_.empty() || selected_indices_.empty()) {
+        return result;
+    }
+    std::vector<size_t> counts(256, 0);
+    for (uint32_t idx : selected_indices_) {
+        if (idx < nodes_.size()) {
+            counts[nodes_[idx].lod_level]++;
+        }
+    }
+    for (size_t level = 0; level < counts.size(); ++level) {
+        if (counts[level] > 0) {
+            result.emplace_back(static_cast<uint8_t>(level), counts[level]);
+        }
+    }
+    return result;
+}
+
 } // namespace lfs::vis

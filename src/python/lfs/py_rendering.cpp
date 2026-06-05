@@ -830,11 +830,11 @@ namespace lfs::python {
         add_float(&Proxy::lod_render_scale, "lod_render_scale", "Render Scale",
                   "Resolution multiplier for LOD calculations", 1.0, 0.1, 2.0);
         add_float(&Proxy::lod_cone_foveation, "lod_cone_foveation", "Cone Foveation",
-                  "Peripheral LOD penalty factor (1.0 = no penalty)", 1.0, 0.1, 2.0);
+                  "Peripheral LOD penalty factor (1.0 = no penalty)", 0.4, 0.1, 2.0);
         add_float(&Proxy::lod_cone_inner_degrees, "lod_cone_inner_degrees", "Cone Inner",
-                  "Inner cone angle in degrees (no penalty inside this angle)", 0.0, 0.0, 180.0);
+                  "Inner cone angle in degrees (no penalty inside this angle)", 90.0, 0.0, 180.0);
         add_float(&Proxy::lod_cone_outer_degrees, "lod_cone_outer_degrees", "Cone Outer",
-                  "Outer cone angle in degrees (full penalty beyond this angle)", 0.0, 0.0, 180.0);
+                  "Outer cone angle in degrees (full penalty beyond this angle)", 120.0, 0.0, 180.0);
 
         add_bool(&Proxy::apply_appearance_correction, "apply_appearance_correction", "Appearance Correction",
                  "Enable PPISP appearance correction", false);
@@ -1270,6 +1270,31 @@ namespace lfs::python {
         if (!settings)
             return std::nullopt;
         return PyRenderSettings(std::move(*settings));
+    }
+
+    nb::dict get_lod_stats() {
+        nb::dict result;
+        auto* rm = get_rendering_manager();
+        if (!rm) {
+            result["enabled"] = false;
+            result["selected"] = 0;
+            result["budget"] = 0;
+            result["levels"] = nb::list();
+            return result;
+        }
+        auto [selected, budget, histogram] = rm->getLodStats();
+        result["enabled"] = rm->isLodEnabled();
+        result["selected"] = selected;
+        result["budget"] = budget;
+        nb::list levels;
+        for (const auto& [level, count] : histogram) {
+            nb::dict item;
+            item["level"] = level;
+            item["count"] = count;
+            levels.append(item);
+        }
+        result["levels"] = levels;
+        return result;
     }
 
 } // namespace lfs::python
@@ -1788,6 +1813,8 @@ Args:
             .def("__dir__", &PyRenderSettings::python_dir);
 
         m.def("get_render_settings", &get_render_settings);
+        m.def("get_lod_stats", &get_lod_stats,
+              "Get LOD statistics: {enabled, selected, budget, levels:[{level, count}, ...]}");
     }
 
 } // namespace lfs::python

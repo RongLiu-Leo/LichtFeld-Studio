@@ -557,6 +557,8 @@ namespace lfs::vis {
                 file_type = state::SceneLoaded::Type::SOG;
             } else if (ext == ".spz") {
                 file_type = state::SceneLoaded::Type::SPZ;
+            } else if (ext == ".rad") {
+                file_type = state::SceneLoaded::Type::RAD;
             }
 
             auto* mesh_data = std::get_if<std::shared_ptr<lfs::core::MeshData>>(&load_result->data);
@@ -634,17 +636,19 @@ namespace lfs::vis {
 
                 const auto* splat_for_cropbox = scene_.getNode(name);
                 if (splat_for_cropbox) {
-                    // Auto-enable LOD for RAD files that have an LOD tree.
+                    // RAD assets always enter LOD mode; availability still reflects tree presence.
+                    const bool is_rad = ext == ".rad";
                     const bool has_lod_tree =
-                        (ext == ".rad" && splat_for_cropbox->model &&
+                        (is_rad && splat_for_cropbox->model &&
                          splat_for_cropbox->model->lod_tree &&
                          splat_for_cropbox->model->lod_tree->has_tree());
                     if (auto* rm = services().renderingOrNull()) {
                         rm->setLodAvailable(has_lod_tree);
-                        rm->setLodEnabled(has_lod_tree);
+                        rm->setLodEnabled(is_rad);
                     }
-                    if (has_lod_tree) {
-                        LOG_INFO("RAD file loaded with LOD tree; LOD viewer mode auto-enabled");
+                    if (is_rad) {
+                        LOG_INFO("RAD file loaded; LOD viewer mode auto-enabled (tree: {})",
+                                 has_lod_tree ? "available" : "missing");
                     }
 
                     const core::NodeId cropbox_id = scene_.getCropBoxForSplat(splat_for_cropbox->id);
@@ -813,6 +817,26 @@ namespace lfs::vis {
             {
                 std::lock_guard<std::mutex> lock(state_mutex_);
                 splat_paths_[name] = path;
+            }
+
+            // RAD assets always enter LOD mode; availability still reflects tree presence.
+            auto add_ext = path.extension().string();
+            std::transform(add_ext.begin(), add_ext.end(), add_ext.begin(), ::tolower);
+            const auto* splat_for_cropbox = scene_.getNode(name);
+            if (splat_for_cropbox) {
+                const bool is_rad = add_ext == ".rad";
+                const bool has_lod_tree =
+                    (is_rad && splat_for_cropbox->model &&
+                     splat_for_cropbox->model->lod_tree &&
+                     splat_for_cropbox->model->lod_tree->has_tree());
+                if (auto* rm = services().renderingOrNull()) {
+                    rm->setLodAvailable(has_lod_tree);
+                    rm->setLodEnabled(is_rad);
+                }
+                if (is_rad) {
+                    LOG_INFO("RAD file added; LOD viewer mode auto-enabled (tree: {})",
+                             has_lod_tree ? "available" : "missing");
+                }
             }
 
             state::PLYAdded{

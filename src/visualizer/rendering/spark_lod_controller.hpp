@@ -10,6 +10,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <optional>
+#include <utility>
 #include <glm/glm.hpp>
 
 namespace lfs::vis {
@@ -21,9 +22,9 @@ public:
         float pixel_scale_limit = 0.0001f;
         float lod_render_scale = 1.0f;
         float behind_camera_penalty = 2.0f;
-        float cone_foveation = 1.0f;
-        float cone_inner_degrees = 0.0f;
-        float cone_outer_degrees = 0.0f;
+        float cone_foveation = 0.4f;
+        float cone_inner_degrees = 90.0f;
+        float cone_outer_degrees = 120.0f;
     };
 
     SparkLodController();
@@ -43,6 +44,10 @@ public:
     bool hasTree() const;
     size_t selectedCount() const;
     const std::vector<uint32_t>& selectedIndices() const;
+    // Returns a histogram of selected nodes per LOD level (level -> count)
+    std::vector<std::pair<uint8_t, size_t>> getLevelHistogram() const;
+    // Last parameters used for the traversal
+    const LodParameters& lastParams() const { return last_params_; }
 
 private:
     struct LodTreeNode {

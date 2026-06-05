@@ -1543,12 +1543,17 @@ namespace lfs::vis {
 
                 // Get view matrix from the frame context
                 const glm::mat4 view_matrix = request.frame_view.getViewMatrix();
+                // Apply model transform so LOD centers are evaluated in world space
+                glm::mat4 lod_view_matrix = view_matrix;
+                if (request.scene.model_transforms && !request.scene.model_transforms->empty()) {
+                    lod_view_matrix = view_matrix * (*request.scene.model_transforms)[0];
+                }
                 if (lod_need_sync_fallback_) {
-                    lod_controller_->update(view_matrix, params);
+                    lod_controller_->update(lod_view_matrix, params);
                     lod_need_sync_fallback_ = false;
                 } else {
                     lod_controller_->swapAsyncResults();
-                    lod_controller_->updateAsync(view_matrix, params);
+                    lod_controller_->updateAsync(lod_view_matrix, params);
                 }
                 const auto& selected = lod_controller_->selectedIndices();
                 if (!selected.empty()) {

@@ -69,7 +69,7 @@ SLIDER_PROPS = [
     "ppisp_exposure", "ppisp_vignette_strength", "ppisp_gamma_multiplier",
     "ppisp_gamma_red", "ppisp_gamma_green", "ppisp_gamma_blue",
     "ppisp_crf_toe", "ppisp_crf_shoulder",
-    "lod_max_splats", "lod_render_scale", "lod_cone_foveation", "lod_cone_inner_degrees", "lod_cone_outer_degrees",
+    "lod_render_scale", "lod_cone_foveation", "lod_cone_inner_degrees", "lod_cone_outer_degrees",
 ]
 
 SCRUB_FIELD_DEFS = {
@@ -98,7 +98,8 @@ SCRUB_FIELD_DEFS = {
     "simplify_target": ScrubFieldSpec(1.0, 1.0, 1.0, "%d", data_type=int),
     "simplify_lod_base": ScrubFieldSpec(0.1, 10.0, 0.1, "%.1f"),
     "simplify_opacity_prune_threshold": ScrubFieldSpec(0.0, 1.0, 0.01, "%.2f"),
-    "lod_max_splats": ScrubFieldSpec(100000.0, 5000000.0, 100000.0, "%.0f", data_type=int),
+    # lod_max_splats is now a text input, not a scrub field
+
     "lod_render_scale": ScrubFieldSpec(0.1, 2.0, 0.1, "%.1f"),
     "lod_cone_foveation": ScrubFieldSpec(0.1, 2.0, 0.1, "%.1f"),
     "lod_cone_inner_degrees": ScrubFieldSpec(0.0, 180.0, 1.0, "%.0f"),
@@ -359,6 +360,17 @@ class RenderingPanel(Panel):
                        lambda p=prop_id: float(getattr(s(), p, 0.0)),
                        lambda v, p=prop_id: setattr(s(), p, float(v)) if s() else None)
 
+        model.bind("lod_max_splats_str",
+                   lambda: f"{int(getattr(s(), 'lod_max_splats', 1500000)):,}",
+                   lambda v: self._set_lod_max_splats_str(v))
+
+        # LOD stats bindings
+        model.bind_func("lod_stats_selected", self._lod_stats_selected)
+        model.bind_func("lod_stats_budget", self._lod_stats_budget)
+        model.bind_func("lod_stats_pct", self._lod_stats_pct)
+        model.bind_func("lod_stats_levels", self._lod_stats_levels)
+        model.bind_func("lod_stats_visible", self._lod_stats_visible)
+
         for prop_id in SELECT_PROPS:
             if prop_id == "raster_backend":
                 model.bind(prop_id,
@@ -392,6 +404,8 @@ class RenderingPanel(Panel):
         ] + COLOR_PROPS
         for prop_id in all_props:
             model.bind_func(f"label_{prop_id}", lambda p=prop_id: _prop_label(p))
+        # lod_max_splats is a text input, not a scrub/slider, but still needs a label
+        model.bind_func("label_lod_max_splats", lambda: _prop_label("lod_max_splats"))
 
         for prop_id in COLOR_PROPS:
             model.bind_func(f"{prop_id}_r",
@@ -430,6 +444,12 @@ class RenderingPanel(Panel):
                          lambda: "Camera & Projection")
         model.bind_func("label_hdr_lod",
                          lambda: _tr_fallback("rendering_panel.section_lod", "LOD"))
+        model.bind_func("label_lod_stats_selected",
+                         lambda: _tr_fallback("label_lod_stats_selected", "Selected"))
+        model.bind_func("label_lod_stats_budget",
+                         lambda: _tr_fallback("label_lod_stats_budget", "Budget"))
+        model.bind_func("label_lod_stats_levels",
+                         lambda: _tr_fallback("label_lod_stats_levels", "Levels"))
         model.bind_func("label_hdr_simplify",
                          lambda: _tr_fallback("rendering_panel.section_simplify", "Splat Simplify"))
         model.bind_func("label_hdr_selection",
@@ -838,6 +858,23 @@ class RenderingPanel(Panel):
             if prop == "focal_length_mm":
                 self._handle.dirty("fov_display")
 
+    def _set_lod_max_splats_str(self, value):
+        settings = lf.get_render_settings()
+        if not settings:
+            return
+        try:
+            cleaned = str(value).replace(",", "").replace(" ", "")
+            parsed = int(cleaned)
+            if parsed < 1:
+                parsed = 1
+            if parsed > 500000000:
+                parsed = 500000000
+            settings.lod_max_splats = parsed
+            if self._handle:
+                self._handle.dirty("lod_max_splats_str")
+        except (ValueError, TypeError):
+            pass
+
     def _set_color_hex(self, prop_id, hex_val):
         s = lf.get_render_settings()
         if not s:
@@ -974,6 +1011,48 @@ class RenderingPanel(Panel):
     def _lod_selected_splats(self):
         _node, _name, count = self._active_splat_node()
         return count
+
+    def _lod_stats_visible(self):
+        stats = getattr(lf, "get_lod_stats", lambda: None)()
+        return bool(stats and stats.get("enabled", False))
+
+    def _lod_stats_selected(self):
+        stats = getattr(lf, "get_lod_stats", lambda: None)()
+        if not stats:
+            return "0"
+        return f"{stats.get('selected', 0):,}"
+
+    def _lod_stats_budget(self):
+        stats = getattr(lf, "get_lod_stats", lambda: None)()
+        if not stats:
+            return "0"
+        return f"{stats.get('budget', 0):,}"
+
+    def _lod_stats_pct(self):
+        stats = getattr(lf, "get_lod_stats", lambda: None)()
+        if not stats:
+            return "0%"
+        selected = stats.get("selected", 0)
+        budget = stats.get("budget", 0)
+        if budget <= 0:
+            return "0%"
+        return f"{min(100, int(round(selected * 100.0 / budget)))}%"
+
+    def _lod_stats_levels(self):
+        stats = getattr(lf, "get_lod_stats", lambda: None)()
+        if not stats:
+            return ""
+        levels = stats.get("levels", [])
+        if not levels:
+            return ""
+        # Sort by count descending, take top 3
+        sorted_levels = sorted(levels, key=lambda x: x.get("count", 0), reverse=True)[:3]
+        parts = []
+        for item in sorted_levels:
+            level = item.get("level", 0)
+            count = item.get("count", 0)
+            parts.append(f"L{level}: {count:,}")
+        return " | ".join(parts)
 
     def _active_splat_node(self):
         scene = getattr(lf, "get_scene", lambda: None)()
@@ -1170,7 +1249,10 @@ class RenderingPanel(Panel):
             return False
         self._last_lod_total_splats = total
         self._last_lod_selected_splats = selected
-        self._dirty_model("lod_total_splats", "lod_selected_splats")
+        self._dirty_model(
+            "lod_total_splats", "lod_selected_splats",
+            "lod_stats_selected", "lod_stats_budget", "lod_stats_pct", "lod_stats_levels", "lod_stats_visible"
+        )
         return True
 
     def _sync_simplify_task_state(self, force: bool) -> bool:

@@ -136,9 +136,15 @@ namespace lfs::vis {
     }
 
     void RenderingManager::setLodEnabled(bool enabled) {
+        bool changed = false;
         {
             std::lock_guard<std::mutex> lock(settings_mutex_);
+            changed = settings_.lod_enabled != enabled;
             settings_.lod_enabled = enabled;
+        }
+        if (changed) {
+            auto& render_settings_generation = app_store().render_settings_generation;
+            render_settings_generation.set(render_settings_generation.get() + 1);
         }
         markDirty(DirtyFlag::SPLATS);
     }
@@ -146,6 +152,17 @@ namespace lfs::vis {
     bool RenderingManager::isLodEnabled() const {
         std::lock_guard<std::mutex> lock(settings_mutex_);
         return settings_.lod_enabled;
+    }
+
+    std::tuple<size_t, size_t, std::vector<std::pair<uint8_t, size_t>>> RenderingManager::getLodStats() const {
+        if (!lod_controller_ || !lod_controller_->hasTree()) {
+            return {0, 0, {}};
+        }
+        return {
+            lod_controller_->selectedCount(),
+            lod_controller_->lastParams().max_splats,
+            lod_controller_->getLevelHistogram()
+        };
     }
 
     void RenderingManager::releaseSceneModelResources() {

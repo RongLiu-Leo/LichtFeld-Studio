@@ -90,6 +90,9 @@ namespace lfs::io {
         data.scaling_raw() = data.scaling_raw().to(Device::CUDA);
         data.rotation_raw() = data.rotation_raw().to(Device::CUDA);
         data.opacity_raw() = data.opacity_raw().to(Device::CUDA);
+        if (data.has_deleted_mask()) {
+            data.deleted() = data.deleted().to(Device::CUDA);
+        }
 
         if (options.progress) {
             options.progress(100.0f, "RAD loading complete");
@@ -116,7 +119,7 @@ namespace lfs::io {
             return false;
         }
 
-        if (!std::filesystem::is_regular_file(path)) {
+        if (std::filesystem::is_directory(path)) {
             return false;
         }
 
