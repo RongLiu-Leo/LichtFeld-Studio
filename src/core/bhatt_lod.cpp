@@ -12,10 +12,13 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <numeric>
 #include <queue>
+#include <random>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
@@ -26,9 +29,22 @@ namespace lfs::core {
 namespace {
 
 constexpr float kMinScale = 1e-12f;
+
+// The 26 neighboring cells around a center cell (excluding (0,0,0))
+constexpr std::array<std::array<int8_t, 3>, 26> kNeighborOffsets = {{
+    {{-1, -1, -1}}, {{-1, -1, 0}}, {{-1, -1, 1}},
+    {{-1,  0, -1}}, {{-1,  0, 0}}, {{-1,  0, 1}},
+    {{-1,  1, -1}}, {{-1,  1, 0}}, {{-1,  1, 1}},
+    {{ 0, -1, -1}}, {{ 0, -1, 0}}, {{ 0, -1, 1}},
+    {{ 0,  0, -1}},                  {{ 0,  0, 1}},
+    {{ 0,  1, -1}}, {{ 0,  1, 0}}, {{ 0,  1, 1}},
+    {{ 1, -1, -1}}, {{ 1, -1, 0}}, {{ 1, -1, 1}},
+    {{ 1,  0, -1}}, {{ 1,  0, 0}}, {{ 1,  0, 1}},
+    {{ 1,  1, -1}}, {{ 1,  1, 0}}, {{ 1,  1, 1}}
+}};
 constexpr float kMinQuatNorm = 1e-12f;
 constexpr float kEllipsoidAreaP = 1.6075f;
-constexpr int kJacobiIterations = 32;
+constexpr int kJacobiIterations = 10;
 constexpr float kMinEval = 1e-18f;
 constexpr float kEpsCov = 1e-8f;
 constexpr float SH_C0 = 0.28209479177387814f;
@@ -278,7 +294,34 @@ void decompose_sigma_to_raw_scale_quat(const std::array<float, 9>& sigma,
     rotmat_to_quat(eig.vectors, rotation_raw);
 }
 
+// Compute symmetric 3x3 covariance from scale + quaternion and store 6 unique elements + det
+inline void compute_covariance_from_scale_quat(
+    float sx, float sy, float sz,
+    float qw, float qx, float qy, float qz,
+    float& out_xx, float& out_xy, float& out_xz,
+    float& out_yy, float& out_yz, float& out_zz,
+    float& out_det) {
+
+    std::array<float, 9> R;
+    quat_to_rotmat(qw, qx, qy, qz, R);
+    const float sx2 = sx * sx;
+    const float sy2 = sy * sy;
+    const float sz2 = sz * sz;
+    std::array<float, 9> cov;
+    sigma_from_rot_var(R, sx2, sy2, sz2, cov);
+
+    out_xx = cov[0];
+    out_xy = cov[1];
+    out_xz = cov[2];
+    out_yy = cov[4];
+    out_yz = cov[5];
+    out_zz = cov[8];
+    out_det = det3(cov);
+}
+
 [[nodiscard]] BhattLodWorkset make_workset_from_splatdata(const SplatData& input) {
+    const auto t0 = std::chrono::high_resolution_clock::now();
+
     const auto means_cpu = input.means_raw().cpu().contiguous();
     const auto scaling_cpu = input.scaling_raw().cpu().contiguous();
     const auto rotation_cpu = input.rotation_raw().cpu().contiguous();
@@ -297,12 +340,41 @@ void decompose_sigma_to_raw_scale_quat(const std::array<float, 9>& sigma,
     const auto deleted_cpu = has_deleted ? input.deleted().cpu().contiguous() : Tensor{};
     const uint8_t* deleted_ptr = has_deleted ? deleted_cpu.ptr<uint8_t>() : nullptr;
 
+    LOG_INFO("make_workset_from_splatdata: total_count={}, has_deleted={}", total_count, has_deleted);
+
+    // Step 1: Count visible splats per chunk in parallel
+    const size_t grain_size = std::max(size_t(4096), total_count / 16);
+    const size_t num_chunks = (total_count + grain_size - 1) / grain_size;
+    std::vector<size_t> chunk_counts(num_chunks);
+
+    const auto t_count_start = std::chrono::high_resolution_clock::now();
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, num_chunks),
+        [&](const tbb::blocked_range<size_t>& range) {
+            for (size_t chunk_idx = range.begin(); chunk_idx != range.end(); ++chunk_idx) {
+                const size_t start = chunk_idx * grain_size;
+                const size_t end = std::min(start + grain_size, total_count);
+                size_t count = 0;
+                for (size_t i = start; i < end; ++i) {
+                    if (!has_deleted || (deleted_ptr && deleted_ptr[i] == 0)) {
+                        ++count;
+                    }
+                }
+                chunk_counts[chunk_idx] = count;
+            }
+        });
+    const auto t_count_end = std::chrono::high_resolution_clock::now();
+    const auto count_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_count_end - t_count_start).count();
+
+    // Step 2: Prefix sum to compute chunk offsets
+    std::vector<size_t> chunk_offsets(num_chunks);
     size_t visible_count = 0;
-    for (size_t i = 0; i < total_count; ++i) {
-        if (!has_deleted || (deleted_ptr && deleted_ptr[i] == 0)) {
-            ++visible_count;
-        }
+    for (size_t i = 0; i < num_chunks; ++i) {
+        chunk_offsets[i] = visible_count;
+        visible_count += chunk_counts[i];
     }
+
+    LOG_INFO("make_workset_from_splatdata: counting done in {} ms, visible_count={}, grain_size={}, num_chunks={}",
+             count_ms, visible_count, grain_size, num_chunks);
 
     BhattLodWorkset workset;
     workset.reserve(visible_count, input.get_max_sh_degree());
@@ -316,57 +388,113 @@ void decompose_sigma_to_raw_scale_quat(const std::array<float, 9>& sigma,
         shN_rest_coeffs = static_cast<int>(input.max_sh_coeffs_rest());
     }
 
-    for (size_t i = 0; i < total_count; ++i) {
-        if (has_deleted && deleted_ptr && deleted_ptr[i] != 0) {
-            continue;
-        }
+    // Step 3: Parallel extraction into pre-allocated arrays
+    const auto t_extract_start = std::chrono::high_resolution_clock::now();
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, num_chunks),
+        [&](const tbb::blocked_range<size_t>& range) {
+            for (size_t chunk_idx = range.begin(); chunk_idx != range.end(); ++chunk_idx) {
+                const size_t start = chunk_idx * grain_size;
+                const size_t end = std::min(start + grain_size, total_count);
+                size_t out_idx = chunk_offsets[chunk_idx];
 
-        const size_t i3 = i * 3;
-        const size_t i4 = i * 4;
+                for (size_t i = start; i < end; ++i) {
+                    if (has_deleted && deleted_ptr && deleted_ptr[i] != 0) {
+                        continue;
+                    }
 
-        const float cx = means_ptr[i3 + 0];
-        const float cy = means_ptr[i3 + 1];
-        const float cz = means_ptr[i3 + 2];
+                    const size_t i3 = i * 3;
+                    const size_t i4 = i * 4;
 
-        const float sx = activated_scale(scaling_ptr[i3 + 0]);
-        const float sy = activated_scale(scaling_ptr[i3 + 1]);
-        const float sz = activated_scale(scaling_ptr[i3 + 2]);
+                    const float cx = means_ptr[i3 + 0];
+                    const float cy = means_ptr[i3 + 1];
+                    const float cz = means_ptr[i3 + 2];
 
-        float qw = rotation_ptr[i4 + 0];
-        float qx = rotation_ptr[i4 + 1];
-        float qy = rotation_ptr[i4 + 2];
-        float qz = rotation_ptr[i4 + 3];
-        const float inv_q = 1.0f / std::max(std::sqrt(qw * qw + qx * qx + qy * qy + qz * qz), kMinQuatNorm);
-        qw *= inv_q;
-        qx *= inv_q;
-        qy *= inv_q;
-        qz *= inv_q;
+                    const float sx = activated_scale(scaling_ptr[i3 + 0]);
+                    const float sy = activated_scale(scaling_ptr[i3 + 1]);
+                    const float sz = activated_scale(scaling_ptr[i3 + 2]);
 
-        const float op = sigmoid(opacity_ptr[i]);
+                    float qw = rotation_ptr[i4 + 0];
+                    float qx = rotation_ptr[i4 + 1];
+                    float qy = rotation_ptr[i4 + 2];
+                    float qz = rotation_ptr[i4 + 3];
+                    const float inv_q = 1.0f / std::max(std::sqrt(qw * qw + qx * qx + qy * qy + qz * qz), kMinQuatNorm);
+                    qw *= inv_q;
+                    qx *= inv_q;
+                    qy *= inv_q;
+                    qz *= inv_q;
 
-        const float r_ = 0.5f + SH_C0 * sh0_ptr[i3 + 0];
-        const float g_ = 0.5f + SH_C0 * sh0_ptr[i3 + 1];
-        const float b_ = 0.5f + SH_C0 * sh0_ptr[i3 + 2];
+                    const float op = sigmoid(opacity_ptr[i]);
 
-        const float* sh1_ptr = nullptr;
-        const float* sh2_ptr = nullptr;
-        const float* sh3_ptr = nullptr;
+                    const float r_ = 0.5f + SH_C0 * sh0_ptr[i3 + 0];
+                    const float g_ = 0.5f + SH_C0 * sh0_ptr[i3 + 1];
+                    const float b_ = 0.5f + SH_C0 * sh0_ptr[i3 + 2];
 
-        if (shN_ptr && shN_rest_coeffs > 0) {
-            const float* rest_ptr = shN_ptr + i * shN_rest_coeffs * 3;
-            if (input.get_max_sh_degree() >= 1 && shN_rest_coeffs >= 3) {
-                sh1_ptr = rest_ptr;
+                    workset.center_x[out_idx] = cx;
+                    workset.center_y[out_idx] = cy;
+                    workset.center_z[out_idx] = cz;
+                    workset.scale_x[out_idx] = sx;
+                    workset.scale_y[out_idx] = sy;
+                    workset.scale_z[out_idx] = sz;
+                    workset.qw[out_idx] = qw;
+                    workset.qx[out_idx] = qx;
+                    workset.qy[out_idx] = qy;
+                    workset.qz[out_idx] = qz;
+                    workset.opacity[out_idx] = op;
+                    workset.r[out_idx] = r_;
+                    workset.g[out_idx] = g_;
+                    workset.b[out_idx] = b_;
+
+                    compute_covariance_from_scale_quat(
+                        sx, sy, sz, qw, qx, qy, qz,
+                        workset.cov_xx[out_idx], workset.cov_xy[out_idx], workset.cov_xz[out_idx],
+                        workset.cov_yy[out_idx], workset.cov_yz[out_idx], workset.cov_zz[out_idx],
+                        workset.cov_det[out_idx]);
+
+                    if (workset.max_sh_degree >= 1) {
+                        const float* sh1_src = nullptr;
+                        const float* sh2_src = nullptr;
+                        const float* sh3_src = nullptr;
+
+                        if (shN_ptr && shN_rest_coeffs > 0) {
+                            const float* rest_ptr = shN_ptr + i * shN_rest_coeffs * 3;
+                            if (input.get_max_sh_degree() >= 1 && shN_rest_coeffs >= 3) {
+                                sh1_src = rest_ptr;
+                            }
+                            if (input.get_max_sh_degree() >= 2 && shN_rest_coeffs >= 8) {
+                                sh2_src = rest_ptr + 3 * 3;
+                            }
+                            if (input.get_max_sh_degree() >= 3 && shN_rest_coeffs >= 15) {
+                                sh3_src = rest_ptr + 8 * 3;
+                            }
+                        }
+
+                        if (sh1_src) {
+                            std::copy_n(sh1_src, 9, workset.sh1.data() + out_idx * 9);
+                        }
+                        if (sh2_src) {
+                            std::copy_n(sh2_src, 15, workset.sh2.data() + out_idx * 15);
+                        }
+                        if (sh3_src) {
+                            std::copy_n(sh3_src, 21, workset.sh3.data() + out_idx * 21);
+                        }
+                    }
+
+                    workset.child_a[out_idx] = -1;
+                    workset.child_b[out_idx] = -1;
+                    workset.is_active[out_idx] = 1;
+
+                    ++out_idx;
+                }
             }
-            if (input.get_max_sh_degree() >= 2 && shN_rest_coeffs >= 8) {
-                sh2_ptr = rest_ptr + 3 * 3;
-            }
-            if (input.get_max_sh_degree() >= 3 && shN_rest_coeffs >= 15) {
-                sh3_ptr = rest_ptr + 8 * 3;
-            }
-        }
+        });
+    const auto t_extract_end = std::chrono::high_resolution_clock::now();
+    const auto extract_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_extract_end - t_extract_start).count();
 
-        workset.add_node(cx, cy, cz, sx, sy, sz, qw, qx, qy, qz, op, r_, g_, b_, sh1_ptr, sh2_ptr, sh3_ptr);
-    }
+    workset.current_count = visible_count;
+
+    const auto t_total = std::chrono::high_resolution_clock::now();
+    const auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_total - t0).count();
+    LOG_INFO("make_workset_from_splatdata: extraction done in {} ms, total time {} ms", extract_ms, total_ms);
 
     return workset;
 }
@@ -454,6 +582,13 @@ void BhattLodWorkset::reserve(size_t initial_count, int max_sh_degree) {
     b.resize(capacity);
     feature_size.resize(capacity);
     area.resize(capacity);
+    cov_xx.resize(capacity);
+    cov_xy.resize(capacity);
+    cov_xz.resize(capacity);
+    cov_yy.resize(capacity);
+    cov_yz.resize(capacity);
+    cov_zz.resize(capacity);
+    cov_det.resize(capacity);
     child_a.resize(capacity);
     child_b.resize(capacity);
     is_active.resize(capacity);
@@ -501,6 +636,13 @@ size_t BhattLodWorkset::add_node(
         b.resize(new_capacity);
         feature_size.resize(new_capacity);
         area.resize(new_capacity);
+        cov_xx.resize(new_capacity);
+        cov_xy.resize(new_capacity);
+        cov_xz.resize(new_capacity);
+        cov_yy.resize(new_capacity);
+        cov_yz.resize(new_capacity);
+        cov_zz.resize(new_capacity);
+        cov_det.resize(new_capacity);
         child_a.resize(new_capacity);
         child_b.resize(new_capacity);
         is_active.resize(new_capacity);
@@ -530,6 +672,12 @@ size_t BhattLodWorkset::add_node(
     r[idx] = r_;
     g[idx] = g_;
     b[idx] = b_;
+
+    compute_covariance_from_scale_quat(
+        sx, sy, sz, qw_, qx_, qy_, qz_,
+        cov_xx[idx], cov_xy[idx], cov_xz[idx],
+        cov_yy[idx], cov_yz[idx], cov_zz[idx],
+        cov_det[idx]);
 
     if (max_sh_degree >= 1 && sh1_ptr) {
         std::copy_n(sh1_ptr, 9, sh1.data() + idx * 9);
@@ -565,41 +713,16 @@ void BhattLodWorkset::grid_cell(size_t idx, float step, int64_t& gx, int64_t& gy
 }
 
 float BhattLodWorkset::similarity(size_t a, size_t b) const {
-    auto covariance_from_scale_quat = [&](size_t idx, std::array<float, 9>& out) {
-        std::array<float, 9> R;
-        quat_to_rotmat(qw[idx], qx[idx], qy[idx], qz[idx], R);
-        const float sx2 = scale_x[idx] * scale_x[idx];
-        const float sy2 = scale_y[idx] * scale_y[idx];
-        const float sz2 = scale_z[idx] * scale_z[idx];
-        sigma_from_rot_var(R, sx2, sy2, sz2, out);
-    };
+    // Average cached covariances
+    const float m00 = 0.5f * (cov_xx[a] + cov_xx[b]);
+    const float m01 = 0.5f * (cov_xy[a] + cov_xy[b]);
+    const float m02 = 0.5f * (cov_xz[a] + cov_xz[b]);
+    const float m11 = 0.5f * (cov_yy[a] + cov_yy[b]);
+    const float m12 = 0.5f * (cov_yz[a] + cov_yz[b]);
+    const float m22 = 0.5f * (cov_zz[a] + cov_zz[b]);
 
-    std::array<float, 9> cov_a{};
-    std::array<float, 9> cov_b{};
-    covariance_from_scale_quat(a, cov_a);
-    covariance_from_scale_quat(b, cov_b);
-
-    std::array<float, 9> sigma{};
-    for (int i = 0; i < 9; ++i) {
-        sigma[i] = 0.5f * (cov_a[i] + cov_b[i]);
-    }
-
-    const float det_a = det3(cov_a);
-    const float det_b = det3(cov_b);
-    const float det_sigma = det3(sigma);
-
-    if (det_sigma <= kEpsCov || det_a <= kEpsCov || det_b <= kEpsCov ||
-        !std::isfinite(det_sigma) || !std::isfinite(det_a) || !std::isfinite(det_b)) {
-        return 0.0f;
-    }
-
-    // Analytic inverse of symmetric 3x3
-    const float m00 = sigma[0];
-    const float m01 = sigma[1];
-    const float m02 = sigma[2];
-    const float m11 = sigma[4];
-    const float m12 = sigma[5];
-    const float m22 = sigma[8];
+    const float det_a = cov_det[a];
+    const float det_b = cov_det[b];
 
     const float C00 = m11 * m22 - m12 * m12;
     const float C01 = m02 * m12 - m01 * m22;
@@ -609,6 +732,13 @@ float BhattLodWorkset::similarity(size_t a, size_t b) const {
     const float C22 = m00 * m11 - m01 * m01;
 
     const float det = m00 * C00 + m01 * C01 + m02 * C02;
+    const float det_sigma = det;
+
+    if (det_sigma <= kEpsCov || det_a <= kEpsCov || det_b <= kEpsCov ||
+        !std::isfinite(det_sigma) || !std::isfinite(det_a) || !std::isfinite(det_b)) {
+        return 0.0f;
+    }
+
     if (std::abs(det) < kEpsCov) {
         return 0.0f;
     }
@@ -670,6 +800,13 @@ size_t BhattLodWorkset::merge_nodes(size_t a, size_t node_b, float filter_size) 
         b.resize(new_capacity);
         feature_size.resize(new_capacity);
         area.resize(new_capacity);
+        cov_xx.resize(new_capacity);
+        cov_xy.resize(new_capacity);
+        cov_xz.resize(new_capacity);
+        cov_yy.resize(new_capacity);
+        cov_yz.resize(new_capacity);
+        cov_zz.resize(new_capacity);
+        cov_det.resize(new_capacity);
         child_a.resize(new_capacity);
         child_b.resize(new_capacity);
         is_active.resize(new_capacity);
@@ -710,26 +847,18 @@ size_t BhattLodWorkset::merge_nodes(size_t a, size_t node_b, float filter_size) 
     const float filter2 = (0.5f * filter_size) * (0.5f * filter_size);
 
     auto add_cov = [&](size_t idx, float weight) {
-        std::array<float, 9> R;
-        quat_to_rotmat(qw[idx], qx[idx], qy[idx], qz[idx], R);
-        const float sx2 = scale_x[idx] * scale_x[idx];
-        const float sy2 = scale_y[idx] * scale_y[idx];
-        const float sz2 = scale_z[idx] * scale_z[idx];
-        std::array<float, 9> cov;
-        sigma_from_rot_var(R, sx2, sy2, sz2, cov);
         const float dx = center_x[idx] - center_x[new_idx];
         const float dy = center_y[idx] - center_y[new_idx];
         const float dz = center_z[idx] - center_z[new_idx];
-        cov[0] += dx * dx + filter2;  // xx
-        cov[1] += dx * dy;            // xy
-        cov[2] += dx * dz;            // xz
-        cov[3] += dx * dy;            // yx
-        cov[4] += dy * dy + filter2;  // yy
-        cov[5] += dy * dz;            // yz
-        cov[6] += dx * dz;            // zx
-        cov[7] += dy * dz;            // zy
-        cov[8] += dz * dz + filter2;  // zz
-        for (int i = 0; i < 9; ++i) total_cov[i] += weight * cov[i];
+        total_cov[0] += weight * (cov_xx[idx] + dx * dx + filter2);
+        total_cov[1] += weight * (cov_xy[idx] + dx * dy);
+        total_cov[2] += weight * (cov_xz[idx] + dx * dz);
+        total_cov[3] += weight * (cov_xy[idx] + dx * dy);
+        total_cov[4] += weight * (cov_yy[idx] + dy * dy + filter2);
+        total_cov[5] += weight * (cov_yz[idx] + dy * dz);
+        total_cov[6] += weight * (cov_xz[idx] + dx * dz);
+        total_cov[7] += weight * (cov_yz[idx] + dy * dz);
+        total_cov[8] += weight * (cov_zz[idx] + dz * dz + filter2);
     };
 
     add_cov(a, wa);
@@ -761,6 +890,21 @@ size_t BhattLodWorkset::merge_nodes(size_t a, size_t node_b, float filter_size) 
     qx[new_idx] = quat[1];
     qy[new_idx] = quat[2];
     qz[new_idx] = quat[3];
+
+    // Compute covariance directly from eigendecomposition (R * diag(evals) * R^T)
+    {
+        const float e0 = evals[0];
+        const float e1 = evals[1];
+        const float e2 = evals[2];
+        const float* R = eig.vectors.data();
+        cov_xx[new_idx] = R[0]*R[0]*e0 + R[1]*R[1]*e1 + R[2]*R[2]*e2;
+        cov_xy[new_idx] = R[0]*R[3]*e0 + R[1]*R[4]*e1 + R[2]*R[5]*e2;
+        cov_xz[new_idx] = R[0]*R[6]*e0 + R[1]*R[7]*e1 + R[2]*R[8]*e2;
+        cov_yy[new_idx] = R[3]*R[3]*e0 + R[4]*R[4]*e1 + R[5]*R[5]*e2;
+        cov_yz[new_idx] = R[3]*R[6]*e0 + R[4]*R[7]*e1 + R[5]*R[8]*e2;
+        cov_zz[new_idx] = R[6]*R[6]*e0 + R[7]*R[7]*e1 + R[8]*R[8]*e2;
+        cov_det[new_idx] = e0 * e1 * e2;
+    }
 
     // Opacity
     float new_area = ellipsoid_area(scale_x[new_idx], scale_y[new_idx], scale_z[new_idx]);
@@ -814,16 +958,25 @@ std::expected<std::unique_ptr<SplatData>, std::string> build_bhatt_lod(
     float lod_base,
     SplatSimplifyProgressCallback progress) {
     try {
+        const auto t_total_start = std::chrono::high_resolution_clock::now();
+        LOG_INFO("build_bhatt_lod: starting, input_count={}, lod_base={}", input.size(), lod_base);
+
         if (!input.means_raw().is_valid() || input.size() == 0) {
             return std::unexpected("build_bhatt_lod: input splat is empty");
         }
 
+        const auto t_workset_start = std::chrono::high_resolution_clock::now();
         auto workset = make_workset_from_splatdata(input);
+        const auto t_workset_end = std::chrono::high_resolution_clock::now();
+        const auto workset_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_workset_end - t_workset_start).count();
+        LOG_INFO("build_bhatt_lod: workset creation took {} ms, visible_count={}", workset_ms, workset.current_count);
+
         if (workset.current_count == 0) {
             return std::unexpected("build_bhatt_lod: no visible gaussians");
         }
 
         // Compute feature_size and area for all initial nodes in parallel
+        const auto t_feature_start = std::chrono::high_resolution_clock::now();
         tbb::parallel_for(tbb::blocked_range<size_t>(0, workset.current_count),
             [&](const tbb::blocked_range<size_t>& range) {
                 for (size_t i = range.begin(); i != range.end(); ++i) {
@@ -831,6 +984,9 @@ std::expected<std::unique_ptr<SplatData>, std::string> build_bhatt_lod(
                     workset.area[i] = workset.compute_area(i);
                 }
             });
+        const auto t_feature_end = std::chrono::high_resolution_clock::now();
+        const auto feature_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_feature_end - t_feature_start).count();
+        LOG_INFO("build_bhatt_lod: feature_size/area computation took {} ms", feature_ms);
 
         // Sort by feature_size (ascending) using indirect sort
         std::vector<size_t> order(workset.current_count);
@@ -847,8 +1003,11 @@ std::expected<std::unique_ptr<SplatData>, std::string> build_bhatt_lod(
         std::vector<ActiveEntry> active_entries;
         active_entries.reserve(workset.capacity);
 
+        const auto t_merge_start = std::chrono::high_resolution_clock::now();
+
         size_t frontier = 0;
         int level = level_min;
+        size_t total_merges = 0;
         for (; ; ++level) {
             const float step = std::pow(MERGE_BASE, level);
 
@@ -875,7 +1034,16 @@ std::expected<std::unique_ptr<SplatData>, std::string> build_bhatt_lod(
             std::vector<ActiveEntry> next_active;
             next_active.reserve(active_entries.size());
 
+            // Pre-select 8 random neighbor offsets for this level
+            std::array<int, 26> neighbor_indices;
+            std::iota(neighbor_indices.begin(), neighbor_indices.end(), 0);
+            std::mt19937 rng(static_cast<uint32_t>(level + 12345)); // deterministic seed per level
+            std::shuffle(neighbor_indices.begin(), neighbor_indices.end(), rng);
+
             size_t merges_this_level = 0;
+            size_t loop_iterations = 0;
+            LOG_INFO("build_bhatt_lod: level={}, active_entries={}, step={}", level, active_entries.size(), step);
+
             while (!active.empty()) {
                 const ActiveEntry entry = active.top();
                 active.pop();
@@ -890,25 +1058,41 @@ std::expected<std::unique_ptr<SplatData>, std::string> build_bhatt_lod(
                 CellKey best_cell{};
                 float best_similarity = -std::numeric_limits<float>::infinity();
 
-                for (int dz = -1; dz <= 1; ++dz) {
-                    for (int dy = -1; dy <= 1; ++dy) {
-                        for (int dx = -1; dx <= 1; ++dx) {
-                            const CellKey neighbor_cell{grid.x + dx, grid.y + dy, grid.z + dz};
-                            auto it = cells.find(neighbor_cell);
-                            if (it == cells.end()) {
+                // 1. Always check own cell
+                {
+                    auto it = cells.find(grid);
+                    if (it != cells.end()) {
+                        for (const uint32_t neighbor : it->second) {
+                            if (neighbor == idx || workset.is_active[neighbor] == 0) {
                                 continue;
                             }
-                            for (const uint32_t neighbor : it->second) {
-                                if (neighbor == idx || workset.is_active[neighbor] == 0) {
-                                    continue;
-                                }
-                                const float similarity = workset.similarity(idx, neighbor);
-                                if (similarity > best_similarity) {
-                                    best_similarity = similarity;
-                                    best_neighbor = neighbor;
-                                    best_cell = neighbor_cell;
-                                }
+                            const float similarity = workset.similarity(idx, neighbor);
+                            if (similarity > best_similarity) {
+                                best_similarity = similarity;
+                                best_neighbor = neighbor;
+                                best_cell = grid;
                             }
+                        }
+                    }
+                }
+
+                // 2. Check 8 randomly selected neighboring cells
+                for (int i = 0; i < 8; ++i) {
+                    const auto& offset = kNeighborOffsets[neighbor_indices[i]];
+                    const CellKey neighbor_cell{grid.x + offset[0], grid.y + offset[1], grid.z + offset[2]};
+                    auto it = cells.find(neighbor_cell);
+                    if (it == cells.end()) {
+                        continue;
+                    }
+                    for (const uint32_t neighbor : it->second) {
+                        if (neighbor == idx || workset.is_active[neighbor] == 0) {
+                            continue;
+                        }
+                        const float similarity = workset.similarity(idx, neighbor);
+                        if (similarity > best_similarity) {
+                            best_similarity = similarity;
+                            best_neighbor = neighbor;
+                            best_cell = neighbor_cell;
                         }
                     }
                 }
@@ -933,11 +1117,25 @@ std::expected<std::unique_ptr<SplatData>, std::string> build_bhatt_lod(
                     cells[cell_for(workset, merged, step)].push_back(merged);
                     active.push(merged_entry);
                 }
+
+                ++loop_iterations;
+                if (merges_this_level % 10000 == 0) {
+                    LOG_INFO("build_bhatt_lod: level={}, merges={}/{}, queue_size={}, nodes={}",
+                             level, merges_this_level, loop_iterations, active.size(), workset.current_count);
+                }
             }
 
+            total_merges += merges_this_level;
+            LOG_INFO("build_bhatt_lod: level={} complete, merges_this_level={}, next_active={}, total_merges={}",
+                     level, merges_this_level, next_active.size(), total_merges);
             active_entries = std::move(next_active);
             if (frontier >= order.size() && active_entries.size() <= 1) break;
         }
+
+        const auto t_merge_end = std::chrono::high_resolution_clock::now();
+        const auto merge_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_merge_end - t_merge_start).count();
+        LOG_INFO("build_bhatt_lod: merge loop took {} ms, levels={}, total_merges={}, nodes_after_merge={}",
+                 merge_ms, level - level_min + 1, total_merges, workset.current_count);
 
         // Pruning and SplatData construction
         if (progress && !progress(0.9f, "Pruning LOD tree")) {
@@ -945,6 +1143,7 @@ std::expected<std::unique_ptr<SplatData>, std::string> build_bhatt_lod(
         }
 
         // Step 1: Post-order pruning to select output nodes
+        const auto t_prune_start = std::chrono::high_resolution_clock::now();
         std::vector<uint8_t> to_output(workset.current_count, 0);
         for (size_t i = 0; i < workset.initial_count; ++i) {
             to_output[i] = 1;
@@ -999,7 +1198,9 @@ std::expected<std::unique_ptr<SplatData>, std::string> build_bhatt_lod(
         to_output[root_index] = 1; // Force root to be output before pruning, matching Spark.
         Pruner pruner{workset, lod_base, to_output, output_children};
         pruner.run(root_index);
-        LOG_INFO("build_bhatt_lod: pruning complete");
+        const auto t_prune_end = std::chrono::high_resolution_clock::now();
+        const auto prune_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_prune_end - t_prune_start).count();
+        LOG_INFO("build_bhatt_lod: pruning took {} ms", prune_ms);
 
         // Step 2: Build a flat buffer where every node's direct children occupy
         // the contiguous range [child_start, child_start + child_count).
@@ -1072,7 +1273,11 @@ std::expected<std::unique_ptr<SplatData>, std::string> build_bhatt_lod(
             to_output,
             output_children,
         };
+        const auto t_flat_start = std::chrono::high_resolution_clock::now();
         flat_tree.run(root_index);
+        const auto t_flat_end = std::chrono::high_resolution_clock::now();
+        const auto flat_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_flat_end - t_flat_start).count();
+        LOG_INFO("build_bhatt_lod: flat tree building took {} ms, output_count={}", flat_ms, old_indices.size());
 
         // Step 3: Build SplatData
         const size_t output_count = old_indices.size();
@@ -1089,61 +1294,66 @@ std::expected<std::unique_ptr<SplatData>, std::string> build_bhatt_lod(
             shN_vec.resize(output_count * shN_coeffs * 3);
         }
 
-        for (size_t i = 0; i < output_count; ++i) {
-            size_t old_idx = old_indices[i];
+        tbb::parallel_for(tbb::blocked_range<size_t>(0, output_count),
+            [&](const tbb::blocked_range<size_t>& range) {
+                for (size_t i = range.begin(); i != range.end(); ++i) {
+                    size_t old_idx = old_indices[i];
 
-            means_vec[i * 3 + 0] = workset.center_x[old_idx];
-            means_vec[i * 3 + 1] = workset.center_y[old_idx];
-            means_vec[i * 3 + 2] = workset.center_z[old_idx];
+                    means_vec[i * 3 + 0] = workset.center_x[old_idx];
+                    means_vec[i * 3 + 1] = workset.center_y[old_idx];
+                    means_vec[i * 3 + 2] = workset.center_z[old_idx];
 
-            // Spark LOD encoding: display-space alpha directly (can exceed 1.0)
-            opacity_vec[i] = std::max(workset.opacity[old_idx], 0.0f);
+                    // Spark LOD encoding: display-space alpha directly (can exceed 1.0)
+                    opacity_vec[i] = std::max(workset.opacity[old_idx], 0.0f);
 
-            // SH0: convert display-space back to optimizer-domain
-            sh0_vec[i * 3 + 0] = (workset.r[old_idx] - 0.5f) / SH_C0;
-            sh0_vec[i * 3 + 1] = (workset.g[old_idx] - 0.5f) / SH_C0;
-            sh0_vec[i * 3 + 2] = (workset.b[old_idx] - 0.5f) / SH_C0;
+                    // SH0: convert display-space back to optimizer-domain
+                    sh0_vec[i * 3 + 0] = (workset.r[old_idx] - 0.5f) / SH_C0;
+                    sh0_vec[i * 3 + 1] = (workset.g[old_idx] - 0.5f) / SH_C0;
+                    sh0_vec[i * 3 + 2] = (workset.b[old_idx] - 0.5f) / SH_C0;
 
-            // Scaling: log-space
-            scaling_vec[i * 3 + 0] = std::log(std::max(workset.scale_x[old_idx], 1e-8f));
-            scaling_vec[i * 3 + 1] = std::log(std::max(workset.scale_y[old_idx], 1e-8f));
-            scaling_vec[i * 3 + 2] = std::log(std::max(workset.scale_z[old_idx], 1e-8f));
+                    // Scaling: log-space
+                    scaling_vec[i * 3 + 0] = std::log(std::max(workset.scale_x[old_idx], 1e-8f));
+                    scaling_vec[i * 3 + 1] = std::log(std::max(workset.scale_y[old_idx], 1e-8f));
+                    scaling_vec[i * 3 + 2] = std::log(std::max(workset.scale_z[old_idx], 1e-8f));
 
-            // Rotation: already normalized
-            rotation_vec[i * 4 + 0] = workset.qw[old_idx];
-            rotation_vec[i * 4 + 1] = workset.qx[old_idx];
-            rotation_vec[i * 4 + 2] = workset.qy[old_idx];
-            rotation_vec[i * 4 + 3] = workset.qz[old_idx];
+                    // Rotation: already normalized
+                    rotation_vec[i * 4 + 0] = workset.qw[old_idx];
+                    rotation_vec[i * 4 + 1] = workset.qx[old_idx];
+                    rotation_vec[i * 4 + 2] = workset.qy[old_idx];
+                    rotation_vec[i * 4 + 3] = workset.qz[old_idx];
 
-            // SH rest coefficients
-            if (shN_coeffs > 0) {
-                float* dst = shN_vec.data() + i * shN_coeffs * 3;
-                if (max_sh >= 1 && shN_coeffs >= 3) {
-                    const float* src = workset.sh1.data() + old_idx * 9;
-                    for (int k = 0; k < 3; ++k) {
-                        dst[k * 3 + 0] = src[k * 3 + 0];
-                        dst[k * 3 + 1] = src[k * 3 + 1];
-                        dst[k * 3 + 2] = src[k * 3 + 2];
+                    // SH rest coefficients
+                    if (shN_coeffs > 0) {
+                        float* dst = shN_vec.data() + i * shN_coeffs * 3;
+                        if (max_sh >= 1 && shN_coeffs >= 3) {
+                            const float* src = workset.sh1.data() + old_idx * 9;
+                            for (int k = 0; k < 3; ++k) {
+                                dst[k * 3 + 0] = src[k * 3 + 0];
+                                dst[k * 3 + 1] = src[k * 3 + 1];
+                                dst[k * 3 + 2] = src[k * 3 + 2];
+                            }
+                        }
+                        if (max_sh >= 2 && shN_coeffs >= 8) {
+                            const float* src = workset.sh2.data() + old_idx * 15;
+                            for (int k = 0; k < 5; ++k) {
+                                dst[(3 + k) * 3 + 0] = src[k * 3 + 0];
+                                dst[(3 + k) * 3 + 1] = src[k * 3 + 1];
+                                dst[(3 + k) * 3 + 2] = src[k * 3 + 2];
+                            }
+                        }
+                        if (max_sh >= 3 && shN_coeffs >= 15) {
+                            const float* src = workset.sh3.data() + old_idx * 21;
+                            for (int k = 0; k < 7; ++k) {
+                                dst[(8 + k) * 3 + 0] = src[k * 3 + 0];
+                                dst[(8 + k) * 3 + 1] = src[k * 3 + 1];
+                                dst[(8 + k) * 3 + 2] = src[k * 3 + 2];
+                            }
+                        }
                     }
                 }
-                if (max_sh >= 2 && shN_coeffs >= 8) {
-                    const float* src = workset.sh2.data() + old_idx * 15;
-                    for (int k = 0; k < 5; ++k) {
-                        dst[(3 + k) * 3 + 0] = src[k * 3 + 0];
-                        dst[(3 + k) * 3 + 1] = src[k * 3 + 1];
-                        dst[(3 + k) * 3 + 2] = src[k * 3 + 2];
-                    }
-                }
-                if (max_sh >= 3 && shN_coeffs >= 15) {
-                    const float* src = workset.sh3.data() + old_idx * 21;
-                    for (int k = 0; k < 7; ++k) {
-                        dst[(8 + k) * 3 + 0] = src[k * 3 + 0];
-                        dst[(8 + k) * 3 + 1] = src[k * 3 + 1];
-                        dst[(8 + k) * 3 + 2] = src[k * 3 + 2];
-                    }
-                }
-            }
-        }
+            });
+
+        const auto t_splatdata_start = std::chrono::high_resolution_clock::now();
 
         Tensor means_tensor = Tensor::from_vector(means_vec, {output_count, 3}, Device::CPU);
         Tensor opacity_tensor = Tensor::from_vector(opacity_vec, {output_count, 1}, Device::CPU);
@@ -1196,6 +1406,14 @@ std::expected<std::unique_ptr<SplatData>, std::string> build_bhatt_lod(
 
         lod_tree->lod_opacity_encoded = true;
         result->lod_tree = std::move(lod_tree);
+
+        const auto t_splatdata_end = std::chrono::high_resolution_clock::now();
+        const auto splatdata_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_splatdata_end - t_splatdata_start).count();
+        LOG_INFO("build_bhatt_lod: SplatData construction took {} ms", splatdata_ms);
+
+        const auto t_total_end = std::chrono::high_resolution_clock::now();
+        const auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_total_end - t_total_start).count();
+        LOG_INFO("build_bhatt_lod: complete, total time {} ms, output_count={}", total_ms, output_count);
 
         if (progress && !progress(1.0f, "LOD tree complete")) {
             return std::unexpected("build_bhatt_lod: cancelled by user");

@@ -12,6 +12,8 @@
 #include "io/error.hpp"
 
 #include <nlohmann/json.hpp>
+#include <tbb/blocked_range.h>
+#include <tbb/parallel_for.h>
 #include <zlib.h>
 
 #include <algorithm>
@@ -28,10 +30,6 @@
 #include <string>
 #include <utility>
 #include <vector>
-
-#ifdef _OPENMP
-#include <omp.h>
-#endif
 
 namespace lfs::io {
 
@@ -774,16 +772,16 @@ namespace lfs::io {
         //   3. Extract axis: if sin(theta/2) > epsilon, axis = (x,y,z) / sin(theta/2), else use (1,0,0)
         //   4. Encode axis to octahedral (2 bytes)
         //   5. Encode angle to 1 byte: theta / PI * 255
-        std::vector<uint8_t> encode_quat_oct88r8(const float* quats, size_t count) {
+        std::vector<uint8_t> encode_quat_oct88r8(const float* quats, size_t count, bool input_wxyz = false) {
             std::vector<uint8_t> result(count * 3);
             constexpr float PI = 3.14159265358979323846f;
             constexpr float EPSILON = 1e-6f;
 
             for (size_t i = 0; i < count; ++i) {
-                float x = quats[i * 4 + 0];
-                float y = quats[i * 4 + 1];
-                float z = quats[i * 4 + 2];
-                float w = quats[i * 4 + 3];
+                float x = input_wxyz ? quats[i * 4 + 1] : quats[i * 4 + 0];
+                float y = input_wxyz ? quats[i * 4 + 2] : quats[i * 4 + 1];
+                float z = input_wxyz ? quats[i * 4 + 3] : quats[i * 4 + 2];
+                float w = input_wxyz ? quats[i * 4 + 0] : quats[i * 4 + 3];
 
                 // Normalize
                 float len = std::sqrt(x * x + y * y + z * z + w * w);
@@ -1616,7 +1614,8 @@ namespace lfs::io {
                     meta.splat_encoding = nlohmann::json{{"lodOpacity", true}};
                 }
 
-                // Encode chunks in parallel with dynamic scheduling
+                // Encode chunks in parallel. lfs_io already links TBB, so keep
+                // RAD export on the same threading runtime as the rest of IO.
                 std::vector<std::vector<uint8_t>> chunk_payloads(num_chunks);
                 std::vector<RadChunkRange> chunk_ranges(num_chunks);
                 std::atomic<uint32_t> completed_chunks{0};
@@ -1626,47 +1625,43 @@ namespace lfs::io {
                     throw std::runtime_error("CANCELLED");
                 }
 
-#ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic, 1)
-#endif
-                for (int32_t chunk_idx = 0; chunk_idx < static_cast<int32_t>(num_chunks); ++chunk_idx) {
-                    const uint32_t base = static_cast<uint32_t>(chunk_idx) * CHUNK_SIZE;
-                    const uint32_t count = std::min(CHUNK_SIZE, num_splats - base);
+                tbb::parallel_for(
+                    tbb::blocked_range<uint32_t>(0, num_chunks, 1),
+                    [&](const tbb::blocked_range<uint32_t>& range) {
+                        for (uint32_t chunk_idx = range.begin(); chunk_idx != range.end(); ++chunk_idx) {
+                            const uint32_t base = chunk_idx * CHUNK_SIZE;
+                            const uint32_t count = std::min(CHUNK_SIZE, num_splats - base);
 
-                    // Thread-local progress callback (only report every 10% to reduce contention)
-                    auto chunk_progress_cb = [&](float /*progress*/) -> bool {
-                        // Check for cancellation periodically
-                        uint32_t completed = completed_chunks.load(std::memory_order_relaxed);
-                        if (completed % 16 == 0) {
-                            // Approximate overall progress
-                            float overall = 0.5f + (0.4f * static_cast<float>(completed) / static_cast<float>(num_chunks));
-                            return report_progress(overall, "Encoding chunks...");
+                            auto chunk_progress_cb = [&](float /*progress*/) -> bool {
+                                const uint32_t completed = completed_chunks.load(std::memory_order_relaxed);
+                                if (completed % 16 == 0) {
+                                    const float overall = 0.5f + (0.4f * static_cast<float>(completed) / static_cast<float>(num_chunks));
+                                    return report_progress(overall, "Encoding chunks...");
+                                }
+                                return true;
+                            };
+
+                            auto chunk_result = encode_chunk(
+                                base, count, sh_degree, sh_coeffs,
+                                packed.means.data(),
+                                packed.opacity.data(),
+                                packed.sh0.data(),
+                                packed.scales.data(),
+                                packed.rotation.data(),
+                                packed.shN.empty() ? nullptr : packed.shN.data(),
+                                lod_tree ? packed.child_count.data() : nullptr,
+                                lod_tree ? packed.child_start.data() : nullptr,
+                                lod_tree,
+                                chunk_progress_cb);
+
+                            chunk_ranges[chunk_idx].base = base;
+                            chunk_ranges[chunk_idx].count = count;
+                            chunk_ranges[chunk_idx].bytes = chunk_result.second.size();
+                            chunk_payloads[chunk_idx] = std::move(chunk_result.second);
+
+                            completed_chunks.fetch_add(1, std::memory_order_relaxed);
                         }
-                        return true;
-                    };
-
-                    auto chunk_result = encode_chunk(
-                        base, count, sh_degree, sh_coeffs,
-                        packed.means.data(),
-                        packed.opacity.data(),
-                        packed.sh0.data(),
-                        packed.scales.data(),
-                        packed.rotation.data(),
-                        packed.shN.empty() ? nullptr : packed.shN.data(),
-                        lod_tree ? packed.child_count.data() : nullptr,
-                        lod_tree ? packed.child_start.data() : nullptr,
-                        lod_tree,
-                        chunk_progress_cb);
-
-                    // Store results (each thread writes to its own index)
-                    chunk_ranges[chunk_idx].base = base;
-                    chunk_ranges[chunk_idx].count = count;
-                    chunk_ranges[chunk_idx].bytes = chunk_result.second.size();
-                    chunk_payloads[chunk_idx] = std::move(chunk_result.second);
-
-                    // Atomically increment completed count for progress tracking
-                    completed_chunks.fetch_add(1, std::memory_order_relaxed);
-                }
+                    });
 
                 // Build metadata in order (sequential - must preserve chunk order)
                 uint64_t current_chunk_offset = 0;
@@ -1757,9 +1752,13 @@ namespace lfs::io {
 
                 // Apply Y-flip if requested (negate Y coordinate of positions)
                 if (flip_y) {
-                    for (size_t i = 0; i < packed.count; ++i) {
-                        packed.means[i * 3 + 1] = -packed.means[i * 3 + 1];
-                    }
+                    tbb::parallel_for(
+                        tbb::blocked_range<size_t>(0, packed.count),
+                        [&](const tbb::blocked_range<size_t>& range) {
+                            for (size_t i = range.begin(); i != range.end(); ++i) {
+                                packed.means[i * 3 + 1] = -packed.means[i * 3 + 1];
+                            }
+                        });
                 }
 
                 if (splat_data.lod_tree && splat_data.lod_tree->lod_opacity_encoded) {
@@ -1769,8 +1768,14 @@ namespace lfs::io {
                     packed.opacity = copy_f32(splat_data.get_opacity(), packed.count);
                 }
                 packed.sh0 = copy_f32(splat_data.sh0_raw(), packed.count * 3);
-                for (float& value : packed.sh0) {
-                    value = 0.5f + SH_C0 * value;
+                if (!packed.sh0.empty()) {
+                    tbb::parallel_for(
+                        tbb::blocked_range<size_t>(0, packed.sh0.size()),
+                        [&](const tbb::blocked_range<size_t>& range) {
+                            for (size_t i = range.begin(); i != range.end(); ++i) {
+                                packed.sh0[i] = 0.5f + SH_C0 * packed.sh0[i];
+                            }
+                        });
                 }
                 packed.scales = copy_f32(splat_data.get_scaling(), packed.count * 3);
                 packed.rotation = copy_f32(splat_data.get_rotation(), packed.count * 4);
@@ -1816,24 +1821,12 @@ namespace lfs::io {
                 encoded_props.reserve(lod_tree ? 12 : 10);
 
                 // Thread-local buffers for temporary data to avoid allocation contention
-                thread_local std::vector<float> tl_center_data;
-                thread_local std::vector<float> tl_alpha_data;
-                thread_local std::vector<float> tl_rgb_data;
-                thread_local std::vector<float> tl_scales_data;
-                thread_local std::vector<float> tl_quat_data;
                 thread_local std::vector<float> tl_sh_data;
 
                 // Encode center (3 components together as single property)
                 {
-                    tl_center_data.resize(count * 3);
-                    for (uint32_t i = 0; i < count; ++i) {
-                        tl_center_data[i * 3 + 0] = means_ptr[(base + i) * 3 + 0];
-                        tl_center_data[i * 3 + 1] = means_ptr[(base + i) * 3 + 1];
-                        tl_center_data[i * 3 + 2] = means_ptr[(base + i) * 3 + 2];
-                    }
-
                     // Encode all 3 components together as "center" property
-                    auto encoded = PropertyEncoder::encode_center(tl_center_data.data(), 3, count, RadCenterEncoding::Auto);
+                    auto encoded = PropertyEncoder::encode_center(means_ptr + static_cast<size_t>(base) * 3, 3, count, RadCenterEncoding::Auto);
                     auto compressed = rad_compress(encoded.data.data(), encoded.data.size(), compression_level_);
 
                     RadChunkProperty prop;
@@ -1854,12 +1847,7 @@ namespace lfs::io {
 
                 // Encode alpha
                 {
-                    tl_alpha_data.resize(count);
-                    for (uint32_t i = 0; i < count; ++i) {
-                        tl_alpha_data[i] = opacity_ptr[base + i];
-                    }
-
-                    auto encoded = PropertyEncoder::encode_alpha(tl_alpha_data.data(), count, RadAlphaEncoding::Auto);
+                    auto encoded = PropertyEncoder::encode_alpha(opacity_ptr + base, count, RadAlphaEncoding::Auto);
                     auto compressed = rad_compress(encoded.data.data(), encoded.data.size(), compression_level_);
 
                     RadChunkProperty prop;
@@ -1884,15 +1872,8 @@ namespace lfs::io {
 
                 // Encode RGB (sh0) - all 3 components together as single property
                 {
-                    tl_rgb_data.resize(count * 3);
-                    for (uint32_t i = 0; i < count; ++i) {
-                        tl_rgb_data[i * 3 + 0] = sh0_ptr[(base + i) * 3 + 0];
-                        tl_rgb_data[i * 3 + 1] = sh0_ptr[(base + i) * 3 + 1];
-                        tl_rgb_data[i * 3 + 2] = sh0_ptr[(base + i) * 3 + 2];
-                    }
-
                     // Encode all 3 components together as "rgb" property
-                    auto encoded = PropertyEncoder::encode_rgb(tl_rgb_data.data(), 3, count, RadRgbEncoding::Auto);
+                    auto encoded = PropertyEncoder::encode_rgb(sh0_ptr + static_cast<size_t>(base) * 3, 3, count, RadRgbEncoding::Auto);
                     auto compressed = rad_compress(encoded.data.data(), encoded.data.size(), compression_level_);
 
                     RadChunkProperty prop;
@@ -1921,15 +1902,8 @@ namespace lfs::io {
 
                 // Encode scales - all 3 components together as single property
                 {
-                    tl_scales_data.resize(count * 3);
-                    for (uint32_t i = 0; i < count; ++i) {
-                        tl_scales_data[i * 3 + 0] = scales_ptr[(base + i) * 3 + 0];
-                        tl_scales_data[i * 3 + 1] = scales_ptr[(base + i) * 3 + 1];
-                        tl_scales_data[i * 3 + 2] = scales_ptr[(base + i) * 3 + 2];
-                    }
-
                     // Encode all 3 components together as "scales" property
-                    auto encoded = PropertyEncoder::encode_scales(tl_scales_data.data(), 3, count, RadScalesEncoding::Auto);
+                    auto encoded = PropertyEncoder::encode_scales(scales_ptr + static_cast<size_t>(base) * 3, 3, count, RadScalesEncoding::Auto);
                     auto compressed = rad_compress(encoded.data.data(), encoded.data.size(), compression_level_);
 
                     RadChunkProperty prop;
@@ -1956,16 +1930,10 @@ namespace lfs::io {
 
                 // Encode orientation
                 {
-                    tl_quat_data.resize(count * 4);
-                    for (uint32_t i = 0; i < count; ++i) {
-                        // SplatData stores as [w, x, y, z], we need [x, y, z, w] for encoding
-                        tl_quat_data[i * 4 + 0] = rotation_ptr[(base + i) * 4 + 1]; // x
-                        tl_quat_data[i * 4 + 1] = rotation_ptr[(base + i) * 4 + 2]; // y
-                        tl_quat_data[i * 4 + 2] = rotation_ptr[(base + i) * 4 + 3]; // z
-                        tl_quat_data[i * 4 + 3] = rotation_ptr[(base + i) * 4 + 0]; // w
-                    }
-
-                    auto encoded = PropertyEncoder::encode_orientation(tl_quat_data.data(), count, RadOrientationEncoding::Auto);
+                    EncodedProperty encoded;
+                    encoded.data = encode_quat_oct88r8(rotation_ptr + static_cast<size_t>(base) * 4, count, true);
+                    encoded.encoding = "oct88r8";
+                    encoded.compression = "none";
                     auto compressed = rad_compress(encoded.data.data(), encoded.data.size(), compression_level_);
 
                     RadChunkProperty prop;

@@ -32,6 +32,10 @@ struct BhattLodWorkset {
     std::vector<float> feature_size;
     std::vector<float> area;
 
+    // Cached covariance matrices (symmetric 3x3 + det) for fast similarity
+    std::vector<float> cov_xx, cov_xy, cov_xz, cov_yy, cov_yz, cov_zz;
+    std::vector<float> cov_det;
+
     // Binary tree: for each node, store up to 2 child indices
     // child_a[i] = first child, child_b[i] = second child (or -1 if none)
     std::vector<int32_t> child_a;
