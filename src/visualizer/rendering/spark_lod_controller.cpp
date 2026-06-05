@@ -142,13 +142,13 @@ float SparkLodController::computePixelScale(uint32_t node_index,
 
     float pixel_scale = (node.size * params.lod_render_scale) / radial_dist;
 
-    if (center_vs.z < 0.0f) {
-        pixel_scale *= params.behind_camera_penalty;
-    }
-
-    // Cone foveation: penalize off-axis splats so peripheral regions use finer LOD.
-    float forward_dot = -center_vs.z;
-    if (forward_dot > 0.0f && (params.cone_inner_degrees > 0.0f || params.cone_outer_degrees > 0.0f)) {
+    // Foveation: match Spark's compute_pixel_scale exactly.
+    float forward_dot = -center_vs.z;  // dot(center_vs, -z_axis)
+    float foveate;
+    if (forward_dot <= 0.0f) {
+        // Behind camera: apply behind-camera penalty
+        foveate = params.behind_camera_penalty;
+    } else {
         float inv_distance = 1.0f / radial_dist;
         float dot = forward_dot * inv_distance;
         float inner_degrees = std::clamp(params.cone_inner_degrees, 0.0f, 180.0f);
@@ -157,7 +157,6 @@ float SparkLodController::computePixelScale(uint32_t node_index,
         float cone_dot = outer_degrees > 0.0f ? std::cos(glm::radians(outer_degrees * 0.5f)) : 1.0f;
         cone_dot = std::min(cone_dot, cone_dot0);
 
-        float foveate;
         if (dot >= cone_dot0) {
             foveate = 1.0f;
         } else if (dot >= cone_dot) {
@@ -176,9 +175,9 @@ float SparkLodController::computePixelScale(uint32_t node_index,
                 foveate = params.behind_camera_penalty + (params.cone_foveation - params.behind_camera_penalty) * t;
             }
         }
-        pixel_scale *= foveate;
     }
 
+    pixel_scale *= foveate;
     return pixel_scale;
 }
 

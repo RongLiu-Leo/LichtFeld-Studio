@@ -259,8 +259,8 @@ namespace lfs::vis {
         size_t lod_max_splats = 1'500'000; // Splat budget (desktop default)
         float lod_pixel_scale_limit = 0.0001f;
         float lod_render_scale = 1.0f;
-        float lod_behind_camera_penalty = 2.0f;
-        float lod_cone_foveation = 1.0f;
+        float lod_behind_camera_penalty = 0.2f;
+        float lod_cone_foveation = 0.4f;
         float lod_cone_inner_degrees = 0.0f;
         float lod_cone_outer_degrees = 0.0f;
         bool lod_debug_colors = false;      // Per-level color tinting
