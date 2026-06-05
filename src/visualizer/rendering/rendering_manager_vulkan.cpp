@@ -443,9 +443,9 @@ namespace lfs::vis {
         if (!last_vulkan_context_->externalMemoryInteropEnabled()) {
             return std::unexpected("VkSplat selection query requires CUDA/Vulkan external-memory interop");
         }
-        if (settings.point_cloud_mode) {
-            return std::unexpected("VkSplat selection query is disabled in point-cloud mode");
-        }
+        // Point-cloud mode renders with a separate graphics pipeline, but selection
+        // still needs the same projected-center mask. Let it use the GPU query
+        // instead of falling back to SelectionService's CPU screen-position pass.
         const bool polygon_mode = (shape == VksplatSelectionMaskShape::Polygon);
         if (polygon_mode) {
             if (polygon_vertices.size() < 3) {
