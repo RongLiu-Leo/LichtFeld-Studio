@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -41,6 +42,12 @@ namespace lfs::vis {
             VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
 #endif
         constexpr std::uint64_t kExternalTimelineWaitTimeoutNs = 2'000'000'000ull;
+
+        [[nodiscard]] double elapsedMs(const std::chrono::steady_clock::time_point start) {
+            return std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - start)
+                .count();
+        }
 
         [[nodiscard]] bool extensionAvailable(const std::vector<VkExtensionProperties>& extensions,
                                               const char* const extension_name) {
@@ -457,6 +464,15 @@ namespace lfs::vis {
         }
 
         if (swapchain_ == VK_NULL_HANDLE || framebuffer_resized_) {
+            LOG_DEBUG("Vulkan beginFrame requesting swapchain recreate: swapchain_present={}, framebuffer_resized={}, framebuffer={}x{}, old_extent={}x{}, images={}, frame_index={}",
+                      swapchain_ != VK_NULL_HANDLE,
+                      framebuffer_resized_,
+                      framebuffer_width_,
+                      framebuffer_height_,
+                      swapchain_extent_.width,
+                      swapchain_extent_.height,
+                      swapchain_images_.size(),
+                      frame_index_);
             if (!recreateSwapchain()) {
                 return false;
             }
@@ -479,9 +495,22 @@ namespace lfs::vis {
         VkResult result = VK_SUCCESS;
         {
             LOG_TIMER_THRESHOLD("frame_pacing.vulkan_beginFrame.wait_frame_fence", 0.25);
+            const auto wait_start = std::chrono::steady_clock::now();
             result = vkWaitForFences(device_, 1, &frame_fence, VK_TRUE, kWaitForeverNs);
             if (result != VK_SUCCESS) {
-                return fail(std::format("vkWaitForFences failed: {}", vkResultToString(result)));
+                return fail(std::format("vkWaitForFences(frame slot {}) failed after {:.1f} ms: {} (frame_index={}, last_submit_id={}, framebuffer={}x{}, swapchain_extent={}x{}, active_image={}, active_frame={}, framebuffer_resized={})",
+                                        current_frame,
+                                        elapsedMs(wait_start),
+                                        vkResultToString(result),
+                                        frame_index_,
+                                        frame_submit_serials_[current_frame],
+                                        framebuffer_width_,
+                                        framebuffer_height_,
+                                        swapchain_extent_.width,
+                                        swapchain_extent_.height,
+                                        active_image_index_,
+                                        active_frame_index_,
+                                        framebuffer_resized_));
             }
         }
 
@@ -497,6 +526,12 @@ namespace lfs::vis {
                                            VK_NULL_HANDLE, &image_index);
         }
         if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+            LOG_DEBUG("vkAcquireNextImageKHR returned OUT_OF_DATE: acquire_index={}, framebuffer={}x{}, swapchain_extent={}x{}",
+                      acquire_index,
+                      framebuffer_width_,
+                      framebuffer_height_,
+                      swapchain_extent_.width,
+                      swapchain_extent_.height);
             if (recreateSwapchain()) {
                 last_error_.clear();
             }
@@ -512,11 +547,19 @@ namespace lfs::vis {
             VkFence image_fence = swapchain_images_in_flight_[image_index];
             {
                 LOG_TIMER_THRESHOLD("frame_pacing.vulkan_beginFrame.wait_image_fence", 0.25);
+                const auto wait_start = std::chrono::steady_clock::now();
                 result = vkWaitForFences(device_, 1, &image_fence, VK_TRUE, kWaitForeverNs);
                 if (result != VK_SUCCESS) {
-                    return fail(std::format("vkWaitForFences(swapchain image {}) failed: {}",
+                    return fail(std::format("vkWaitForFences(swapchain image {}) failed after {:.1f} ms: {} (frame_slot={}, acquire_index={}, framebuffer={}x{}, swapchain_extent={}x{})",
                                             image_index,
-                                            vkResultToString(result)));
+                                            elapsedMs(wait_start),
+                                            vkResultToString(result),
+                                            current_frame,
+                                            acquire_index,
+                                            framebuffer_width_,
+                                            framebuffer_height_,
+                                            swapchain_extent_.width,
+                                            swapchain_extent_.height));
                 }
             }
         }
@@ -680,17 +723,37 @@ namespace lfs::vis {
         submit_info.pSignalSemaphores = &render_finished_[current_frame];
 
         VkFence frame_fence = in_flight_[current_frame];
+        const std::uint64_t submit_id = ++frame_submit_serial_;
         result = vkResetFences(device_, 1, &frame_fence);
         if (result != VK_SUCCESS) {
             frame_active_ = false;
-            return fail(std::format("vkResetFences failed: {}", vkResultToString(result)));
+            return fail(std::format("vkResetFences(frame slot {}, submit_id {}) failed: {}",
+                                    current_frame,
+                                    submit_id,
+                                    vkResultToString(result)));
         }
+        LOG_DEBUG("Vulkan endFrame submit: submit_id={}, frame_slot={}, image={}, acquire_index={}, waits={}, timeline_waits={}, framebuffer={}x{}, extent={}x{}",
+                  submit_id,
+                  current_frame,
+                  active_image_index_,
+                  active_acquire_index_,
+                  wait_semaphores.size(),
+                  frame_timeline_waits_.size(),
+                  framebuffer_width_,
+                  framebuffer_height_,
+                  swapchain_extent_.width,
+                  swapchain_extent_.height);
         result = vkQueueSubmit(graphics_queue_, 1, &submit_info, frame_fence);
         frame_timeline_waits_.clear();
         if (result != VK_SUCCESS) {
             frame_active_ = false;
-            return fail(std::format("vkQueueSubmit failed: {}", vkResultToString(result)));
+            return fail(std::format("vkQueueSubmit(frame slot {}, submit_id {}, image {}) failed: {}",
+                                    current_frame,
+                                    submit_id,
+                                    active_image_index_,
+                                    vkResultToString(result)));
         }
+        frame_submit_serials_[current_frame] = submit_id;
         if (active_image_index_ < swapchain_images_in_flight_.size()) {
             swapchain_images_in_flight_[active_image_index_] = frame_fence;
         }
@@ -707,6 +770,14 @@ namespace lfs::vis {
         frame_active_ = false;
         frame_index_ = (frame_index_ + 1) % kFramesInFlight;
         if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR || frame_suboptimal_) {
+            LOG_DEBUG("Vulkan present requested swapchain recreate: result={}, frame_suboptimal={}, image={}, framebuffer={}x{}, extent={}x{}",
+                      vkResultToString(result),
+                      frame_suboptimal_,
+                      active_image_index_,
+                      framebuffer_width_,
+                      framebuffer_height_,
+                      swapchain_extent_.width,
+                      swapchain_extent_.height);
             frame_suboptimal_ = false;
             // A silent false (empty error) means the surface reported 0×0 extent (window minimized);
             // treat as success so the caller doesn't log a spurious warning. framebuffer_resized_
@@ -715,7 +786,10 @@ namespace lfs::vis {
         }
         frame_suboptimal_ = false;
         if (result != VK_SUCCESS) {
-            return fail(std::format("vkQueuePresentKHR failed: {}", vkResultToString(result)));
+            return fail(std::format("vkQueuePresentKHR(image {}, frame slot {}) failed: {}",
+                                    active_image_index_,
+                                    current_frame,
+                                    vkResultToString(result)));
         }
 
         return true;
@@ -878,9 +952,10 @@ namespace lfs::vis {
         }
         const VkResult result = vkWaitForFences(device_, 1, &frame_fence, VK_TRUE, kWaitForeverNs);
         if (result != VK_SUCCESS) {
-            return fail(std::format("vkWaitForFences(frame slot {}) failed: {}",
+            return fail(std::format("vkWaitForFences(frame slot {}) failed: {} (last_submit_id={})",
                                     current_frame,
-                                    vkResultToString(result)));
+                                    vkResultToString(result),
+                                    frame_submit_serials_[current_frame]));
         }
         last_error_.clear();
         return true;
@@ -2553,8 +2628,10 @@ namespace lfs::vis {
         swapchain_format_ = surface_format.format;
         swapchain_color_space_ = surface_format.colorSpace;
         has_hdr_ = surface_format.colorSpace != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
-        LOG_INFO("Vulkan swapchain: {} images, format {}, color space {}{}",
+        LOG_INFO("Vulkan swapchain: {} images, extent {}x{}, format {}, color space {}{}",
                  image_count,
+                 extent.width,
+                 extent.height,
                  vkFormatToString(surface_format.format),
                  vkColorSpaceToString(surface_format.colorSpace),
                  has_hdr_ ? " (HDR-capable)" : "");
@@ -2990,9 +3067,12 @@ namespace lfs::vis {
         constexpr std::uint64_t kSwapchainWaitTimeoutNs = 2'000'000'000ull;
         std::vector<VkFence> fences;
         fences.reserve(kFramesInFlight + swapchain_images_in_flight_.size());
+        std::size_t frame_fence_count = 0;
+        std::size_t image_alias_count = 0;
         for (const VkFence fence : in_flight_) {
             if (fence != VK_NULL_HANDLE) {
                 fences.push_back(fence);
+                ++frame_fence_count;
             }
         }
         // The per-swapchain-image fences are aliases of in_flight_ entries set in endFrame;
@@ -3003,19 +3083,56 @@ namespace lfs::vis {
             }
             if (std::find(fences.begin(), fences.end(), fence) == fences.end()) {
                 fences.push_back(fence);
+                ++image_alias_count;
             }
         }
         if (fences.empty()) {
+            LOG_DEBUG("Vulkan waitForSubmittedFrames: no fences to wait (frame_index={}, last_submit_id={}, framebuffer={}x{}, extent={}x{})",
+                      frame_index_,
+                      frame_submit_serials_[frame_index_],
+                      framebuffer_width_,
+                      framebuffer_height_,
+                      swapchain_extent_.width,
+                      swapchain_extent_.height);
             return true;
         }
+        const std::uint64_t last_frame_submit_id =
+            frame_index_ < frame_submit_serials_.size() ? frame_submit_serials_[frame_index_] : 0;
+        LOG_DEBUG("Vulkan waitForSubmittedFrames begin: fences={}, frame_fences={}, image_aliases={}, frame_index={}, last_submit_id={}, framebuffer={}x{}, extent={}x{}, resized={}",
+                  fences.size(),
+                  frame_fence_count,
+                  image_alias_count,
+                  frame_index_,
+                  last_frame_submit_id,
+                  framebuffer_width_,
+                  framebuffer_height_,
+                  swapchain_extent_.width,
+                  swapchain_extent_.height,
+                  framebuffer_resized_);
+        const auto wait_start = std::chrono::steady_clock::now();
         const VkResult result = vkWaitForFences(device_,
                                                 static_cast<std::uint32_t>(fences.size()),
                                                 fences.data(),
                                                 VK_TRUE,
                                                 kSwapchainWaitTimeoutNs);
         if (result != VK_SUCCESS) {
-            return fail(std::format("vkWaitForFences(swapchain recreate) failed: {}", vkResultToString(result)));
+            return fail(std::format("vkWaitForFences(submitted frames) failed after {:.1f} ms: {} (fences={}, frame_fences={}, image_aliases={}, frame_index={}, last_submit_id={}, framebuffer={}x{}, extent={}x{}, resized={})",
+                                    elapsedMs(wait_start),
+                                    vkResultToString(result),
+                                    fences.size(),
+                                    frame_fence_count,
+                                    image_alias_count,
+                                    frame_index_,
+                                    last_frame_submit_id,
+                                    framebuffer_width_,
+                                    framebuffer_height_,
+                                    swapchain_extent_.width,
+                                    swapchain_extent_.height,
+                                    framebuffer_resized_));
         }
+        LOG_DEBUG("Vulkan waitForSubmittedFrames complete: fences={}, elapsed_ms={:.1f}",
+                  fences.size(),
+                  elapsedMs(wait_start));
         return true;
     }
 
@@ -3023,6 +3140,15 @@ namespace lfs::vis {
         if (framebuffer_width_ <= 0 || framebuffer_height_ <= 0) {
             return true;
         }
+
+        LOG_DEBUG("Vulkan recreateSwapchain begin: framebuffer={}x{}, old_extent={}x{}, old_images={}, framebuffer_resized={}, frame_index={}",
+                  framebuffer_width_,
+                  framebuffer_height_,
+                  swapchain_extent_.width,
+                  swapchain_extent_.height,
+                  swapchain_images_.size(),
+                  framebuffer_resized_,
+                  frame_index_);
 
         // Wait on all in-flight render fences (per-frame + per-image aliases). Once those
         // are signaled, prior vkQueueSubmit work is complete and the presentation engine
@@ -3044,7 +3170,16 @@ namespace lfs::vis {
         // tracks. The timer below surfaces a pathological stall instead of hiding it.
         {
             LOG_TIMER_THRESHOLD("frame_pacing.vulkan_recreateSwapchain.device_wait_idle", 1.0);
-            vkDeviceWaitIdle(device_);
+            const auto wait_start = std::chrono::steady_clock::now();
+            const VkResult idle_result = vkDeviceWaitIdle(device_);
+            LOG_DEBUG("Vulkan recreateSwapchain deviceWaitIdle result={} elapsed_ms={:.1f}",
+                      vkResultToString(idle_result),
+                      elapsedMs(wait_start));
+            if (idle_result != VK_SUCCESS) {
+                framebuffer_resized_ = true;
+                return fail(std::format("vkDeviceWaitIdle(swapchain recreate) failed: {}",
+                                        vkResultToString(idle_result)));
+            }
         }
         // Keep the old swapchain alive across the teardown of its dependent resources so it
         // can be handed to vkCreateSwapchainKHR as oldSwapchain — letting the driver reuse
@@ -3068,6 +3203,12 @@ namespace lfs::vis {
             return false;
         }
         framebuffer_resized_ = false;
+        LOG_DEBUG("Vulkan recreateSwapchain complete: extent={}x{}, images={}, framebuffer={}x{}",
+                  swapchain_extent_.width,
+                  swapchain_extent_.height,
+                  swapchain_images_.size(),
+                  framebuffer_width_,
+                  framebuffer_height_);
         return true;
     }
 

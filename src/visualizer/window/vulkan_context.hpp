@@ -338,6 +338,8 @@ namespace lfs::vis {
         std::size_t active_acquire_index_ = 0;
         std::array<VkSemaphore, kFramesInFlight> render_finished_{};
         std::array<VkFence, kFramesInFlight> in_flight_{};
+        std::array<std::uint64_t, kFramesInFlight> frame_submit_serials_{};
+        std::uint64_t frame_submit_serial_ = 0;
         std::vector<VkFence> swapchain_images_in_flight_;
 
         bool framebuffer_resized_ = false;

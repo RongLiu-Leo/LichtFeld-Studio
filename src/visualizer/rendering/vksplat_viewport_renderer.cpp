@@ -2568,6 +2568,25 @@ namespace lfs::vis {
         return latest_output_ring_slot_[outputSlotIndex(output_slot)];
     }
 
+    bool VksplatViewportRenderer::nextOutputImagesNeedResize(
+        const glm::ivec2 size,
+        const OutputSlot output_slot) const {
+        if (size.x <= 0 || size.y <= 0) {
+            return false;
+        }
+        const auto& output_ring = output_slots_[outputSlotIndex(output_slot)];
+        for (std::size_t ring_slot = 0; ring_slot < output_ring.size(); ++ring_slot) {
+            const auto& slot = output_ring[ring_slot];
+            const bool replacing_existing_output =
+                slot.image.image != VK_NULL_HANDLE ||
+                slot.depth_image.image != VK_NULL_HANDLE;
+            if (replacing_existing_output && slot.size != size) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     bool VksplatViewportRenderer::inputsResident(const lfs::core::SplatData& splat_data,
                                                  const std::size_t ring_slot) const {
         if (ring_slot >= ring_uploaded_.size())
@@ -2976,6 +2995,14 @@ namespace lfs::vis {
         // The previous GUI submit may still be sampling this slot. Drain submitted
         // frames before destroying images during viewport-size changes.
         if (replacing_existing_output && !context.waitForSubmittedFrames()) {
+            LOG_WARN("VkSplat output image resize wait failed: slot={}, ring={}, old_size={}x{}, new_size={}x{}, error={}",
+                     outputSlotDiagnosticName(output_slot),
+                     ring_slot,
+                     slot.size.x,
+                     slot.size.y,
+                     size.x,
+                     size.y,
+                     context.lastError());
             return std::unexpected(std::format("VkSplat output resize wait failed: {}",
                                                context.lastError()));
         }
@@ -4542,6 +4569,25 @@ namespace lfs::vis {
             static_cast<std::size_t>(uniforms.grid_width) * static_cast<std::size_t>(uniforms.grid_height);
         bool shared_scratch_bound = false;
         std::optional<RasterizerArenaRenderGuard> shared_arena_guard;
+        std::uint64_t shared_scratch_attempt_id = 0;
+        const auto shared_scratch_context = [&]() {
+            return std::format(
+                "attempt_id={}, required={}MiB, capacity={}MiB, generation={}, sort_capacity={}, high_water={}, last_indices={}, splats={}, viewport={}x{}, grid={}x{}, ring={}, next_render_value={}",
+                shared_scratch_attempt_id,
+                estimateSharedScratchBytes(buffers_.num_splats, shared_sort_capacity, num_pixels, num_tiles) >> 20,
+                shared_scratch_.bytes >> 20,
+                shared_scratch_.generation,
+                shared_sort_capacity,
+                buffers_.num_indices_high_water,
+                buffers_.num_indices,
+                buffers_.num_splats,
+                static_cast<std::uint32_t>(uniforms.image_width),
+                static_cast<std::uint32_t>(uniforms.image_height),
+                static_cast<std::uint32_t>(uniforms.grid_width),
+                static_cast<std::uint32_t>(uniforms.grid_height),
+                ring_slot,
+                render_complete_value_ + 1);
+        };
 
         static const bool kDisableSharedScratch = (std::getenv("LFS_NO_SHARED_SCRATCH") != nullptr);
         if (synchronize_input_upload && !kDisableSharedScratch) {
@@ -4550,6 +4596,7 @@ namespace lfs::vis {
             releasePrivateScratchBuffers();
             const std::size_t required_shared_scratch =
                 estimateSharedScratchBytes(buffers_.num_splats, shared_sort_capacity, num_pixels, num_tiles);
+            shared_scratch_attempt_id = ++shared_scratch_attempt_serial_;
             if (auto ok = ensureSharedScratchArena(context, required_shared_scratch); ok) {
                 try {
                     shared_arena_guard.emplace();
@@ -4571,10 +4618,14 @@ namespace lfs::vis {
                     shared_arena_guard.reset();
                     detachSharedScratchBuffers();
                     return std::unexpected(std::format(
-                        "VkSplat shared scratch activation failed: {}", e.what()));
+                        "VkSplat shared scratch activation failed: {}; reason={}",
+                        shared_scratch_context(),
+                        e.what()));
                 }
             } else {
-                return std::unexpected(ok.error());
+                return std::unexpected(std::format("{}; reason={}",
+                                                   shared_scratch_context(),
+                                                   ok.error()));
             }
         }
 
@@ -4675,7 +4726,8 @@ namespace lfs::vis {
                 }
                 if (shared_scratch_bound && buffers_.num_indices > shared_sort_capacity) {
                     return std::unexpected(std::format(
-                        "VkSplat shared scratch sort capacity insufficient: have {}, need {}",
+                        "VkSplat shared scratch sort capacity insufficient: {}; have {}, need {}",
+                        shared_scratch_context(),
                         shared_sort_capacity,
                         buffers_.num_indices));
                 }

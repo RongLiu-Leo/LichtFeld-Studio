@@ -54,6 +54,7 @@ namespace lfs::core {
 namespace lfs::vis {
     class VisualizerImpl;
     class VulkanContext;
+    class WindowManager;
     struct VulkanSceneInteropTarget;
 
     namespace gui {
@@ -77,6 +78,8 @@ namespace lfs::vis {
             void init();
             void shutdown();
             void render();
+            void updateInteractiveTransitions();
+            [[nodiscard]] bool isInteractiveTransitionSettling() const;
             void syncVisiblePanelsBeforeSceneRender();
             void setRmlResizeDeferring(bool defer) { rmlui_manager_.setResizeDeferring(defer); }
 
@@ -226,6 +229,22 @@ namespace lfs::vis {
 
             [[nodiscard]] bool isVramHudOverlayVisible() const;
             [[nodiscard]] bool isVramHudPublishDue(std::chrono::steady_clock::time_point now) const;
+            [[nodiscard]] bool drainVulkanFramesForInteractiveTransition(
+                lfs::vis::WindowManager& window_manager,
+                const char* transition_name);
+            void applyInteractiveTransitionCooldown(
+                std::chrono::steady_clock::time_point& next_allowed_at,
+                std::chrono::steady_clock::time_point now,
+                bool training_active);
+            void queueUiVisibilityToggle();
+            void requestUiVisibilityToggle();
+            void updateUiVisibilityTransition();
+            void queueFullscreenToggle();
+            void requestFullscreenToggle();
+            void updateFullscreenTransition();
+            void beginInteractiveTransitionGuard();
+            void updateInteractiveTransitionGuard();
+            void endInteractiveTransitionGuard();
 
             struct EditorContextUpdateStamp {
                 bool valid = false;
@@ -256,6 +275,13 @@ namespace lfs::vis {
             bool show_vram_hud_ = true;
             bool vram_hud_visible_published_ = false;
             std::chrono::steady_clock::time_point next_vram_hud_publish_{};
+            std::chrono::steady_clock::time_point ui_toggle_next_allowed_at_{};
+            bool ui_toggle_pending_ = false;
+            std::chrono::steady_clock::time_point fullscreen_toggle_next_allowed_at_{};
+            std::chrono::steady_clock::time_point interactive_transition_guard_until_{};
+            bool fullscreen_toggle_pending_ = false;
+            bool fullscreen_target_state_ = false;
+            bool interactive_transition_resume_training_ = false;
             std::optional<AppStore::GTMetricsOverlayConfig> published_gt_metrics_overlay_config_;
             bool menu_labels_synced_ = false;
             std::uint64_t synced_menu_entries_version_ = 0;

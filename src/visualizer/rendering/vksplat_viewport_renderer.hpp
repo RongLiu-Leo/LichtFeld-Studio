@@ -114,6 +114,9 @@ namespace lfs::vis {
             const lfs::rendering::ViewportRenderRequest& request,
             OutputSlot output_slot = OutputSlot::Main,
             bool synchronize_input_read = false);
+        [[nodiscard]] bool nextOutputImagesNeedResize(
+            glm::ivec2 size,
+            OutputSlot output_slot = OutputSlot::Main) const;
         [[nodiscard]] std::expected<std::shared_ptr<lfs::core::Tensor>, std::string> readOutputImage(
             VulkanContext& context,
             OutputSlot output_slot = OutputSlot::Main) const;
@@ -369,6 +372,7 @@ namespace lfs::vis {
             bool installed_in_training_arena = false;
         };
         SharedScratchArena shared_scratch_{};
+        std::uint64_t shared_scratch_attempt_serial_ = 0;
 
         // Old shared-scratch imports awaiting GPU retirement, keyed by the
         // render-complete timeline value at which they become safe to free.

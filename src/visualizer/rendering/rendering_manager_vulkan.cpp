@@ -18,6 +18,7 @@
 #include "vksplat_viewport_renderer.hpp"
 #include "vulkan_external_tensor.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <expected>
@@ -33,6 +34,40 @@
 namespace lfs::vis {
 
     namespace {
+        constexpr auto kVulkanViewportResizeTrainingPauseWait = std::chrono::milliseconds(300);
+
+        class ScopedTemporaryTrainingPause {
+        public:
+            ScopedTemporaryTrainingPause(TrainerManager* const trainer_manager,
+                                         const std::chrono::milliseconds timeout)
+                : trainer_manager_(trainer_manager) {
+                if (!trainer_manager_ || !trainer_manager_->isRunning()) {
+                    return;
+                }
+
+                const auto pause_result = trainer_manager_->pauseTrainingTemporaryAndWait(timeout);
+                synchronized_ = pause_result.synchronized;
+                resume_required_ = pause_result.resume_required;
+            }
+
+            ScopedTemporaryTrainingPause(const ScopedTemporaryTrainingPause&) = delete;
+            ScopedTemporaryTrainingPause& operator=(const ScopedTemporaryTrainingPause&) = delete;
+
+            ~ScopedTemporaryTrainingPause() {
+                if (resume_required_ && trainer_manager_ && trainer_manager_->isRunning()) {
+                    trainer_manager_->resumeTrainingTemporary();
+                    LOG_TRACE("Training resumed after Vulkan viewport resize");
+                }
+            }
+
+            [[nodiscard]] bool synchronized() const { return synchronized_; }
+
+        private:
+            TrainerManager* trainer_manager_ = nullptr;
+            bool synchronized_ = false;
+            bool resume_required_ = false;
+        };
+
         [[nodiscard]] std::optional<std::shared_lock<std::shared_mutex>> acquireLiveModelRenderLock(
             const SceneManager* const scene_manager) {
             std::optional<std::shared_lock<std::shared_mutex>> lock;
@@ -48,6 +83,21 @@ namespace lfs::vis {
             return error.find("shared scratch") != std::string_view::npos &&
                    (error.find("busy") != std::string_view::npos ||
                     error.find("capacity insufficient") != std::string_view::npos);
+        }
+
+        [[nodiscard]] bool isRetryableVksplatOutputResizeWait(const std::string_view error) {
+            return error.find("VkSplat output resize wait failed") != std::string_view::npos &&
+                   error.find("VK_ERROR_DEVICE_LOST") == std::string_view::npos &&
+                   (error.find("VK_TIMEOUT") != std::string_view::npos ||
+                    error.find("vkWaitForFences") != std::string_view::npos);
+        }
+
+        [[nodiscard]] DirtyMask vksplatOutputResizeRetryDirty(const DirtyMask frame_dirty) {
+            return frame_dirty != 0 ? frame_dirty : DirtyFlag::VIEWPORT | DirtyFlag::CAMERA;
+        }
+
+        [[nodiscard]] DirtyMask vksplatSharedScratchRetryDirty(const DirtyMask frame_dirty) {
+            return frame_dirty != 0 ? frame_dirty : DirtyFlag::SPLATS;
         }
 
         [[nodiscard]] std::optional<std::pair<size_t, size_t>>
@@ -557,6 +607,10 @@ namespace lfs::vis {
             markDirty(resize_result.dirty);
         }
 
+        auto* const trainer_manager = scene_manager ? scene_manager->getTrainerManager() : nullptr;
+        const bool is_training = scene_manager && scene_manager->hasDataset() &&
+                                 trainer_manager && trainer_manager->isRunning();
+
         auto render_lock = acquireLiveModelRenderLock(scene_manager);
 
         const lfs::core::SplatData* const model = scene_manager ? scene_manager->getModelForRendering() : nullptr;
@@ -593,9 +647,6 @@ namespace lfs::vis {
             markDirty(DirtyFlag::ALL);
         }
 
-        const bool is_training = scene_manager && scene_manager->hasDataset() &&
-                                 scene_manager->getTrainerManager() &&
-                                 scene_manager->getTrainerManager()->isRunning();
         const bool synchronize_vksplat_input_upload = is_training;
         if (const DirtyMask training_dirty = frame_lifecycle_service_.handleTrainingRefresh(
                 is_training,
@@ -617,6 +668,10 @@ namespace lfs::vis {
             vulkan_viewport_image_ != nullptr ||
             vulkan_external_viewport_image_ != VK_NULL_HANDLE ||
             has_cached_gpu_only_frame;
+        const float scale = std::clamp(settings_.render_scale, 0.25f, 1.0f);
+        glm::ivec2 render_size(
+            std::max(static_cast<int>(std::lround(static_cast<float>(current_size.x) * scale)), 1),
+            std::max(static_cast<int>(std::lround(static_cast<float>(current_size.y) * scale)), 1));
 
         if (const DirtyMask required_dirty = frame_lifecycle_service_.requiredDirtyMask(
                 has_cached_viewport_output,
@@ -705,12 +760,31 @@ namespace lfs::vis {
             return cached_frame_result();
         }
 
-        framerate_controller_.beginFrame();
+        std::optional<ScopedTemporaryTrainingPause> viewport_resize_training_pause;
+        const bool vksplat_viewport_resize =
+            is_training &&
+            context.vulkan_context != nullptr &&
+            vksplat_viewport_renderer_ != nullptr &&
+            vksplat_viewport_renderer_->nextOutputImagesNeedResize(
+                render_size,
+                VksplatViewportRenderer::OutputSlot::Main) &&
+            lfs::rendering::isVkSplatBackend(settings_.raster_backend);
+        if (vksplat_viewport_resize) {
+            viewport_resize_training_pause.emplace(trainer_manager,
+                                                   kVulkanViewportResizeTrainingPauseWait);
+            if (!viewport_resize_training_pause->synchronized()) {
+                dirty_mask_.fetch_or(vksplatOutputResizeRetryDirty(frame_dirty),
+                                     std::memory_order_relaxed);
+                LOG_WARN("Skipping Vulkan viewport resize because training did not pause in time");
+                render_lock.reset();
+                return cached_frame_result();
+            }
+            LOG_DEBUG("Training paused around VkSplat output resize to {}x{}",
+                      render_size.x,
+                      render_size.y);
+        }
 
-        const float scale = std::clamp(settings_.render_scale, 0.25f, 1.0f);
-        glm::ivec2 render_size(
-            std::max(static_cast<int>(std::lround(static_cast<float>(current_size.x) * scale)), 1),
-            std::max(static_cast<int>(std::lround(static_cast<float>(current_size.y) * scale)), 1));
+        framerate_controller_.beginFrame();
 
         const FrameContext frame_ctx{
             .viewport = context.viewport,
@@ -1630,12 +1704,38 @@ namespace lfs::vis {
                     }
                     const bool shared_scratch_retryable =
                         isRetryableSharedScratchUnavailable(render_result.error());
+                    const bool output_resize_wait_retryable =
+                        isRetryableVksplatOutputResizeWait(render_result.error());
                     if (synchronize_vksplat_input_upload &&
                         has_cached_viewport_output &&
-                        shared_scratch_retryable) {
-                        dirty_mask_.fetch_or(frame_dirty, std::memory_order_relaxed);
-                        LOG_DEBUG("VkSplat shared scratch unavailable ({}); returning cached viewport image",
-                                  render_result.error());
+                        (shared_scratch_retryable || output_resize_wait_retryable)) {
+                        const DirtyMask retry_dirty =
+                            output_resize_wait_retryable
+                                ? vksplatOutputResizeRetryDirty(frame_dirty)
+                                : vksplatSharedScratchRetryDirty(frame_dirty);
+                        dirty_mask_.fetch_or(retry_dirty, std::memory_order_relaxed);
+                        const bool cached_size_matches = vulkan_viewport_image_size_ == render_size;
+                        if (vksplat_viewport_resize || !cached_size_matches) {
+                            LOG_DEBUG("{} ({}); skipping cached viewport image, retry_dirty=0x{:x}, vksplat_resize={}, cached_size={}x{}, render_size={}x{}",
+                                      output_resize_wait_retryable
+                                          ? "VkSplat output resize wait is still pending"
+                                          : "VkSplat shared scratch unavailable",
+                                      render_result.error(),
+                                      retry_dirty,
+                                      vksplat_viewport_resize,
+                                      vulkan_viewport_image_size_.x,
+                                      vulkan_viewport_image_size_.y,
+                                      render_size.x,
+                                      render_size.y);
+                            render_lock.reset();
+                            return {};
+                        }
+                        LOG_DEBUG("{} ({}); returning cached viewport image, retry_dirty=0x{:x}",
+                                  output_resize_wait_retryable
+                                      ? "VkSplat output resize wait is still pending"
+                                      : "VkSplat shared scratch unavailable",
+                                  render_result.error(),
+                                  retry_dirty);
                         render_lock.reset();
                         return cached_frame_result();
                     }
@@ -1793,18 +1893,39 @@ namespace lfs::vis {
             const bool shared_scratch_retryable =
                 synchronize_vksplat_input_upload &&
                 isRetryableSharedScratchUnavailable(render_error);
-            if (shared_scratch_retryable) {
-                dirty_mask_.fetch_or(frame_dirty != 0 ? frame_dirty : DirtyFlag::SPLATS,
+            const bool output_resize_wait_retryable =
+                isRetryableVksplatOutputResizeWait(render_error);
+            if (shared_scratch_retryable || output_resize_wait_retryable) {
+                const DirtyMask retry_dirty =
+                    output_resize_wait_retryable
+                        ? vksplatOutputResizeRetryDirty(frame_dirty)
+                        : vksplatSharedScratchRetryDirty(frame_dirty);
+                dirty_mask_.fetch_or(retry_dirty,
                                      std::memory_order_relaxed);
                 render_lock.reset();
-                if (has_cached_viewport_output) {
-                    LOG_DEBUG("VkSplat shared scratch unavailable ({}); returning cached viewport image",
-                              render_error);
+                const bool cached_size_matches = vulkan_viewport_image_size_ == render_size;
+                if (has_cached_viewport_output && !vksplat_viewport_resize && cached_size_matches) {
+                    LOG_DEBUG("{} ({}); returning cached viewport image, retry_dirty=0x{:x}",
+                              output_resize_wait_retryable
+                                  ? "VkSplat output resize wait is still pending"
+                                  : "VkSplat shared scratch unavailable",
+                              render_error,
+                              retry_dirty);
                     return cached_frame_result();
                 }
 
-                LOG_DEBUG("VkSplat shared scratch unavailable ({}); skipping viewport frame until arena is free",
-                          render_error);
+                LOG_DEBUG("{} ({}); skipping viewport frame, retry_dirty=0x{:x}, cached_output={}, vksplat_resize={}, cached_size={}x{}, render_size={}x{}",
+                          output_resize_wait_retryable
+                              ? "VkSplat output resize wait is still pending"
+                              : "VkSplat shared scratch unavailable",
+                          render_error,
+                          retry_dirty,
+                          has_cached_viewport_output,
+                          vksplat_viewport_resize,
+                          vulkan_viewport_image_size_.x,
+                          vulkan_viewport_image_size_.y,
+                          render_size.x,
+                          render_size.y);
                 return {};
             }
 
