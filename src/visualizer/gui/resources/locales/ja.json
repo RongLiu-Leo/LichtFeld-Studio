@@ -756,6 +756,7 @@
     "mirror_z": "Z軸ミラー",
     "reset_default": "デフォルトにリセット",
     "home": "ホーム",
+    "focus_selection": "選択にフォーカス",
     "fullscreen": "全画面表示",
     "toggle_ui": "UIを切り替え",
     "asset_manager": "アセットマネージャー",

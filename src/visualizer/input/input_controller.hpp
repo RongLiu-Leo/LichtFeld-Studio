@@ -123,6 +123,7 @@ namespace lfs::vis {
         void handleKey(int physical_key, int logical_key, int scancode, int action, int mods);
         void handleFileDrop(const std::vector<std::string>& paths);
         void onWindowFocusLost();
+        bool focusSelection();
 
     private:
         struct PanelInteractionState {

@@ -756,6 +756,7 @@
     "mirror_z": "Z spiegeln",
     "reset_default": "Auf Standard zurücksetzen",
     "home": "Start",
+    "focus_selection": "Auswahl fokussieren",
     "fullscreen": "Vollbild",
     "toggle_ui": "UI umschalten",
     "asset_manager": "Asset Manager",

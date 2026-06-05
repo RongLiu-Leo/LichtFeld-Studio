@@ -422,6 +422,11 @@ def free_icon(texture_id: int) -> None:
 def reset_camera() -> None:
     """Reset camera to default position and orientation"""
 
+def focus_selection() -> bool:
+    """
+    Focus the active viewport on the selection, or the whole scene when nothing is selected
+    """
+
 def get_camera_navigation_mode() -> str:
     """Get the active camera navigation mode ('orbit', 'trackball', or 'fpv')"""
 

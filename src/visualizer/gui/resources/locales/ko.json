@@ -756,6 +756,7 @@
     "mirror_z": "Z축 미러",
     "reset_default": "기본값으로 재설정",
     "home": "홈",
+    "focus_selection": "선택 항목에 초점",
     "fullscreen": "전체 화면",
     "toggle_ui": "UI 토글",
     "asset_manager": "에셋 매니저",

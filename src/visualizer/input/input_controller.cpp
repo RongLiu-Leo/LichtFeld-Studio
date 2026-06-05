@@ -2264,6 +2264,10 @@ namespace lfs::vis {
         return false;
     }
 
+    bool InputController::focusSelection() {
+        return handleFocusSelection(activeKeyboardViewport());
+    }
+
     // Helpers
     bool InputController::isInViewport(double x, double y) const {
         return x >= viewport_bounds_.x &&

@@ -756,6 +756,7 @@
     "mirror_z": "Spiegel Z",
     "reset_default": "Reset naar Standaard",
     "home": "Home",
+    "focus_selection": "Selectie focussen",
     "fullscreen": "Volledig Scherm",
     "toggle_ui": "Schakel UI",
     "asset_manager": "Asset Manager",

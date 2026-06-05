@@ -911,6 +911,7 @@ def test_viewport_toolbar_update_syncs_utility_records(toolbar_module, monkeypat
         lf_stub.ui,
         "tr",
         lambda key: {
+            "toolbar.focus_selection": "Focus Selection",
             "toolbar.asset_manager": "Assets",
             "menu.tools.plugin_marketplace": "Plugins",
             "window.input_settings": "Input",
@@ -944,7 +945,14 @@ def test_viewport_toolbar_update_syncs_utility_records(toolbar_module, monkeypat
     extra_buttons = model.handle.record_updates["utility_extra_buttons"]
     render_group = model.handle.record_updates["render_group_buttons"][0]
     assert len(camera_buttons) == 3
-    assert [button["action"] for button in primary_buttons] == ["home", "fullscreen", "toggle_ui"]
+    assert [button["action"] for button in primary_buttons] == [
+        "home",
+        "focus_selection",
+        "fullscreen",
+        "toggle_ui",
+    ]
+    assert primary_buttons[1]["icon_src"] == "../icon/focus-selection.png"
+    assert primary_buttons[1]["tooltip_text"] == "Focus Selection"
     assert [button["button_id"] for button in extra_buttons] == [
         "util-input-settings",
         "util-viewport-export",

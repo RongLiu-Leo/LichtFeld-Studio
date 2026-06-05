@@ -756,6 +756,7 @@
     "mirror_z": "Specchia Z",
     "reset_default": "Ripristina Predefinito",
     "home": "Home",
+    "focus_selection": "Focalizza selezione",
     "fullscreen": "Schermo Intero",
     "toggle_ui": "Alterna UI",
     "asset_manager": "Gestore Risorse",

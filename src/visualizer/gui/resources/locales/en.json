@@ -759,6 +759,7 @@
     "mirror_z": "Mirror Z",
     "reset_default": "Reset to Default",
     "home": "Home",
+    "focus_selection": "Focus Selection",
     "fullscreen": "Fullscreen",
     "toggle_ui": "Toggle UI",
     "asset_manager": "Asset Manager",

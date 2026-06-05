@@ -586,6 +586,7 @@
     "mirror_z": "Z轴镜像",
     "reset_default": "重置为默认",
     "home": "主页",
+    "focus_selection": "聚焦选择",
     "fullscreen": "全屏",
     "toggle_ui": "切换UI",
     "asset_manager": "资源管理器",

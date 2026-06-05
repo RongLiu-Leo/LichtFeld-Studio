@@ -704,6 +704,7 @@ class _UtilityToolbarController:
     )
     _PRIMARY_ACTIONS = {
         "home": "CAMERA_RESET_HOME",
+        "focus_selection": "CAMERA_FOCUS_SELECTION",
         "fullscreen": "TOGGLE_FULLSCREEN",
         "toggle_ui": "TOGGLE_UI",
     }
@@ -779,6 +780,15 @@ class _UtilityToolbarController:
                            tooltip_key="toolbar.home",
                            tooltip_text="Home",
                            action_id=self._PRIMARY_ACTIONS["home"]),
+            _button_record(
+                "util-focus-selection",
+                "focus_selection",
+                "",
+                _icon_src("focus-selection"),
+                tooltip_key="toolbar.focus_selection",
+                tooltip_text="Focus Selection",
+                action_id=self._PRIMARY_ACTIONS["focus_selection"],
+            ),
             _button_record(
                 "util-fullscreen",
                 "fullscreen",
@@ -984,6 +994,9 @@ class _UtilityToolbarController:
             return
         if action == "home":
             lf.reset_camera()
+            return
+        if action == "focus_selection":
+            lf.focus_selection()
             return
         if action == "fullscreen":
             lf.toggle_fullscreen()

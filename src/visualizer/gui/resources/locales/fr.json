@@ -756,6 +756,7 @@
     "mirror_z": "Miroir Z",
     "reset_default": "Réinitialiser par Défaut",
     "home": "Accueil",
+    "focus_selection": "Focaliser la sélection",
     "fullscreen": "Plein Écran",
     "toggle_ui": "Basculer UI",
     "asset_manager": "Gestionnaire d'Actifs",

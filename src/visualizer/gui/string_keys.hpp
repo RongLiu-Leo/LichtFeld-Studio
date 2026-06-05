@@ -521,6 +521,7 @@ namespace lichtfeld::Strings {
         inline constexpr const char* MIRROR_Z = "toolbar.mirror_z";
         inline constexpr const char* RESET_DEFAULT = "toolbar.reset_default";
         inline constexpr const char* HOME = "toolbar.home";
+        inline constexpr const char* FOCUS_SELECTION = "toolbar.focus_selection";
         inline constexpr const char* FULLSCREEN = "toolbar.fullscreen";
         inline constexpr const char* TOGGLE_UI = "toolbar.toggle_ui";
         inline constexpr const char* SPLAT_RENDERING = "toolbar.splat_rendering";

@@ -1445,6 +1445,12 @@ NB_MODULE(lichtfeld, m) {
         "reset_camera", []() { lfs::core::events::cmd::ResetCamera{}.emit(); },
         "Reset camera to default position and orientation");
     m.def(
+        "focus_selection", []() -> bool {
+            auto* const controller = lfs::vis::InputController::instance();
+            return controller ? controller->focusSelection() : false;
+        },
+        "Focus the active viewport on the selection, or the whole scene when nothing is selected");
+    m.def(
         "get_camera_navigation_mode", []() -> std::string {
             const auto* controller = lfs::vis::InputController::instance();
             if (!controller)
