@@ -4,7 +4,7 @@
     "file": "ファイル",
     "file.new_project": "新規プロジェクト",
     "file.import_dataset": "データセットをインポート",
-    "file.import_ply": "PLY, SOG, SPZ, USDをインポート",
+    "file.import_ply": "PLY, SOG, SPZ, RAD, USDをインポート",
     "file.import_mesh": "メッシュをインポート",
     "file.import_checkpoint": "チェックポイントをインポート",
     "file.import_config": "設定をインポート",
@@ -246,7 +246,7 @@
     "url_import.url_label": "URL",
     "url_import.supported_sources": "対応ソース",
     "url_import.asset_files_title": "アセットファイル",
-    "url_import.asset_files_line": ".ply, .sog, .spz, .obj, .fbx, .gltf, .glb, .stl, .dae, .3ds, .usd, .usda, .usdc, .usdz, .ckpt",
+    "url_import.asset_files_line": ".ply, .sog, .spz, .rad, .obj, .fbx, .gltf, .glb, .stl, .dae, .3ds, .usd, .usda, .usdc, .usdz, .ckpt",
     "url_import.archives_title": "アーカイブ",
     "url_import.archives_line": "データセットまたは対応アセットファイルを含む .zip, .tar.gz, .tgz, .tar.bz2, .tbz2, .tbz, .tar.xz, .txz, .tar",
     "url_import.providers_title": "HTTP(S) プロバイダー",
@@ -1355,10 +1355,10 @@
     "supported_by": "サポート",
     "click_to_continue": "クリックして続行",
     "drop_files_title": "ファイルをここにドロップして開始",
-    "drop_files_subtitle": "PLY、SOG、SPZ、USD、COLMAPデータセット、またはプロジェクトファイル",
+    "drop_files_subtitle": "PLY、SOG、SPZ、RAD、USD、COLMAPデータセット、またはプロジェクトファイル",
     "drop_files_hint": "または ファイル > データセットをインポート / PLYをインポート を使用",
     "drop_to_import": "ドロップしてインポート",
-    "drop_to_import_subtitle": "PLY、SOG、SPZ、USD、COLMAPデータセット、またはプロジェクト"
+    "drop_to_import_subtitle": "PLY、SOG、SPZ、RAD、USD、COLMAPデータセット、またはプロジェクト"
   },
   "axis": {
     "x": "X:",
@@ -1623,7 +1623,7 @@
   },
   "file_association": {
     "title": "既定のアプリケーションに設定",
-    "message": "LichtFeld Studioをスプラットファイル（.ply、.sog、.spz、.usd、.usda、.usdc、.usdz）の既定のアプリケーションに設定しますか？",
+    "message": "LichtFeld Studioをスプラットファイル（.ply、.sog、.spz、.rad、.usd、.usda、.usdc、.usdz）の既定のアプリケーションに設定しますか？",
     "yes": "はい",
     "not_now": "後で",
     "dont_ask": "今後表示しない",

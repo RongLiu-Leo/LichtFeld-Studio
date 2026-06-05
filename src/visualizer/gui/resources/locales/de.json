@@ -4,7 +4,7 @@
     "file": "Datei",
     "file.new_project": "Neues Projekt",
     "file.import_dataset": "Datensatz importieren",
-    "file.import_ply": "PLY, SOG, SPZ, USD importieren",
+    "file.import_ply": "PLY, SOG, SPZ, RAD, USD importieren",
     "file.import_mesh": "Mesh importieren",
     "file.import_checkpoint": "Checkpoint importieren",
     "file.import_config": "Konfiguration importieren",
@@ -246,7 +246,7 @@
     "url_import.url_label": "URL",
     "url_import.supported_sources": "Unterstützte Quellen",
     "url_import.asset_files_title": "Asset-Dateien",
-    "url_import.asset_files_line": ".ply, .sog, .spz, .obj, .fbx, .gltf, .glb, .stl, .dae, .3ds, .usd, .usda, .usdc, .usdz, .ckpt",
+    "url_import.asset_files_line": ".ply, .sog, .spz, .rad, .obj, .fbx, .gltf, .glb, .stl, .dae, .3ds, .usd, .usda, .usdc, .usdz, .ckpt",
     "url_import.archives_title": "Archive",
     "url_import.archives_line": ".zip, .tar.gz, .tgz, .tar.bz2, .tbz2, .tbz, .tar.xz, .txz, .tar mit Datensätzen oder unterstützten Asset-Dateien",
     "url_import.providers_title": "HTTP(S)-Anbieter",
@@ -1355,10 +1355,10 @@
     "supported_by": "Unterstützt von",
     "click_to_continue": "Klicken Sie irgendwo um fortzufahren",
     "drop_files_title": "Dateien hier ablegen um zu starten",
-    "drop_files_subtitle": "PLY, SOG, SPZ, USD, COLMAP Datensatz oder Projektdatei",
+    "drop_files_subtitle": "PLY, SOG, SPZ, RAD, USD, COLMAP Datensatz oder Projektdatei",
     "drop_files_hint": "Oder Datei > Datensatz importieren / PLY importieren verwenden",
     "drop_to_import": "Zum Importieren ablegen",
-    "drop_to_import_subtitle": "PLY, SOG, SPZ, USD, COLMAP Datensatz oder Projekt"
+    "drop_to_import_subtitle": "PLY, SOG, SPZ, RAD, USD, COLMAP Datensatz oder Projekt"
   },
   "axis": {
     "x": "X:",
@@ -1623,7 +1623,7 @@
   },
   "file_association": {
     "title": "Als Standardanwendung festlegen",
-    "message": "Möchten Sie LichtFeld Studio als Standardanwendung für Splat-Dateien (.ply, .sog, .spz, .usd, .usda, .usdc, .usdz) festlegen?",
+    "message": "Möchten Sie LichtFeld Studio als Standardanwendung für Splat-Dateien (.ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz) festlegen?",
     "yes": "Ja",
     "not_now": "Nicht jetzt",
     "dont_ask": "Nicht mehr fragen",

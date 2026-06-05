@@ -4,7 +4,7 @@
     "file": "Bestand",
     "file.new_project": "Nieuw Project",
     "file.import_dataset": "Dataset Importeren",
-    "file.import_ply": "PLY, SOG, SPZ, USD Importeren",
+    "file.import_ply": "PLY, SOG, SPZ, RAD, USD Importeren",
     "file.import_mesh": "Mesh Importeren",
     "file.import_checkpoint": "Controlepunt Importeren",
     "file.import_config": "Configuratie Importeren",
@@ -245,7 +245,7 @@
     "url_import.url_label": "URL",
     "url_import.supported_sources": "Ondersteunde bronnen",
     "url_import.asset_files_title": "Assetbestanden",
-    "url_import.asset_files_line": ".ply, .sog, .spz, .obj, .fbx, .gltf, .glb, .stl, .dae, .3ds, .usd, .usda, .usdc, .usdz, .ckpt",
+    "url_import.asset_files_line": ".ply, .sog, .spz, .rad, .obj, .fbx, .gltf, .glb, .stl, .dae, .3ds, .usd, .usda, .usdc, .usdz, .ckpt",
     "url_import.archives_title": "Archieven",
     "url_import.archives_line": ".zip, .tar.gz, .tgz, .tar.bz2, .tbz2, .tbz, .tar.xz, .txz, .tar met datasets of ondersteunde assetbestanden",
     "url_import.providers_title": "HTTP(S)-providers",
@@ -1355,10 +1355,10 @@
     "supported_by": "Ondersteund door",
     "click_to_continue": "Klik ergens om door te gaan",
     "drop_files_title": "Sleep bestanden hierheen om te beginnen",
-    "drop_files_subtitle": "PLY, SOG, SPZ, USD, COLMAP dataset of Projectbestand",
+    "drop_files_subtitle": "PLY, SOG, SPZ, RAD, USD, COLMAP dataset of Projectbestand",
     "drop_files_hint": "Of gebruik Bestand > Dataset Importeren / PLY Importeren",
     "drop_to_import": "Loslaten om te importeren",
-    "drop_to_import_subtitle": "PLY, SOG, SPZ, USD, COLMAP dataset of Project"
+    "drop_to_import_subtitle": "PLY, SOG, SPZ, RAD, USD, COLMAP dataset of Project"
   },
   "axis": {
     "x": "X:",
@@ -1623,7 +1623,7 @@
   },
   "file_association": {
     "title": "Instellen als standaardtoepassing",
-    "message": "Wilt u LichtFeld Studio instellen als de standaardtoepassing voor splat-bestanden (.ply, .sog, .spz, .usd, .usda, .usdc, .usdz)?",
+    "message": "Wilt u LichtFeld Studio instellen als de standaardtoepassing voor splat-bestanden (.ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz)?",
     "yes": "Ja",
     "not_now": "Niet nu",
     "dont_ask": "Niet meer vragen",

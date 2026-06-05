@@ -4,7 +4,7 @@
     "file": "파일",
     "file.new_project": "새 프로젝트",
     "file.import_dataset": "데이터셋 가져오기",
-    "file.import_ply": "PLY, SOG, SPZ, USD 가져오기",
+    "file.import_ply": "PLY, SOG, SPZ, RAD, USD 가져오기",
     "file.import_mesh": "메시 가져오기",
     "file.import_checkpoint": "체크포인트 가져오기",
     "file.import_config": "설정 가져오기",
@@ -246,7 +246,7 @@
     "url_import.url_label": "URL",
     "url_import.supported_sources": "지원 소스",
     "url_import.asset_files_title": "에셋 파일",
-    "url_import.asset_files_line": ".ply, .sog, .spz, .obj, .fbx, .gltf, .glb, .stl, .dae, .3ds, .usd, .usda, .usdc, .usdz, .ckpt",
+    "url_import.asset_files_line": ".ply, .sog, .spz, .rad, .obj, .fbx, .gltf, .glb, .stl, .dae, .3ds, .usd, .usda, .usdc, .usdz, .ckpt",
     "url_import.archives_title": "압축 파일",
     "url_import.archives_line": "데이터셋 또는 지원되는 에셋 파일이 포함된 .zip, .tar.gz, .tgz, .tar.bz2, .tbz2, .tbz, .tar.xz, .txz, .tar",
     "url_import.providers_title": "HTTP(S) 제공자",
@@ -1355,10 +1355,10 @@
     "supported_by": "지원:",
     "click_to_continue": "계속하려면 아무 곳이나 클릭",
     "drop_files_title": "시작하려면 파일을 여기에 드롭하세요",
-    "drop_files_subtitle": "PLY, SOG, SPZ, USD, COLMAP 데이터셋 또는 프로젝트 파일",
+    "drop_files_subtitle": "PLY, SOG, SPZ, RAD, USD, COLMAP 데이터셋 또는 프로젝트 파일",
     "drop_files_hint": "또는 파일 > 데이터셋 가져오기 / PLY 가져오기 사용",
     "drop_to_import": "가져오려면 드롭",
-    "drop_to_import_subtitle": "PLY, SOG, SPZ, USD, COLMAP 데이터셋 또는 프로젝트"
+    "drop_to_import_subtitle": "PLY, SOG, SPZ, RAD, USD, COLMAP 데이터셋 또는 프로젝트"
   },
   "axis": {
     "x": "X:",
@@ -1623,7 +1623,7 @@
   },
   "file_association": {
     "title": "기본 응용 프로그램으로 설정",
-    "message": "LichtFeld Studio를 스플랫 파일(.ply, .sog, .spz, .usd, .usda, .usdc, .usdz)의 기본 응용 프로그램으로 설정하시겠습니까?",
+    "message": "LichtFeld Studio를 스플랫 파일(.ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz)의 기본 응용 프로그램으로 설정하시겠습니까?",
     "yes": "예",
     "not_now": "나중에",
     "dont_ask": "다시 묻지 않기",
