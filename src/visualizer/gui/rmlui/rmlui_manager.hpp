@@ -47,6 +47,8 @@ namespace lfs::vis::gui {
         float clip_y1 = 0.0f;
         float clip_x2 = 0.0f;
         float clip_y2 = 0.0f;
+        bool depends_on_preview_textures = false;
+        uint64_t preview_texture_generation = 0;
     };
 
     struct RmlRect {

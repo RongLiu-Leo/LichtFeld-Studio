@@ -61,7 +61,9 @@ namespace lfs::python {
                                                       const PyTensor* bg_color = nullptr);
     [[nodiscard]] std::optional<PyTensor> render_view_u8(const PyTensor& rotation, const PyTensor& translation,
                                                          int width, int height, float fov_degrees = 60.0f,
-                                                         const PyTensor* bg_color = nullptr);
+                                                         const PyTensor* bg_color = nullptr,
+                                                         std::optional<bool> orthographic = std::nullopt,
+                                                         std::optional<float> ortho_scale = std::nullopt);
 
     [[nodiscard]] std::optional<PyTensor> compute_screen_positions(const PyTensor& rotation, const PyTensor& translation,
                                                                    int width, int height, float fov_degrees = 60.0f);

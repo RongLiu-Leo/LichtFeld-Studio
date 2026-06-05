@@ -444,9 +444,9 @@ namespace lfs::vis {
         if (!last_vulkan_context_->externalMemoryInteropEnabled()) {
             return std::unexpected("VkSplat selection query requires CUDA/Vulkan external-memory interop");
         }
-        if (settings.point_cloud_mode) {
-            return std::unexpected("VkSplat selection query is disabled in point-cloud mode");
-        }
+        // Point-cloud mode renders with a separate graphics pipeline, but selection
+        // still needs the same projected-center mask. Let it use the GPU query
+        // instead of falling back to SelectionService's CPU screen-position pass.
         const bool polygon_mode = (shape == VksplatSelectionMaskShape::Polygon);
         if (polygon_mode) {
             if (polygon_vertices.size() < 3) {
@@ -1305,6 +1305,11 @@ namespace lfs::vis {
                 vk_req.model_transforms = pc_request.scene.model_transforms;
                 vk_req.transform_indices = pc_request.scene.transform_indices.get();
                 vk_req.node_visibility_mask = &pc_request.scene.node_visibility_mask;
+                if (settings_.point_cloud_mode && has_visible_gaussian_model &&
+                    model->has_deleted_mask()) {
+                    vk_req.deleted_mask = &model->deleted();
+                    vk_req.deleted_mask_revision = point_cloud_data_revision_;
+                }
                 vk_req.selection_mask = pc_request.overlay.selection_mask.get();
                 vk_req.preview_selection_mask = pc_request.overlay.transient_mask.mask;
                 vk_req.selection_colors = &pc_request.overlay.selection_colors;
@@ -1331,10 +1336,9 @@ namespace lfs::vis {
                 vk_req.voxel_size = pc_request.render.voxel_size;
                 vk_req.scaling_modifier = pc_request.render.scaling_modifier;
                 vk_req.depth_view = settings_.depth_view;
-                vk_req.depth_view_min = pc_request.frame_view.near_plane;
-                vk_req.depth_view_max = settings_.depth_clip_far > pc_request.frame_view.near_plane
-                                            ? settings_.depth_clip_far
-                                            : pc_request.frame_view.far_plane;
+                vk_req.depth_view_min = settings_.depth_view_min;
+                vk_req.depth_view_max = settings_.depth_view_max;
+                vk_req.depth_visualization_mode = settings_.depth_visualization_mode;
 
                 LOG_TIMER("renderVulkanFrame.point_cloud_vulkan");
                 auto render_result = point_cloud_vulkan_renderer_->render(

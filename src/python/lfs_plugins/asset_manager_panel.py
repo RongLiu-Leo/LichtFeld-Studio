@@ -23,7 +23,11 @@ from .asset_manager_integration import (
     ensure_dataset_catalog_context,
     set_active_asset_manager_panel,
 )
-from .import_panels import open_url_import_panel, open_watch_dirs_dialog
+from .import_panels import (
+    open_dataset_import_panel,
+    open_url_import_panel,
+    open_watch_dirs_dialog,
+)
 from .types import Panel
 from .ui import RuntimeState
 
@@ -67,6 +71,7 @@ def tr(key, **kwargs):
 
 def _encode_rml_image_path(path: str) -> str:
     return quote(path, safe=RML_PATH_SAFE_CHARS)
+
 
 __lfs_panel_classes__ = ["AssetManagerPanel"]
 __lfs_panel_ids__ = ["lfs.asset_manager"]
@@ -2621,7 +2626,7 @@ class AssetManagerPanel(Panel):
         if not self._selected_asset_ids:
             return
 
-        for asset_id in self._selected_asset_ids:
+        for asset_id in sorted(self._selected_asset_ids):
             if not self._asset_index or not hasattr(self._asset_index, "assets"):
                 continue
 
@@ -2640,15 +2645,9 @@ class AssetManagerPanel(Panel):
                 # Load based on asset type
                 asset_type = str(asset.get("type") or "")
                 if asset_type == "dataset":
-                    # Datasets need special loading with output path
-                    output_path = asset.get("output_path") or str(
-                        Path(file_path) / "output"
-                    )
-                    lf.load_file(
-                        file_path,
-                        is_dataset=True,
-                        output_path=output_path,
-                    )
+                    if self._open_dataset_asset_import_panel(file_path, asset):
+                        return
+                    continue
                 else:
                     # Regular mesh/splat file loading
                     transform_node_name = self._load_asset_with_hierarchy(file_path)
@@ -2827,6 +2826,26 @@ class AssetManagerPanel(Panel):
         asset_id = self._resolve_event_value(args, _ev, "data-asset-id")
         self._load_asset(asset_id, replace_scene=False)
 
+    def _open_dataset_asset_import_panel(
+        self,
+        file_path: str,
+        asset: Dict[str, Any],
+        *,
+        clear_scene_on_load: bool = False,
+    ) -> bool:
+        opened = open_dataset_import_panel(
+            file_path,
+            clear_scene_on_load=clear_scene_on_load,
+        )
+        if not opened:
+            self._log_warn("Dataset import panel unavailable for: %s", file_path)
+            return False
+        self._log_info(
+            "Opened dataset import panel for asset: %s",
+            asset.get("name", "unknown"),
+        )
+        return True
+
     def on_load_asset_new(self, _handle, _ev, args):
         """Clear the scene and load a specific asset by ID into the viewer."""
         asset_id = self._resolve_event_value(args, _ev, "data-asset-id")
@@ -2859,29 +2878,25 @@ class AssetManagerPanel(Panel):
             return
 
         try:
-            if replace_scene:
-                lf.clear_scene()
-
             # Load based on asset type
             asset_type = str(asset.get("type") or "")
             if asset_type == "dataset":
-                # Datasets need special loading with output path
-                output_path = asset.get("output_path") or str(
-                    Path(file_path) / "output"
-                )
-                lf.load_file(
+                if not self._open_dataset_asset_import_panel(
                     file_path,
-                    is_dataset=True,
-                    output_path=output_path,
-                )
-                self._queue_pending_transform_application(asset)
+                    asset,
+                    clear_scene_on_load=replace_scene,
+                ):
+                    return
             else:
+                if replace_scene:
+                    lf.clear_scene()
                 # Regular mesh/splat file loading
                 transform_node_name = self._load_asset_with_hierarchy(file_path)
                 self._apply_asset_transform(asset, transform_node_name)
-            self._log_info("Loaded asset: %s", asset.get("name", "unknown"))
+                self._log_info("Loaded asset: %s", asset.get("name", "unknown"))
 
-            # Select the loaded asset
+            # Keep the requested asset selected; dataset assets finish loading
+            # from the import panel after the user confirms its options.
             self._selected_asset_ids = {asset_id}
             self._selection_type = "asset"
             self.refresh_catalog()

@@ -340,7 +340,7 @@ inline void compute_covariance_from_scale_quat(
     const auto deleted_cpu = has_deleted ? input.deleted().cpu().contiguous() : Tensor{};
     const uint8_t* deleted_ptr = has_deleted ? deleted_cpu.ptr<uint8_t>() : nullptr;
 
-    LOG_INFO("make_workset_from_splatdata: total_count={}, has_deleted={}", total_count, has_deleted);
+    LOG_DEBUG("make_workset_from_splatdata: total_count={}, has_deleted={}", total_count, has_deleted);
 
     // Step 1: Count visible splats per chunk in parallel
     const size_t grain_size = std::max(size_t(4096), total_count / 16);
@@ -373,7 +373,7 @@ inline void compute_covariance_from_scale_quat(
         visible_count += chunk_counts[i];
     }
 
-    LOG_INFO("make_workset_from_splatdata: counting done in {} ms, visible_count={}, grain_size={}, num_chunks={}",
+    LOG_DEBUG("make_workset_from_splatdata: counting done in {} ms, visible_count={}, grain_size={}, num_chunks={}",
              count_ms, visible_count, grain_size, num_chunks);
 
     BhattLodWorkset workset;
@@ -494,7 +494,7 @@ inline void compute_covariance_from_scale_quat(
 
     const auto t_total = std::chrono::high_resolution_clock::now();
     const auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_total - t0).count();
-    LOG_INFO("make_workset_from_splatdata: extraction done in {} ms, total time {} ms", extract_ms, total_ms);
+    LOG_DEBUG("make_workset_from_splatdata: extraction done in {} ms, total time {} ms", extract_ms, total_ms);
 
     return workset;
 }
@@ -959,7 +959,7 @@ std::expected<std::unique_ptr<SplatData>, std::string> build_bhatt_lod(
     SplatSimplifyProgressCallback progress) {
     try {
         const auto t_total_start = std::chrono::high_resolution_clock::now();
-        LOG_INFO("build_bhatt_lod: starting, input_count={}, lod_base={}", input.size(), lod_base);
+        LOG_DEBUG("build_bhatt_lod: starting, input_count={}, lod_base={}", input.size(), lod_base);
 
         if (!input.means_raw().is_valid() || input.size() == 0) {
             return std::unexpected("build_bhatt_lod: input splat is empty");
@@ -969,10 +969,14 @@ std::expected<std::unique_ptr<SplatData>, std::string> build_bhatt_lod(
         auto workset = make_workset_from_splatdata(input);
         const auto t_workset_end = std::chrono::high_resolution_clock::now();
         const auto workset_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_workset_end - t_workset_start).count();
-        LOG_INFO("build_bhatt_lod: workset creation took {} ms, visible_count={}", workset_ms, workset.current_count);
+        LOG_DEBUG("build_bhatt_lod: workset creation took {} ms, visible_count={}", workset_ms, workset.current_count);
 
         if (workset.current_count == 0) {
             return std::unexpected("build_bhatt_lod: no visible gaussians");
+        }
+
+        if (progress && !progress(0.05f, "Preparing LOD workset")) {
+            return std::unexpected("build_bhatt_lod: cancelled by user");
         }
 
         // Compute feature_size and area for all initial nodes in parallel
@@ -986,7 +990,11 @@ std::expected<std::unique_ptr<SplatData>, std::string> build_bhatt_lod(
             });
         const auto t_feature_end = std::chrono::high_resolution_clock::now();
         const auto feature_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_feature_end - t_feature_start).count();
-        LOG_INFO("build_bhatt_lod: feature_size/area computation took {} ms", feature_ms);
+        LOG_DEBUG("build_bhatt_lod: feature_size/area computation took {} ms", feature_ms);
+
+        if (progress && !progress(0.10f, "Computing feature sizes")) {
+            return std::unexpected("build_bhatt_lod: cancelled by user");
+        }
 
         // Sort by feature_size (ascending) using indirect sort
         std::vector<size_t> order(workset.current_count);
@@ -1042,7 +1050,14 @@ std::expected<std::unique_ptr<SplatData>, std::string> build_bhatt_lod(
 
             size_t merges_this_level = 0;
             size_t loop_iterations = 0;
-            LOG_INFO("build_bhatt_lod: level={}, active_entries={}, step={}", level, active_entries.size(), step);
+            LOG_DEBUG("build_bhatt_lod: level={}, active_entries={}, step={}", level, active_entries.size(), step);
+
+            if (progress) {
+                const float level_progress = std::min(0.80f, 0.15f + 0.65f * static_cast<float>(total_merges) / static_cast<float>(workset.initial_count));
+                if (!progress(level_progress, std::format("Starting LOD level {} ({} active nodes)", level, active_entries.size()))) {
+                    return std::unexpected("build_bhatt_lod: cancelled by user");
+                }
+            }
 
             while (!active.empty()) {
                 const ActiveEntry entry = active.top();
@@ -1120,13 +1135,19 @@ std::expected<std::unique_ptr<SplatData>, std::string> build_bhatt_lod(
 
                 ++loop_iterations;
                 if (merges_this_level % 10000 == 0) {
-                    LOG_INFO("build_bhatt_lod: level={}, merges={}/{}, queue_size={}, nodes={}",
+                    LOG_DEBUG("build_bhatt_lod: level={}, merges={}/{}, queue_size={}, nodes={}",
                              level, merges_this_level, loop_iterations, active.size(), workset.current_count);
+                    if (progress) {
+                        const float merge_progress = std::min(0.80f, 0.15f + 0.65f * static_cast<float>(total_merges + merges_this_level) / static_cast<float>(workset.initial_count));
+                        if (!progress(merge_progress, std::format("Merging LOD level {} ({} merges)", level, total_merges + merges_this_level))) {
+                            return std::unexpected("build_bhatt_lod: cancelled by user");
+                        }
+                    }
                 }
             }
 
             total_merges += merges_this_level;
-            LOG_INFO("build_bhatt_lod: level={} complete, merges_this_level={}, next_active={}, total_merges={}",
+            LOG_DEBUG("build_bhatt_lod: level={} complete, merges_this_level={}, next_active={}, total_merges={}",
                      level, merges_this_level, next_active.size(), total_merges);
             active_entries = std::move(next_active);
             if (frontier >= order.size() && active_entries.size() <= 1) break;
@@ -1134,11 +1155,15 @@ std::expected<std::unique_ptr<SplatData>, std::string> build_bhatt_lod(
 
         const auto t_merge_end = std::chrono::high_resolution_clock::now();
         const auto merge_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_merge_end - t_merge_start).count();
-        LOG_INFO("build_bhatt_lod: merge loop took {} ms, levels={}, total_merges={}, nodes_after_merge={}",
+        LOG_DEBUG("build_bhatt_lod: merge loop took {} ms, levels={}, total_merges={}, nodes_after_merge={}",
                  merge_ms, level - level_min + 1, total_merges, workset.current_count);
 
+        if (progress && !progress(0.85f, "Merging complete")) {
+            return std::unexpected("build_bhatt_lod: cancelled by user");
+        }
+
         // Pruning and SplatData construction
-        if (progress && !progress(0.9f, "Pruning LOD tree")) {
+        if (progress && !progress(0.90f, "Pruning LOD tree")) {
             return std::unexpected("build_bhatt_lod: cancelled by user");
         }
 
@@ -1200,7 +1225,7 @@ std::expected<std::unique_ptr<SplatData>, std::string> build_bhatt_lod(
         pruner.run(root_index);
         const auto t_prune_end = std::chrono::high_resolution_clock::now();
         const auto prune_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_prune_end - t_prune_start).count();
-        LOG_INFO("build_bhatt_lod: pruning took {} ms", prune_ms);
+        LOG_DEBUG("build_bhatt_lod: pruning took {} ms", prune_ms);
 
         // Step 2: Build a flat buffer where every node's direct children occupy
         // the contiguous range [child_start, child_start + child_count).
@@ -1277,7 +1302,7 @@ std::expected<std::unique_ptr<SplatData>, std::string> build_bhatt_lod(
         flat_tree.run(root_index);
         const auto t_flat_end = std::chrono::high_resolution_clock::now();
         const auto flat_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_flat_end - t_flat_start).count();
-        LOG_INFO("build_bhatt_lod: flat tree building took {} ms, output_count={}", flat_ms, old_indices.size());
+        LOG_DEBUG("build_bhatt_lod: flat tree building took {} ms, output_count={}", flat_ms, old_indices.size());
 
         // Step 3: Build SplatData
         const size_t output_count = old_indices.size();
@@ -1409,11 +1434,11 @@ std::expected<std::unique_ptr<SplatData>, std::string> build_bhatt_lod(
 
         const auto t_splatdata_end = std::chrono::high_resolution_clock::now();
         const auto splatdata_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_splatdata_end - t_splatdata_start).count();
-        LOG_INFO("build_bhatt_lod: SplatData construction took {} ms", splatdata_ms);
+        LOG_DEBUG("build_bhatt_lod: SplatData construction took {} ms", splatdata_ms);
 
         const auto t_total_end = std::chrono::high_resolution_clock::now();
         const auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_total_end - t_total_start).count();
-        LOG_INFO("build_bhatt_lod: complete, total time {} ms, output_count={}", total_ms, output_count);
+        LOG_DEBUG("build_bhatt_lod: complete, total time {} ms, output_count={}", total_ms, output_count);
 
         if (progress && !progress(1.0f, "LOD tree complete")) {
             return std::unexpected("build_bhatt_lod: cancelled by user");

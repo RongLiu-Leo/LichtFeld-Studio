@@ -27,6 +27,14 @@ namespace lfs::vis {
         constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
         constexpr std::size_t kSlotCount = 3;
         constexpr std::size_t kPlaceholderSize = 16;
+        constexpr std::uint32_t kBindingModelTransforms = 0;
+        constexpr std::uint32_t kBindingTransformIndices = 1;
+        constexpr std::uint32_t kBindingVisibility = 2;
+        constexpr std::uint32_t kBindingSelectionMask = 3;
+        constexpr std::uint32_t kBindingPreviewSelectionMask = 4;
+        constexpr std::uint32_t kBindingSelectionColors = 5;
+        constexpr std::uint32_t kBindingDeletedMask = 6;
+        constexpr std::uint32_t kDescriptorBindingCount = 7;
 
         // Push constants exactly mirror the layout in point_cloud.vert.
         // Packed to 256 bytes (the Vulkan portable upper bound). Counts/flags
@@ -41,6 +49,8 @@ namespace lfs::vis {
             kFlagHasSelection = 1 << 5,
             kFlagHasPreviewSelection = 1 << 6,
             kFlagPreviewSelectionAdditive = 1 << 7,
+            kFlagDepthViewGrayscale = 1 << 8,
+            kFlagHasDeletedMask = 1 << 9,
         };
         struct PushConstants {
             float view_proj[16];        // 64
@@ -177,7 +187,7 @@ namespace lfs::vis {
         void writePushConstants(PushConstants& pc, const PointCloudVulkanRenderer::RenderRequest& req,
                                 int max_point_size, int n_transforms, int n_visibility,
                                 bool has_transform_indices, bool has_selection,
-                                bool has_preview_selection) {
+                                bool has_preview_selection, bool has_deleted_mask) {
             std::memcpy(pc.view_proj, glm::value_ptr(req.view_projection), sizeof(pc.view_proj));
             std::memcpy(pc.view, glm::value_ptr(req.view), sizeof(pc.view));
 
@@ -226,6 +236,12 @@ namespace lfs::vis {
                 if (req.preview_selection_additive) {
                     flags |= kFlagPreviewSelectionAdditive;
                 }
+            }
+            if (has_deleted_mask) {
+                flags |= kFlagHasDeletedMask;
+            }
+            if (req.depth_visualization_mode == lfs::rendering::DepthVisualizationMode::Grayscale) {
+                flags |= kFlagDepthViewGrayscale;
             }
             pc.counts[0] = n_transforms;
             pc.counts[1] = n_visibility;
@@ -287,6 +303,7 @@ namespace lfs::vis {
             ManagedBuffer transforms;
             ManagedBuffer transform_indices;
             ManagedBuffer visibility;
+            ManagedBuffer deleted_mask;
             ManagedBuffer selection_mask;
             ManagedBuffer preview_selection_mask;
             ManagedBuffer selection_colors;
@@ -305,6 +322,10 @@ namespace lfs::vis {
             std::vector<glm::mat4> cached_transforms;
             std::vector<std::uint32_t> cached_visibility;
 
+            const void* cached_deleted_mask_ptr = nullptr;
+            std::size_t cached_deleted_mask_id = 0;
+            std::size_t cached_deleted_mask_count = 0;
+            std::uint64_t cached_deleted_mask_revision = 0;
             const void* cached_selection_mask_ptr = nullptr;
             std::size_t cached_selection_mask_id = 0;
             std::size_t cached_selection_mask_count = 0;
@@ -430,7 +451,7 @@ namespace lfs::vis {
                 return std::unexpected<std::string>("vkCreateShaderModule(point_cloud) failed");
             }
 
-            std::array<VkDescriptorSetLayoutBinding, 6> bindings{};
+            std::array<VkDescriptorSetLayoutBinding, kDescriptorBindingCount> bindings{};
             for (std::uint32_t i = 0; i < bindings.size(); ++i) {
                 bindings[i].binding = i;
                 bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -574,7 +595,7 @@ namespace lfs::vis {
         std::expected<void, std::string> createDescriptorPool() {
             VkDescriptorPoolSize ps{};
             ps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            ps.descriptorCount = 6;
+            ps.descriptorCount = kDescriptorBindingCount;
             VkDescriptorPoolCreateInfo pi{};
             pi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
             pi.maxSets = 1;
@@ -771,6 +792,7 @@ namespace lfs::vis {
             destroyBuffer(allocator, cache.transforms);
             destroyBuffer(allocator, cache.transform_indices);
             destroyBuffer(allocator, cache.visibility);
+            destroyBuffer(allocator, cache.deleted_mask);
             destroyBuffer(allocator, cache.selection_mask);
             destroyBuffer(allocator, cache.preview_selection_mask);
             destroyBuffer(allocator, cache.selection_colors);
@@ -818,6 +840,10 @@ namespace lfs::vis {
             }
 
             const std::size_t n_points = static_cast<std::size_t>(req.positions->size(0));
+            if (req.deleted_mask && req.deleted_mask->is_valid() &&
+                req.deleted_mask->numel() != n_points) {
+                return std::unexpected<std::string>("deleted mask must match positions");
+            }
 
             // positions
             const void* pos_key = req.positions->ptr<float>();
@@ -1030,6 +1056,18 @@ namespace lfs::vis {
             if (!selection_count) {
                 return std::unexpected(selection_count.error());
             }
+            auto deleted_count = upload_mask_if_changed(
+                req.deleted_mask,
+                cache.deleted_mask,
+                "deleted mask",
+                cache.cached_deleted_mask_ptr,
+                cache.cached_deleted_mask_id,
+                cache.cached_deleted_mask_count,
+                &cache.cached_deleted_mask_revision,
+                req.deleted_mask_revision);
+            if (!deleted_count) {
+                return std::unexpected(deleted_count.error());
+            }
             auto preview_count = upload_mask_if_changed(
                 req.preview_selection_mask,
                 cache.preview_selection_mask,
@@ -1077,6 +1115,9 @@ namespace lfs::vis {
             VkBuffer visibility_buf = (cache.cached_n_visibility > 0)
                                           ? cache.visibility.buffer
                                           : placeholder.buffer;
+            VkBuffer deleted_buf = (cache.cached_deleted_mask_count > 0)
+                                       ? cache.deleted_mask.buffer
+                                       : placeholder.buffer;
             VkBuffer selection_buf = (cache.cached_selection_mask_count > 0)
                                          ? cache.selection_mask.buffer
                                          : placeholder.buffer;
@@ -1090,21 +1131,23 @@ namespace lfs::vis {
                                                 ? cache.selection_colors.buffer
                                                 : placeholder.buffer;
 
-            std::array<VkDescriptorBufferInfo, 6> infos{};
-            infos[0].buffer = transforms_buf;
-            infos[0].range = VK_WHOLE_SIZE;
-            infos[1].buffer = indices_buf;
-            infos[1].range = VK_WHOLE_SIZE;
-            infos[2].buffer = visibility_buf;
-            infos[2].range = VK_WHOLE_SIZE;
-            infos[3].buffer = selection_buf;
-            infos[3].range = VK_WHOLE_SIZE;
-            infos[4].buffer = preview_selection_buf;
-            infos[4].range = VK_WHOLE_SIZE;
-            infos[5].buffer = selection_colors_buf;
-            infos[5].range = VK_WHOLE_SIZE;
+            std::array<VkDescriptorBufferInfo, kDescriptorBindingCount> infos{};
+            infos[kBindingModelTransforms].buffer = transforms_buf;
+            infos[kBindingModelTransforms].range = VK_WHOLE_SIZE;
+            infos[kBindingTransformIndices].buffer = indices_buf;
+            infos[kBindingTransformIndices].range = VK_WHOLE_SIZE;
+            infos[kBindingVisibility].buffer = visibility_buf;
+            infos[kBindingVisibility].range = VK_WHOLE_SIZE;
+            infos[kBindingSelectionMask].buffer = selection_buf;
+            infos[kBindingSelectionMask].range = VK_WHOLE_SIZE;
+            infos[kBindingPreviewSelectionMask].buffer = preview_selection_buf;
+            infos[kBindingPreviewSelectionMask].range = VK_WHOLE_SIZE;
+            infos[kBindingSelectionColors].buffer = selection_colors_buf;
+            infos[kBindingSelectionColors].range = VK_WHOLE_SIZE;
+            infos[kBindingDeletedMask].buffer = deleted_buf;
+            infos[kBindingDeletedMask].range = VK_WHOLE_SIZE;
 
-            std::array<VkWriteDescriptorSet, 6> writes{};
+            std::array<VkWriteDescriptorSet, kDescriptorBindingCount> writes{};
             for (std::uint32_t i = 0; i < writes.size(); ++i) {
                 writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
                 writes[i].dstSet = descriptor_set;
@@ -1260,7 +1303,8 @@ namespace lfs::vis {
                                static_cast<int>(cache.cached_n_visibility),
                                cache.cached_transform_indices_count > 0,
                                cache.cached_selection_mask_count > 0,
-                               cache.cached_preview_selection_mask_count > 0);
+                               cache.cached_preview_selection_mask_count > 0,
+                               cache.cached_deleted_mask_count > 0);
             vkCmdPushConstants(command_buffer, pipeline_layout,
                                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                                0, sizeof(push), &push);

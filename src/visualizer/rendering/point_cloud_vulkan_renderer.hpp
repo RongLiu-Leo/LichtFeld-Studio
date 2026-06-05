@@ -67,6 +67,10 @@ namespace lfs::vis {
             // Optional per-transform visibility (size matches model_transforms).
             const std::vector<bool>* node_visibility_mask = nullptr;
 
+            // Optional per-point soft-delete mask. Nonzero entries are hidden.
+            const lfs::core::Tensor* deleted_mask = nullptr;
+            std::uint64_t deleted_mask_revision = 0;
+
             // Optional selection overlays. Masks are per-point UInt8/Bool tensors
             // where 0 means unselected and nonzero means selection group/preview.
             const lfs::core::Tensor* selection_mask = nullptr;
@@ -91,8 +95,10 @@ namespace lfs::vis {
             float voxel_size = 0.01f;
             float scaling_modifier = 1.0f;
             bool depth_view = false;
-            float depth_view_min = lfs::rendering::DEFAULT_NEAR_PLANE;
-            float depth_view_max = lfs::rendering::DEFAULT_FAR_PLANE;
+            float depth_view_min = lfs::rendering::DEFAULT_DEPTH_VIEW_MIN;
+            float depth_view_max = lfs::rendering::DEFAULT_DEPTH_VIEW_MAX;
+            lfs::rendering::DepthVisualizationMode depth_visualization_mode =
+                lfs::rendering::DepthVisualizationMode::Palette;
         };
 
         enum class OutputSlot : std::size_t {

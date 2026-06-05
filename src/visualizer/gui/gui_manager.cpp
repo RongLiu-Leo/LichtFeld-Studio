@@ -60,7 +60,6 @@
 #include "scene/scene_manager.hpp"
 #include "scene/scene_render_state.hpp"
 #include "theme/theme.hpp"
-#include "tools/brush_tool.hpp"
 #include "tools/selection_tool.hpp"
 #include "training/trainer.hpp"
 #include "training/training_manager.hpp"
@@ -2198,6 +2197,23 @@ namespace lfs::vis::gui {
                                    4.5f);
             }
 
+            if (gizmo.cropbox_active) {
+                appendProjectedBox(params.overlay_triangles, params, panel, settings,
+                                   gizmo.cropbox_min,
+                                   gizmo.cropbox_max,
+                                   gizmo.cropbox_transform,
+                                   cropGuideColor(glm::vec3(1.0f, 1.0f, 0.0f), false, 0.0f),
+                                   2.0f);
+            }
+
+            if (gizmo.ellipsoid_active) {
+                appendProjectedEllipsoid(params.overlay_triangles, params, panel, settings,
+                                         gizmo.ellipsoid_radii,
+                                         gizmo.ellipsoid_transform,
+                                         cropGuideColor(glm::vec3(0.5f, 0.85f, 1.0f), false, 0.0f),
+                                         2.0f);
+            }
+
             if (!scene_state || !scene_manager) {
                 return;
             }
@@ -3118,6 +3134,15 @@ namespace lfs::vis::gui {
         rml_right_panel_.init(&rmlui_manager_);
         rml_right_panel_.on_tab_changed = [this](const std::string& id) {
             panel_layout_.setActiveTab(id);
+        };
+        rml_right_panel_.on_tab_closed = [this](const std::string& id) {
+            if (id.empty())
+                return;
+            PanelRegistry::instance().set_panel_enabled(id, false);
+            if (panel_layout_.getActiveTab() == id)
+                panel_layout_.setActiveTab({});
+            if (focus_panel_name_ == id)
+                focus_panel_name_.clear();
         };
         rml_right_panel_.on_splitter_delta = [this](float delta_y) {
             viewer_->getRenderingManager()->setViewportResizeActive(true);
@@ -4778,6 +4803,8 @@ namespace lfs::vis::gui {
         {
             LOG_TIMER_THRESHOLD("gui_render.imgui_newFrame", 0.25);
             ImGui_ImplSDL3_NewFrame();
+            if (auto* input_controller = viewer_->getInputController())
+                input_controller->applySplitterCursorOverride();
             rmlui_manager_.clearVulkanQueue();
         }
         const auto& sdl_input = viewer_->getWindowManager()->frameInput();
@@ -5222,6 +5249,7 @@ namespace lfs::vis::gui {
                     .id = t.id,
                     .label = t.label,
                     .dom_id = makeRmlTabDomId(t.id),
+                    .closeable = t.tab_closeable,
                 });
             }
 
@@ -5449,6 +5477,27 @@ namespace lfs::vis::gui {
         rml_viewport_overlay_.setViewportBounds(
             viewport_layout_.pos, viewport_layout_.size,
             {panel_input.screen_x, panel_input.screen_y});
+        RmlViewportOverlay::SplitDividerOverlayState split_divider_state;
+        if (auto* const rendering = viewer_ ? viewer_->getRenderingManager() : nullptr;
+            rendering && rendering->isSplitViewActive()) {
+            const auto divider_x = rendering->getSplitDividerScreenX(viewport_layout_.pos, viewport_layout_.size);
+            const auto content_bounds = rendering->getContentBounds(glm::ivec2(
+                std::max(static_cast<int>(viewport_layout_.size.x), 0),
+                std::max(static_cast<int>(viewport_layout_.size.y), 0)));
+            if (divider_x && content_bounds.width > 0.0f && content_bounds.height > 0.0f) {
+                const auto& t = theme();
+                constexpr float kSplitDividerMinWidthPx = 10.0f;
+                const float divider_width =
+                    std::max(kSplitDividerMinWidthPx * current_ui_scale_,
+                             std::round(t.viewport.border_size * current_ui_scale_ * 4.0f));
+                split_divider_state.visible = true;
+                split_divider_state.x = std::round((*divider_x - viewport_layout_.pos.x) - divider_width * 0.5f);
+                split_divider_state.y = content_bounds.y;
+                split_divider_state.width = divider_width;
+                split_divider_state.height = content_bounds.height;
+            }
+        }
+        rml_viewport_overlay_.setSplitDividerOverlay(split_divider_state);
         AppStore::GTMetricsOverlayConfig gt_metrics_config;
         if (auto* const rendering = viewer_ ? viewer_->getRenderingManager() : nullptr) {
             const auto settings = rendering->getSettings();
@@ -5631,6 +5680,8 @@ namespace lfs::vis::gui {
         apply_cursor(panel_layout_.getCursorRequest());
         if (SDL_Cursor* const cursor = systemCursorForImGuiCursor(ImGui::GetMouseCursor()))
             SDL_SetCursor(cursor);
+        if (auto* input_controller = viewer_->getInputController())
+            input_controller->applySplitterCursorOverride();
         syncWindowTextInput(viewer_->getWindow());
 
         if (vulkan_gui_) {
@@ -5768,9 +5819,6 @@ namespace lfs::vis::gui {
             return;
         }
 
-        if (auto* const tool = ctx.viewer->getBrushTool(); tool && tool->isEnabled() && !ui_hidden_) {
-            tool->renderUI(ctx, nullptr);
-        }
         if (auto* const tool = ctx.viewer->getSelectionTool(); tool && tool->isEnabled() && !ui_hidden_) {
             tool->renderUI(ctx, nullptr);
         }
@@ -6162,40 +6210,6 @@ namespace lfs::vis::gui {
                 }
             }
         }
-
-        auto* const rendering = viewer_ ? viewer_->getRenderingManager() : nullptr;
-        if (!rendering || viewport_layout_.size.x <= 0.0f || viewport_layout_.size.y <= 0.0f) {
-            return;
-        }
-
-        if (!rendering->isSplitViewActive()) {
-            return;
-        }
-
-        const auto& t = theme();
-        auto* const draw_list = ImGui::GetBackgroundDrawList(ImGui::GetMainViewport());
-        const auto divider_x = rendering->getSplitDividerScreenX(viewport_layout_.pos, viewport_layout_.size);
-        if (!divider_x) {
-            return;
-        }
-        constexpr float kSplitDividerMinWidthPx = 10.0f;
-        const float divider_width =
-            std::max(kSplitDividerMinWidthPx * current_ui_scale_,
-                     std::round(t.viewport.border_size * current_ui_scale_ * 4.0f));
-        const float divider_left = std::round(*divider_x - divider_width * 0.5f);
-        const float divider_right = std::round(*divider_x + divider_width * 0.5f);
-        const ImU32 divider_fill_color = toU32(t.menu_background());
-
-        draw_list->PushClipRect(
-            ImVec2(viewport_layout_.pos.x, viewport_layout_.pos.y),
-            ImVec2(viewport_layout_.pos.x + viewport_layout_.size.x,
-                   viewport_layout_.pos.y + viewport_layout_.size.y),
-            true);
-        draw_list->AddRectFilled(
-            ImVec2(divider_left, viewport_layout_.pos.y),
-            ImVec2(divider_right, viewport_layout_.pos.y + viewport_layout_.size.y),
-            divider_fill_color);
-        draw_list->PopClipRect();
     }
 
     void GuiManager::updateInputOverrides(const PanelInputState& input,
@@ -6608,6 +6622,102 @@ namespace lfs::vis::gui {
         return isVramHudOverlayVisible() &&
                (next_vram_hud_publish_ == std::chrono::steady_clock::time_point{} ||
                 now >= next_vram_hud_publish_);
+    }
+
+    void GuiManager::syncVisiblePanelsBeforeSceneRender() {
+        const std::uint64_t sync_generation = lfs::python::pre_scene_panel_sync_generation();
+        if (sync_generation == 0 ||
+            sync_generation == last_pre_scene_panel_sync_generation_)
+            return;
+        last_pre_scene_panel_sync_generation_ = sync_generation;
+
+        if (!viewer_ || !show_main_panel_ || ui_hidden_) {
+            return;
+        }
+
+        auto& reg = PanelRegistry::instance();
+        const auto main_tabs = reg.get_panels_for_space(PanelSpace::MainPanelTab);
+        if (main_tabs.empty()) {
+            return;
+        }
+
+        panel_layout_.syncActiveTab(main_tabs, focus_panel_name_);
+        const std::string& active_tab = panel_layout_.getActiveTab();
+        if (active_tab.empty()) {
+            return;
+        }
+
+        const ImGuiViewport* const mvp = ImGui::GetMainViewport();
+        if (!mvp || mvp->WorkSize.x <= 0.0f || mvp->WorkSize.y <= 0.0f) {
+            return;
+        }
+
+        auto& editor_ctx = viewer_->getEditorContext();
+        auto* scene_manager = viewer_->getSceneManager();
+        auto* trainer_manager = viewer_->getTrainerManager();
+        editor_ctx.update(scene_manager, trainer_manager);
+
+        UIContext ctx{
+            .viewer = viewer_,
+            .window_states = &window_states_,
+            .editor = &editor_ctx,
+            .sequencer_controller = &sequencer_ui_.controller(),
+            .rml_manager = &rmlui_manager_,
+            .fonts = buildFontSet()};
+
+        lfs::core::Scene* scene = nullptr;
+        if (scene_manager)
+            scene = &scene_manager->getScene();
+
+        PanelDrawContext draw_ctx;
+        draw_ctx.ui = &ctx;
+        draw_ctx.viewport = &viewport_layout_;
+        draw_ctx.scene = scene;
+        draw_ctx.ui_hidden = ui_hidden_;
+        draw_ctx.scene_generation = python::get_scene_generation();
+        if (scene_manager)
+            draw_ctx.has_selection = scene_manager->hasSelectedNode();
+        if (auto* cc = lfs::event::command_center())
+            draw_ctx.is_training = cc->snapshot().is_running;
+
+        PanelInputState input;
+        input.mouse_x = -1.0e9f;
+        input.mouse_y = -1.0e9f;
+        input.screen_x = mvp->Pos.x;
+        input.screen_y = mvp->Pos.y;
+        input.screen_w = static_cast<int>(mvp->Size.x);
+        input.screen_h = static_cast<int>(mvp->Size.y);
+
+        const float dpi = lfs::python::get_shared_dpi_scale();
+        const float panel_h = mvp->WorkSize.y - PanelLayoutManager::STATUS_BAR_HEIGHT * dpi;
+        if (panel_h <= 0.0f) {
+            return;
+        }
+
+        constexpr float kPanelPad = 8.0f;
+        constexpr float kPreloadMaxHeight = 100000.0f;
+        const float content_w = panel_layout_.getRightPanelWidth() - 2.0f * kPanelPad;
+        if (content_w <= 0.0f) {
+            return;
+        }
+
+        const float splitter_h = PanelLayoutManager::SPLITTER_H * dpi;
+        const float tab_bar_h = PanelLayoutManager::TAB_BAR_H * dpi;
+        const float avail_h = panel_h - 2.0f * kPanelPad;
+        const float scene_h =
+            std::max(80.0f * dpi,
+                     avail_h * panel_layout_.getScenePanelRatio() - splitter_h * 0.5f);
+        const float content_top = mvp->WorkPos.y + kPanelPad;
+        const float tab_content_y = content_top + scene_h + splitter_h + tab_bar_h;
+        const float tab_content_h =
+            std::max(0.0f, content_top + avail_h - tab_content_y);
+        const float clip_y_min = tab_content_y;
+        const float clip_y_max = tab_content_y + tab_content_h;
+
+        reg.preload_single_panel_direct(active_tab, content_w, kPreloadMaxHeight, draw_ctx,
+                                        clip_y_min, clip_y_max, &input);
+        reg.preload_child_panels_direct(active_tab, content_w, kPreloadMaxHeight, draw_ctx,
+                                        clip_y_min, clip_y_max, &input);
     }
 
     bool GuiManager::needsAnimationFrame() const {

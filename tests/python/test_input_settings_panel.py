@@ -14,7 +14,6 @@ import pytest
 TOOL_MODE_NAMES = (
     "GLOBAL",
     "SELECTION",
-    "BRUSH",
     "TRANSLATE",
     "ROTATE",
     "SCALE",
@@ -63,7 +62,6 @@ ACTION_NAMES = (
     "TOGGLE_SELECTION_DEPTH_FILTER",
     "TOGGLE_SELECTION_CROP_FILTER",
     "BRUSH_RESIZE",
-    "CYCLE_BRUSH_MODE",
     "CONFIRM_POLYGON",
     "CANCEL_POLYGON",
     "UNDO_POLYGON_VERTEX",
@@ -89,7 +87,6 @@ ACTION_NAMES = (
     "TOOL_ROTATE",
     "TOOL_SCALE",
     "TOOL_MIRROR",
-    "TOOL_BRUSH",
     "TOOL_ALIGN",
     "PIE_MENU",
     "DEPTH_ADJUST_NEAR",
@@ -289,12 +286,11 @@ def test_input_settings_builds_profile_and_mode_records(input_settings_module):
     assert panel._handle.records["tool_modes"] == [
         {"index": "0", "label": "Mode GLOBAL"},
         {"index": "1", "label": "Mode SELECTION"},
-        {"index": "2", "label": "Mode BRUSH"},
-        {"index": "3", "label": "Mode TRANSLATE"},
-        {"index": "4", "label": "Mode ROTATE"},
-        {"index": "5", "label": "Mode SCALE"},
-        {"index": "6", "label": "Mode ALIGN"},
-        {"index": "7", "label": "Mode CROP_BOX"},
+        {"index": "2", "label": "Mode TRANSLATE"},
+        {"index": "3", "label": "Mode ROTATE"},
+        {"index": "4", "label": "Mode SCALE"},
+        {"index": "5", "label": "Mode ALIGN"},
+        {"index": "6", "label": "Mode CROP_BOX"},
     ]
 
 

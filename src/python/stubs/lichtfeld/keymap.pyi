@@ -85,8 +85,6 @@ class Action(enum.Enum):
 
     BRUSH_RESIZE = 38
 
-    CYCLE_BRUSH_MODE = 39
-
     CONFIRM_POLYGON = 40
 
     CANCEL_POLYGON = 41
@@ -137,8 +135,6 @@ class Action(enum.Enum):
 
     TOOL_MIRROR = 65
 
-    TOOL_BRUSH = 66
-
     TOOL_ALIGN = 67
 
     PIE_MENU = 68
@@ -151,8 +147,6 @@ class ToolMode(enum.Enum):
     GLOBAL = 0
 
     SELECTION = 1
-
-    BRUSH = 2
 
     TRANSLATE = 3
 

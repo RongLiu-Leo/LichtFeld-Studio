@@ -4215,7 +4215,7 @@ namespace lfs::vis {
     void SceneManager::selectAllGaussians() {
         auto* editor = services().editorOrNull();
         const auto tool = editor ? editor->getActiveTool() : ToolType::None;
-        const bool is_selection_tool = (tool == ToolType::Selection || tool == ToolType::Brush);
+        const bool is_selection_tool = (tool == ToolType::Selection);
         auto* rendering_manager = services().renderingOrNull();
 
         if (selection_service_ &&
@@ -4289,7 +4289,7 @@ namespace lfs::vis {
     void SceneManager::copySelectionToClipboard() {
         auto* editor = services().editorOrNull();
         const auto tool = editor ? editor->getActiveTool() : ToolType::None;
-        const bool is_selection_tool = (tool == ToolType::Selection || tool == ToolType::Brush);
+        const bool is_selection_tool = (tool == ToolType::Selection);
 
         if (is_selection_tool && scene_.hasSelection()) {
             copySelectedGaussians();

@@ -501,7 +501,7 @@ class ToolDef:
     id: str                                      # Unique tool ID
     label: str                                   # Display label
     icon: str                                    # Icon name
-    group: str = "default"                       # "select", "transform", "paint", "utility"
+    group: str = "default"                       # "select", "transform", "utility"
     order: int = 100                             # Sort order within group
     description: str = ""                        # Tooltip
     shortcut: str = ""                           # Keyboard shortcut

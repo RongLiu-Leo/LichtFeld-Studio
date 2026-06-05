@@ -120,6 +120,9 @@ namespace lfs::vis {
         [[nodiscard]] std::expected<std::shared_ptr<lfs::core::Tensor>, std::string> readOutputImageRgb8(
             VulkanContext& context,
             OutputSlot output_slot = OutputSlot::Main) const;
+        [[nodiscard]] std::expected<std::shared_ptr<lfs::core::Tensor>, std::string> readOutputImageRgba8(
+            VulkanContext& context,
+            OutputSlot output_slot = OutputSlot::Main) const;
         [[nodiscard]] std::expected<void, std::string> readOutputImageIntoCpuHwc(
             VulkanContext& context,
             OutputSlot output_slot,
@@ -188,7 +191,8 @@ namespace lfs::vis {
             bool transparent_background,
             bool depth_view,
             float depth_min,
-            float depth_max);
+            float depth_max,
+            lfs::rendering::DepthVisualizationMode depth_visualization_mode);
         [[nodiscard]] std::expected<void, std::string> waitForRingSlot(
             std::size_t ring_slot,
             std::string_view reason);

@@ -15,6 +15,11 @@
 #undef min
 #endif
 
+namespace {
+    constexpr size_t kRasterBatchSize = 1024;
+    constexpr size_t kMinBatchedRasterAverageTileInstances = 1024;
+} // namespace
+
 VulkanGSRenderer::VulkanGSRenderer()
     : VulkanGSPipeline() {
 }
@@ -208,7 +213,12 @@ void VulkanGSRenderer::initializeExternal(const std::map<std::string, std::strin
         createComputePipeline(pipeline_rasterize_forward_3dgut[i], spirv_paths.at("rasterize_forward_3dgut"));
         createComputePipeline(pipeline_rasterize_forward_plain[i], spirv_paths.at("rasterize_forward_plain"));
         createComputePipeline(pipeline_rasterize_forward_3dgut_plain[i], spirv_paths.at("rasterize_forward_3dgut_plain"));
+        createComputePipeline(pipeline_rasterize_forward_batches_plain[i],
+                              spirv_paths.at("rasterize_forward_batches_plain"));
     }
+    createComputePipeline(pipeline_tile_batch_counts, spirv_paths.at("tile_batch_counts"));
+    createComputePipeline(pipeline_tile_batch_descriptors, spirv_paths.at("tile_batch_descriptors"));
+    createComputePipeline(pipeline_compose_tile_batches_plain, spirv_paths.at("compose_tile_batches_plain"));
     createComputePipeline(pipeline_cumsum.single_pass, spirv_paths.at("cumsum_single_pass"));
     createComputePipeline(pipeline_cumsum.block_scan, spirv_paths.at("cumsum_block_scan"));
     createComputePipeline(pipeline_cumsum.scan_block_sums, spirv_paths.at("cumsum_scan_block_sums"));
@@ -388,6 +398,102 @@ void VulkanGSRenderer::executeComputeTileRanges(
         });
 }
 
+void VulkanGSRenderer::executeBatchedRasterizeForward(
+    const VulkanGSRendererUniforms& uniforms,
+    VulkanGSPipelineBuffers& buffers) {
+    const size_t num_tiles = static_cast<size_t>(uniforms.grid_height) * uniforms.grid_width;
+    const size_t num_pixels = static_cast<size_t>(uniforms.image_height) * uniforms.image_width;
+    const size_t batch_capacity = num_tiles + _CEIL_DIV(buffers.num_indices, kRasterBatchSize);
+    if (num_tiles == 0 || num_pixels == 0)
+        return;
+
+    executeCompute(
+        {{num_tiles, 256}},
+        &uniforms, sizeof(uniforms),
+        pipeline_tile_batch_counts,
+        {
+            buffers.tile_ranges.deviceBuffer,
+            resizeDeviceBuffer(buffers.tile_batch_counts, num_tiles),
+        });
+
+    executeCumsum(buffers, buffers.tile_batch_counts, buffers.tile_batch_offsets);
+
+    auto& tile_batch_offsets = buffers.tile_batch_offsets.deviceBuffer;
+    auto& tile_batch_descriptors = resizeDeviceBuffer(buffers.tile_batch_descriptors,
+                                                      4 * batch_capacity);
+    auto& tile_batch_dispatch_args = resizeDeviceBuffer(buffers.tile_batch_dispatch_args, 3);
+
+    bufferMemoryBarrier({
+                            {tile_batch_offsets, COMPUTE_SHADER_WRITE},
+                        },
+                        COMPUTE_SHADER_READ);
+    executeCompute(
+        {{num_tiles, 256}},
+        &uniforms, sizeof(uniforms),
+        pipeline_tile_batch_descriptors,
+        {
+            buffers.tile_ranges.deviceBuffer,
+            tile_batch_offsets,
+            tile_batch_descriptors,
+            tile_batch_dispatch_args,
+        });
+
+    auto& tile_batch_pixel_state =
+        resizeDeviceBuffer(buffers.tile_batch_pixel_state, 4 * batch_capacity * TILE_WIDTH * TILE_HEIGHT);
+    auto& tile_batch_n_contributors =
+        resizeDeviceBuffer(buffers.tile_batch_n_contributors, batch_capacity * TILE_WIDTH * TILE_HEIGHT);
+    auto& pixel_state = resizeDeviceBuffer(buffers.pixel_state, 4 * num_pixels);
+    auto& pixel_depth = resizeDeviceBuffer(buffers.pixel_depth, num_pixels);
+    auto& n_contributors = resizeDeviceBuffer(buffers.n_contributors, num_pixels);
+
+    bufferMemoryBarrier({
+                            {tile_batch_descriptors, COMPUTE_SHADER_WRITE},
+                        },
+                        COMPUTE_SHADER_READ);
+    bufferMemoryBarrier({
+                            {tile_batch_dispatch_args, COMPUTE_SHADER_WRITE},
+                        },
+                        INDIRECT_DISPATCH_READ);
+    executeComputeIndirect(
+        tile_batch_dispatch_args,
+        0,
+        &uniforms, sizeof(uniforms),
+        pipeline_rasterize_forward_batches_plain[buffers.is_unsorted_1],
+        {
+            buffers.sorted_gauss_idx().deviceBuffer,
+            tile_batch_descriptors,
+            buffers.xy_vs.deviceBuffer,
+            buffers.inv_cov_vs_opacity.deviceBuffer,
+            buffers.rgb.deviceBuffer,
+            tile_batch_pixel_state,
+            tile_batch_n_contributors,
+        });
+
+    bufferMemoryBarrier({
+                            {tile_batch_pixel_state, COMPUTE_SHADER_WRITE},
+                            {tile_batch_n_contributors, COMPUTE_SHADER_WRITE},
+                        },
+                        COMPUTE_SHADER_READ);
+    executeCompute(
+        {{uniforms.image_width, TILE_WIDTH}, {uniforms.image_height, TILE_HEIGHT}},
+        &uniforms, sizeof(uniforms),
+        pipeline_compose_tile_batches_plain,
+        {
+            buffers.sorted_gauss_idx().deviceBuffer,
+            tile_batch_descriptors,
+            tile_batch_offsets,
+            buffers.xy_vs.deviceBuffer,
+            buffers.inv_cov_vs_opacity.deviceBuffer,
+            buffers.rgb.deviceBuffer,
+            buffers.depths.deviceBuffer,
+            tile_batch_pixel_state,
+            tile_batch_n_contributors,
+            pixel_state,
+            pixel_depth,
+            n_contributors,
+        });
+}
+
 void VulkanGSRenderer::executeRasterizeForward(
     const VulkanGSRendererUniforms& uniforms,
     VulkanGSPipelineBuffers& buffers,
@@ -426,6 +532,17 @@ void VulkanGSRenderer::executeRasterizeForward(
                             {model_transforms, TRANSFER_COMPUTE_SHADER_WRITE},
                         },
                         COMPUTE_SHADER_READ);
+
+    const size_t num_tiles = static_cast<size_t>(uniforms.grid_height) * uniforms.grid_width;
+    const bool use_batched_raster =
+        !use_gut_rasterization &&
+        !overlays_active &&
+        num_tiles > 0 &&
+        buffers.num_indices / num_tiles >= kMinBatchedRasterAverageTileInstances;
+    if (use_batched_raster) {
+        executeBatchedRasterizeForward(uniforms, buffers);
+        return;
+    }
 
     if (use_gut_rasterization) {
         auto& gut_pipeline = overlays_active

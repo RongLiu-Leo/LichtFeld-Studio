@@ -597,6 +597,9 @@ namespace lfs::app {
                                  {"equirectangular", settings.equirectangular},
                                  {"orthographic", settings.orthographic},
                                  {"ortho_scale", settings.ortho_scale},
+                                 {"depth_view_min", settings.depth_view_min},
+                                 {"depth_view_max", settings.depth_view_max},
+                                 {"depth_visualization_mode", static_cast<int>(settings.depth_visualization_mode)},
                                  {"selection_color_committed", json::array({settings.selection_color_committed[0], settings.selection_color_committed[1], settings.selection_color_committed[2]})},
                                  {"selection_color_preview", json::array({settings.selection_color_preview[0], settings.selection_color_preview[1], settings.selection_color_preview[2]})},
                                  {"selection_color_center_marker", json::array({settings.selection_color_center_marker[0], settings.selection_color_center_marker[1], settings.selection_color_center_marker[2]})},
@@ -732,6 +735,9 @@ namespace lfs::app {
             set_bool("equirectangular", settings.equirectangular);
             set_bool("orthographic", settings.orthographic);
             set_float("ortho_scale", settings.ortho_scale);
+            set_float("depth_view_min", settings.depth_view_min);
+            set_float("depth_view_max", settings.depth_view_max);
+            set_int("depth_visualization_mode", settings.depth_visualization_mode);
             set_bool("depth_clip_enabled", settings.depth_clip_enabled);
             set_float("depth_clip_far", settings.depth_clip_far);
             set_bool("mesh_wireframe", settings.mesh_wireframe);

@@ -1046,6 +1046,10 @@ struct Uniforms {
     uint lod_enabled;
     uint lod_count;
     uint mip_filter;
+    uint render_origin_x;
+    uint render_origin_y;
+    uint camera_width;
+    uint camera_height;
     uint pad2;
     float fx;
     float fy;

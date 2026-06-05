@@ -170,9 +170,10 @@ namespace lfs::rendering {
         GaussianOverlayState overlay;
         bool transparent_background = false;
         bool depth_view = false;
-        float depth_view_min = DEFAULT_NEAR_PLANE;
-        float depth_view_max = DEFAULT_FAR_PLANE;
-        
+        float depth_view_min = DEFAULT_DEPTH_VIEW_MIN;
+        float depth_view_max = DEFAULT_DEPTH_VIEW_MAX;
+        DepthVisualizationMode depth_visualization_mode = DepthVisualizationMode::Palette;
+
         // LOD index indirection (optional)
         const uint32_t* lod_indices = nullptr;
         size_t lod_count = 0;

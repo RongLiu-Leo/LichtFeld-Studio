@@ -19,6 +19,8 @@ layout(push_constant) uniform PushConstants {
     ivec4 counts;
 } pc;
 
+const int FLAG_DEPTH_GRAYSCALE = 1 << 8;
+
 float normalizedDepth(float depth, float lo, float hi) {
     lo = max(lo, 1.0e-4);
     hi = max(hi, lo + 1.0e-4);
@@ -69,11 +71,9 @@ void main() {
         }
         const float depth_t = normalizedDepth(v_view_depth, lo, hi);
         const float near_t = 1.0 - depth_t;
-        vec3 depth_color = depthPalette(near_t);
-
-        const float band = abs(fract(depth_t * 24.0) - 0.5);
-        const float contour = smoothstep(0.475, 0.5, band);
-        depth_color *= 1.0 - contour * 0.07;
+        vec3 depth_color = (pc.counts.z & FLAG_DEPTH_GRAYSCALE) != 0
+                               ? vec3(near_t)
+                               : depthPalette(near_t);
 
         frag_color = vec4(depth_color, 1.0);
         return;

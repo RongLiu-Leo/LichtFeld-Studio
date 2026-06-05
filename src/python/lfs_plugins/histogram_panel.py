@@ -105,7 +105,7 @@ class HistogramPanel(Panel):
         self._primary_values: lf.Tensor | None = None
         self._primary_finite_mask: lf.Tensor | None = None
         self._primary_valid_values: lf.Tensor | None = None
-        # Cached host copies so a view-only change (zoom / range / log) re-bins without
+        # Cached host copies so a view-only change (zoom / range) re-bins without
         # re-extracting, re-copying, or re-sorting the full dataset.
         self._primary_finite_values_cpu: lf.Tensor | None = None
         self._primary_sorted_values: lf.Tensor | None = None
@@ -473,9 +473,10 @@ class HistogramPanel(Panel):
         if enabled == self._log_scale_enabled:
             return
         self._log_scale_enabled = enabled
-        # Bin EDGES change with log scale (we log-space them on both axes), so
-        # we need a full rebuild rather than just a re-render of the records.
-        self._refresh_after_range_change()
+        self._update_bin_records()
+        self._update_compare_bin_records()
+        if self._handle:
+            self._handle.dirty_all()
 
     def _resolve_active_bounds(self, auto_min: float, auto_max: float) -> tuple[float, float]:
         """User constraint narrows binning when set; otherwise the metric's auto bounds win."""
@@ -493,16 +494,11 @@ class HistogramPanel(Panel):
         finite_values: lf.Tensor,
         range_min: float,
         range_max: float,
-        log_scale: bool = False,
     ) -> tuple[float, float]:
-        """Tighten [range_min, range_max] to the actual extent of values inside it.
-        With log_scale, additionally exclude non-positive samples so the lower bound
-        is always > 0 (a hard requirement for log-spaced bin edges)."""
+        """Tighten [range_min, range_max] to the actual extent of values inside it."""
         if not math.isfinite(range_min) or not math.isfinite(range_max) or range_max <= range_min:
             return range_min, range_max
         in_range = (finite_values >= range_min) & (finite_values <= range_max)
-        if log_scale:
-            in_range = in_range & (finite_values > 0)
         if not bool(in_range.any().item()):
             return range_min, range_max
         clipped = finite_values[in_range]
@@ -513,26 +509,9 @@ class HistogramPanel(Panel):
         return max(range_min, data_min), min(range_max, data_max)
 
     @staticmethod
-    def _log_bins_supported(histogram_min: float, histogram_max: float) -> bool:
-        return (
-            histogram_min > 0.0 and
-            histogram_max > 0.0 and
-            histogram_max > histogram_min and
-            math.isfinite(histogram_min) and
-            math.isfinite(histogram_max)
-        )
-
-    @staticmethod
     def _compute_bin_edges(
-        histogram_min: float, histogram_max: float, bin_count: int, log_scale: bool = False
+        histogram_min: float, histogram_max: float, bin_count: int
     ) -> list[float]:
-        if log_scale and HistogramPanel._log_bins_supported(histogram_min, histogram_max):
-            log_lo = math.log(histogram_min)
-            log_hi = math.log(histogram_max)
-            return [
-                math.exp(log_lo + (log_hi - log_lo) * (index / bin_count))
-                for index in range(bin_count + 1)
-            ]
         return [
             histogram_min + (histogram_max - histogram_min) * (index / bin_count)
             for index in range(bin_count + 1)
@@ -613,18 +592,13 @@ class HistogramPanel(Panel):
         return True
 
     @staticmethod
-    def _value_at_fraction(fraction: float, lo: float, hi: float, log_scale: bool) -> float | None:
-        """Map a 0..1 position across the chart to a data value, matching the linear /
-        log-spaced bin layout so the value lands under the pixel the user pointed at."""
+    def _value_at_fraction(fraction: float, lo: float, hi: float) -> float | None:
+        """Map a 0..1 position across the chart to a data value."""
         lo = float(lo)
         hi = float(hi)
         if not (math.isfinite(lo) and math.isfinite(hi)) or hi <= lo:
             return None
         fraction = min(1.0, max(0.0, float(fraction)))
-        if log_scale and lo > 0.0 and hi > 0.0:
-            log_lo = math.log(lo)
-            log_hi = math.log(hi)
-            return math.exp(log_lo + (log_hi - log_lo) * fraction)
         return lo + (hi - lo) * fraction
 
     @staticmethod
@@ -635,7 +609,6 @@ class HistogramPanel(Panel):
         domain_min: float,
         domain_max: float,
         zoom_in: bool,
-        log_scale: bool = False,
         magnitude: float = 1.0,
     ) -> tuple[float, float] | None:
         """Zoom [current_min, current_max] around ``focus`` (the value under the cursor),
@@ -651,45 +624,39 @@ class HistogramPanel(Panel):
         if domain_hi <= domain_lo or current_hi <= current_lo:
             return None
 
-        use_log = log_scale and domain_lo > 0.0 and current_lo > 0.0 and float(focus) > 0.0
-        to_axis = math.log if use_log else (lambda value: value)
-        from_axis = math.exp if use_log else (lambda value: value)
+        current_lo = min(max(current_lo, domain_lo), domain_hi)
+        current_hi = min(max(current_hi, domain_lo), domain_hi)
+        focus = min(max(float(focus), current_lo), current_hi)
 
-        axis_domain_lo = to_axis(domain_lo)
-        axis_domain_hi = to_axis(domain_hi)
-        axis_current_lo = min(max(to_axis(current_lo), axis_domain_lo), axis_domain_hi)
-        axis_current_hi = min(max(to_axis(current_hi), axis_domain_lo), axis_domain_hi)
-        axis_focus = min(max(to_axis(float(focus)), axis_current_lo), axis_current_hi)
-
-        span = axis_current_hi - axis_current_lo
-        domain_span = axis_domain_hi - axis_domain_lo
+        span = current_hi - current_lo
+        domain_span = domain_hi - domain_lo
         if span <= 0.0 or domain_span <= 0.0:
             return None
 
         step = HISTOGRAM_ZOOM_STEP ** max(1.0, float(magnitude))
         target_span = span * step if zoom_in else span / step
         if not zoom_in and target_span >= domain_span:
-            return from_axis(axis_domain_lo), from_axis(axis_domain_hi)
+            return domain_lo, domain_hi
         target_span = min(target_span, domain_span)
         target_span = max(target_span, max(domain_span * 1e-9, 1e-30))
 
         # Hold the focused value at its current fractional offset so the point under the
         # cursor stays put as the window shrinks or grows around it.
-        fraction = (axis_focus - axis_current_lo) / span
-        new_lo = axis_focus - fraction * target_span
+        fraction = (focus - current_lo) / span
+        new_lo = focus - fraction * target_span
         new_hi = new_lo + target_span
 
-        if new_lo < axis_domain_lo:
-            new_hi += axis_domain_lo - new_lo
-            new_lo = axis_domain_lo
-        if new_hi > axis_domain_hi:
-            new_lo -= new_hi - axis_domain_hi
-            new_hi = axis_domain_hi
-        new_lo = max(axis_domain_lo, new_lo)
-        new_hi = min(axis_domain_hi, new_hi)
+        if new_lo < domain_lo:
+            new_hi += domain_lo - new_lo
+            new_lo = domain_lo
+        if new_hi > domain_hi:
+            new_lo -= new_hi - domain_hi
+            new_hi = domain_hi
+        new_lo = max(domain_lo, new_lo)
+        new_hi = min(domain_hi, new_hi)
         if new_hi <= new_lo:
             return None
-        return from_axis(new_lo), from_axis(new_hi)
+        return new_lo, new_hi
 
     @staticmethod
     def _view_covers_domain(view_min: float, view_max: float, domain_min: float, domain_max: float) -> bool:
@@ -709,7 +676,6 @@ class HistogramPanel(Panel):
                 finite_values,
                 float(range_min),
                 float(range_max),
-                log_scale=self._log_scale_enabled,
             )
         except Exception:
             return float(range_min), float(range_max)
@@ -725,7 +691,6 @@ class HistogramPanel(Panel):
             (mouse_x - left) / total_width,
             self._primary_histogram_min,
             self._primary_histogram_max,
-            self._log_scale_enabled,
         )
 
     def _apply_histogram_view_range(self, range_min: float, range_max: float) -> bool:
@@ -760,7 +725,6 @@ class HistogramPanel(Panel):
             self._auto_histogram_min,
             self._auto_histogram_max,
             zoom_in,
-            log_scale=self._log_scale_enabled,
             magnitude=magnitude,
         )
         if bounds is None:
@@ -775,11 +739,11 @@ class HistogramPanel(Panel):
         width = max(float(self._compare_chart_el.absolute_width), 1.0)
         height = max(float(self._compare_chart_el.absolute_height), 1.0)
         x_value = self._value_at_fraction(
-            (mouse_x - left) / width, self._compare_x_min, self._compare_x_max, self._log_scale_enabled
+            (mouse_x - left) / width, self._compare_x_min, self._compare_x_max
         )
         # Screen y grows downward while the value axis grows upward, so invert.
         y_value = self._value_at_fraction(
-            1.0 - (mouse_y - top) / height, self._compare_y_min, self._compare_y_max, self._log_scale_enabled
+            1.0 - (mouse_y - top) / height, self._compare_y_min, self._compare_y_max
         )
         if x_value is None or y_value is None:
             return None
@@ -820,7 +784,6 @@ class HistogramPanel(Panel):
             self._auto_histogram_min,
             self._auto_histogram_max,
             zoom_in,
-            log_scale=self._log_scale_enabled,
             magnitude=magnitude,
         )
         zoomed_y = self._cursor_zoom_bounds(
@@ -830,7 +793,6 @@ class HistogramPanel(Panel):
             self._compare_y_auto_min,
             self._compare_y_auto_max,
             zoom_in,
-            log_scale=self._log_scale_enabled,
             magnitude=magnitude,
         )
         if zoomed_x is None or zoomed_y is None:
@@ -1066,7 +1028,7 @@ class HistogramPanel(Panel):
         if not self._handle:
             return
 
-        # Zoom / range / log changes don't touch the data — re-bin the cached values
+        # Zoom / range changes don't touch the data — re-bin the cached values
         # instead of re-extracting, re-copying and re-sorting the whole scene.
         if view_only and self._primary_finite_values_cpu is not None and self._primary_valid_values is not None:
             self._rebind_view_from_cache()
@@ -1168,7 +1130,7 @@ class HistogramPanel(Panel):
 
     def _rebind_view_from_cache(self):
         """Re-resolve the view range and rebuild the bars from already-extracted data.
-        Used by the full refresh and by view-only changes (zoom / range / log)."""
+        Used by the full refresh and by view-only changes (zoom / range)."""
         finite_values = self._primary_finite_values_cpu
         if finite_values is None:
             return
@@ -1176,7 +1138,7 @@ class HistogramPanel(Panel):
         # Snap to the actual extent of the values inside the resolved range so the bars
         # fill the chart instead of leaving leading/trailing empty bins.
         histogram_min, histogram_max = self._snap_bounds_to_data(
-            finite_values, range_min, range_max, log_scale=self._log_scale_enabled
+            finite_values, range_min, range_max
         )
         # Inputs reflect the current effective min/max; the typed constraint stays in
         # _custom_range_{min,max}_value.
@@ -1233,21 +1195,18 @@ class HistogramPanel(Panel):
             return
 
         mark_bounds = self._capture_histogram_mark_value_bounds()
-        log_x = self._log_scale_enabled
         selection_bin_indices = self._build_selection_bin_indices(
             self._primary_values,
             self._primary_finite_mask,
             self._primary_histogram_min,
             self._primary_histogram_max,
             self._histogram_bin_count,
-            log_scale=log_x,
         )
         valid_bin_indices = self._bin_indices_for_values(
             self._primary_valid_values,
             self._primary_histogram_min,
             self._primary_histogram_max,
             self._histogram_bin_count,
-            log_scale=log_x,
         )
         counts, edges = self._build_histogram(
             valid_bin_indices,
@@ -1255,7 +1214,6 @@ class HistogramPanel(Panel):
             self._primary_histogram_min,
             self._primary_histogram_max,
             self._histogram_bin_count,
-            log_scale=log_x,
         )
 
         self._selection_bin_indices = selection_bin_indices
@@ -1298,14 +1256,12 @@ class HistogramPanel(Panel):
             return
 
         mark_bounds = self._capture_compare_mark_value_bounds()
-        log = self._log_scale_enabled
         x_bin_indices = self._build_selection_bin_indices(
             self._primary_values,
             self._compare_finite_mask,
             self._compare_x_min,
             self._compare_x_max,
             self._compare_x_bin_count,
-            log_scale=log,
         )
         y_bin_indices = self._build_selection_bin_indices(
             self._compare_values,
@@ -1313,21 +1269,18 @@ class HistogramPanel(Panel):
             self._compare_y_min,
             self._compare_y_max,
             self._compare_y_bin_count,
-            log_scale=log,
         )
         valid_x_bins = self._bin_indices_for_values(
             self._compare_valid_x_values,
             self._compare_x_min,
             self._compare_x_max,
             self._compare_x_bin_count,
-            log_scale=log,
         )
         valid_y_bins = self._bin_indices_for_values(
             self._compare_valid_y_values,
             self._compare_y_min,
             self._compare_y_max,
             self._compare_y_bin_count,
-            log_scale=log,
         )
         compare_counts, x_edges, y_edges = self._build_compare_heatmap(
             valid_x_bins,
@@ -1339,7 +1292,6 @@ class HistogramPanel(Panel):
             self._compare_y_max,
             self._compare_x_bin_count,
             self._compare_y_bin_count,
-            log_scale=log,
         )
 
         self._compare_x_bin_indices = x_bin_indices
@@ -1364,13 +1316,7 @@ class HistogramPanel(Panel):
 
     def _build_bin_records(self, counts: list[int], edges: list[float]) -> Iterable[dict[str, object]]:
         if self._log_scale_enabled:
-            # In log-space, bin widths grow geometrically — plot density
-            # (count / width) so the bar shape reflects the underlying PDF
-            # instead of giving wider upper bins an unfair advantage.
-            display_counts = [
-                float(count) / max(edges[i + 1] - edges[i], 1e-30)
-                for i, count in enumerate(counts)
-            ]
+            display_counts = [math.log1p(float(count)) for count in counts]
         else:
             display_counts = [float(count) for count in counts]
 
@@ -1933,9 +1879,8 @@ class HistogramPanel(Panel):
         histogram_min: float,
         histogram_max: float,
         bin_count: int = DEFAULT_HISTOGRAM_BIN_COUNT,
-        log_scale: bool = False,
     ) -> tuple[list[int], list[float]]:
-        edges = self._compute_bin_edges(histogram_min, histogram_max, bin_count, log_scale)
+        edges = self._compute_bin_edges(histogram_min, histogram_max, bin_count)
 
         span = histogram_max - histogram_min
         if not math.isfinite(span) or span <= 0.0:
@@ -1965,14 +1910,11 @@ class HistogramPanel(Panel):
         histogram_min: float,
         histogram_max: float,
         bin_count: int = DEFAULT_HISTOGRAM_BIN_COUNT,
-        log_scale: bool = False,
     ) -> lf.Tensor:
         # Out-of-range values get a -1 sentinel so they're excluded from both
         # the histogram counts and bin-based selection masks. Without this,
         # clamping piles every out-of-range sample into the edge bins, which
-        # makes a custom range-of-interest meaningless. With log_scale on,
-        # bin edges are log-spaced and non-positive samples are also excluded
-        # since log is undefined for them.
+        # makes a custom range-of-interest meaningless.
         value_count = int(values.shape[0]) if values.ndim > 0 else int(values.numel)
         device = HistogramPanel._device_string(values)
         if value_count <= 0:
@@ -1984,30 +1926,16 @@ class HistogramPanel(Panel):
 
         flat = values.reshape([-1])
         in_range = (flat >= histogram_min) & (flat <= histogram_max)
-
-        use_log = log_scale and HistogramPanel._log_bins_supported(histogram_min, histogram_max)
         raw = lf.Tensor.full([value_count], -1, dtype="int32", device=device)
-        if use_log:
-            in_range = in_range & (flat > 0)
         if not bool(in_range.any().item()):
             return raw
 
         in_values = flat[in_range]
-        if use_log:
-            log_lo = math.log(histogram_min)
-            log_hi = math.log(histogram_max)
-            log_span = log_hi - log_lo
-            bin_idx = (
-                (((in_values.log() - log_lo) / log_span) * bin_count)
-                .floor()
-                .to("int32")
-            )
-        else:
-            bin_idx = (
-                (((in_values - histogram_min) / span) * bin_count)
-                .floor()
-                .to("int32")
-            )
+        bin_idx = (
+            (((in_values - histogram_min) / span) * bin_count)
+            .floor()
+            .to("int32")
+        )
         bin_idx = bin_idx.clamp(0.0, float(bin_count - 1)).to("int32")
         raw[in_range] = bin_idx
         return raw
@@ -2019,7 +1947,6 @@ class HistogramPanel(Panel):
         histogram_min: float,
         histogram_max: float,
         bin_count: int = DEFAULT_HISTOGRAM_BIN_COUNT,
-        log_scale: bool = False,
     ) -> lf.Tensor:
         value_count = int(values.shape[0]) if values.ndim > 0 else int(values.numel)
         device = self._device_string(values)
@@ -2032,7 +1959,6 @@ class HistogramPanel(Panel):
             histogram_min,
             histogram_max,
             bin_count,
-            log_scale=log_scale,
         )
         return selection_bin_indices
 
@@ -2254,13 +2180,12 @@ class HistogramPanel(Panel):
         y_finite = self._compare_y_finite_cpu
         if x_finite is None or y_finite is None:
             return
-        log = self._log_scale_enabled
         # Mirror the primary axis range-of-interest on the compare X axis so the 2D
         # heatmap stays consistent with the 1D histogram.
         x_range_min, x_range_max = self._resolve_active_bounds(self._compare_x_auto_min, self._compare_x_auto_max)
-        x_min, x_max = self._snap_bounds_to_data(x_finite, x_range_min, x_range_max, log_scale=log)
+        x_min, x_max = self._snap_bounds_to_data(x_finite, x_range_min, x_range_max)
         y_range_min, y_range_max = self._resolve_compare_y_bounds(self._compare_y_auto_min, self._compare_y_auto_max)
-        y_min, y_max = self._snap_bounds_to_data(y_finite, y_range_min, y_range_max, log_scale=log)
+        y_min, y_max = self._snap_bounds_to_data(y_finite, y_range_min, y_range_max)
         self._compare_y_custom_range_min_str = self._format_range_input(y_min)
         self._compare_y_custom_range_max_str = self._format_range_input(y_max)
         self._compare_x_min = x_min
@@ -2280,10 +2205,9 @@ class HistogramPanel(Panel):
         y_max: float,
         x_bin_count: int,
         y_bin_count: int,
-        log_scale: bool = False,
     ) -> tuple[list[int], list[float], list[float]]:
-        x_edges = self._compute_bin_edges(x_min, x_max, x_bin_count, log_scale)
-        y_edges = self._compute_bin_edges(y_min, y_max, y_bin_count, log_scale)
+        x_edges = self._compute_bin_edges(x_min, x_max, x_bin_count)
+        y_edges = self._compute_bin_edges(y_min, y_max, y_bin_count)
 
         device = self._device_string(x_bin_indices)
         counts_tensor = lf.Tensor.zeros([x_bin_count * y_bin_count], dtype="int32", device=device)
@@ -2358,23 +2282,7 @@ class HistogramPanel(Panel):
             return []
 
         if self._log_scale_enabled:
-            # Density per cell — divide by the geometric area in value-space
-            # so wider log-bins don't dominate the heatmap.
-            x_widths = [
-                max(self._compare_x_edges[i + 1] - self._compare_x_edges[i], 1e-30)
-                for i in range(self._compare_x_bin_count)
-            ]
-            y_widths = [
-                max(self._compare_y_edges[i + 1] - self._compare_y_edges[i], 1e-30)
-                for i in range(self._compare_y_bin_count)
-            ]
-            display_counts = []
-            for y_bin in range(self._compare_y_bin_count):
-                for x_bin in range(self._compare_x_bin_count):
-                    idx = y_bin * self._compare_x_bin_count + x_bin
-                    display_counts.append(
-                        float(self._compare_counts[idx]) / (x_widths[x_bin] * y_widths[y_bin])
-                    )
+            display_counts = [math.log1p(float(count)) for count in self._compare_counts]
         else:
             display_counts = [float(count) for count in self._compare_counts]
 

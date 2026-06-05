@@ -736,7 +736,10 @@ def test_dom_card_ctrl_click_adds_to_multi_selection(asset_manager_panel_module)
     assert panel.get_selection_type() == "multiple"
 
 
-def test_dom_card_double_click_loads_asset(asset_manager_panel_module, monkeypatch):
+def test_dom_card_double_click_opens_dataset_import_panel(
+    asset_manager_panel_module,
+    monkeypatch,
+):
     panel = asset_manager_panel_module.AssetManagerPanel()
     panel._handle = _HandleStub()
     panel._asset_index = SimpleNamespace(
@@ -753,10 +756,12 @@ def test_dom_card_double_click_loads_asset(asset_manager_panel_module, monkeypat
         asset_manager_panel_module.os.path, "exists", lambda _path: True
     )
     monkeypatch.setattr(
-        asset_manager_panel_module.lf,
-        "load_file",
-        lambda *args, **kwargs: calls.append((args, kwargs)),
-        raising=False,
+        asset_manager_panel_module,
+        "open_dataset_import_panel",
+        lambda path, *, clear_scene_on_load=False: calls.append(
+            (path, clear_scene_on_load)
+        )
+        or True,
     )
 
     container = _ElementStub({"id": "asset-popup-content"})
@@ -769,14 +774,46 @@ def test_dom_card_double_click_loads_asset(asset_manager_panel_module, monkeypat
 
     panel._on_asset_manager_double_click(event)
 
-    assert calls == [
-        (
-            ("/tmp/bicycle",),
-            {"is_dataset": True, "output_path": "/tmp/bicycle/output"},
-        )
-    ]
+    assert calls == [("/tmp/bicycle", False)]
     assert panel.get_selected_asset_name() == "bicycle"
     assert event.stopped is True
+
+
+def test_dataset_load_new_opens_import_panel_with_scene_clear(
+    asset_manager_panel_module,
+    monkeypatch,
+):
+    panel = asset_manager_panel_module.AssetManagerPanel()
+    panel._handle = _HandleStub()
+    panel._asset_index = SimpleNamespace(
+        assets={"a1": _make_asset()},
+        folders={
+            "p1": {"id": "p1", "name": "Imported Datasets", "scene_ids": ["s1"]}
+        },
+        scenes={"s1": {"id": "s1", "name": "bicycle", "folder_id": "p1"}},
+        tags={},
+        collections={},
+    )
+    calls = []
+
+    monkeypatch.setattr(
+        asset_manager_panel_module.os.path,
+        "exists",
+        lambda _path: True,
+    )
+    monkeypatch.setattr(
+        asset_manager_panel_module,
+        "open_dataset_import_panel",
+        lambda path, *, clear_scene_on_load=False: calls.append(
+            (path, clear_scene_on_load)
+        )
+        or True,
+    )
+
+    panel._load_asset("a1", replace_scene=True)
+
+    assert calls == [("/tmp/bicycle", True)]
+    assert panel.get_selected_asset_name() == "bicycle"
 
 
 def test_dom_card_double_click_ignored_during_input_capture(

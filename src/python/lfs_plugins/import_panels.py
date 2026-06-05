@@ -107,11 +107,18 @@ __lfs_panel_ids__ = [
 ]
 
 
-def open_dataset_import_panel(dataset_path: str) -> bool:
+def open_dataset_import_panel(
+    dataset_path: str,
+    *,
+    clear_scene_on_load: bool = False,
+) -> bool:
     """Open the retained dataset import dialog for the given dataset path."""
     if _dataset_import_panel is None:
         return False
-    return _dataset_import_panel.show(dataset_path)
+    return _dataset_import_panel.show(
+        dataset_path,
+        clear_scene_on_load=clear_scene_on_load,
+    )
 
 
 def open_resume_checkpoint_panel(checkpoint_path: str) -> bool:
@@ -515,6 +522,7 @@ class DatasetImportPanel(_ImportDialogPanel):
         self._max_width = self.DEFAULT_MAX_WIDTH
         self._max_width_str = str(self.DEFAULT_MAX_WIDTH)
         self._apply_auto_crop = False
+        self._clear_scene_on_load = False
         self._last_lang = ""
 
     def on_bind_model(self, ctx):
@@ -559,10 +567,12 @@ class DatasetImportPanel(_ImportDialogPanel):
             return True
         return False
 
-    def show(self, dataset_path: str) -> bool:
+    def show(self, dataset_path: str, *, clear_scene_on_load: bool = False) -> bool:
+        self._clear_scene_on_load = False
         if not self._apply_dataset_path(dataset_path, reset_output=True):
             return False
 
+        self._clear_scene_on_load = bool(clear_scene_on_load)
         self._init_path = ""
         self._centralize_dataset = "off"
         self._max_width = self.DEFAULT_MAX_WIDTH
@@ -759,6 +769,10 @@ class DatasetImportPanel(_ImportDialogPanel):
 
         lf.ui.set_panel_enabled(self.id, False)
         register_catalog_asset_path(dataset_path, is_dataset=True, select=True)
+        clear_scene_on_load = self._clear_scene_on_load
+        self._clear_scene_on_load = False
+        if clear_scene_on_load:
+            lf.clear_scene()
         lf.load_file(
             dataset_path,
             is_dataset=True,
@@ -770,6 +784,7 @@ class DatasetImportPanel(_ImportDialogPanel):
         )
 
     def _on_do_cancel(self, _handle=None, _ev=None, _args=None):
+        self._clear_scene_on_load = False
         lf.ui.set_panel_enabled(self.id, False)
 
 

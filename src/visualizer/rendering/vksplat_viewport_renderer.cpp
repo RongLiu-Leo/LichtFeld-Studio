@@ -249,6 +249,12 @@ namespace lfs::vis {
                 {"rasterize_forward_plain", (root / "generated/rasterize_forward_plain.spv").string()},
                 {"rasterize_forward_3dgut_plain",
                  (root / "generated/rasterize_forward_3dgut_plain.spv").string()},
+                {"tile_batch_counts", (root / "generated/tile_batch_counts.spv").string()},
+                {"tile_batch_descriptors", (root / "generated/tile_batch_descriptors.spv").string()},
+                {"rasterize_forward_batches_plain",
+                 (root / "generated/rasterize_forward_batches_plain.spv").string()},
+                {"compose_tile_batches_plain",
+                 (root / "generated/compose_tile_batches_plain.spv").string()},
                 {"cumsum_single_pass", (root / "generated/cumsum_single_pass.spv").string()},
                 {"cumsum_block_scan", (root / "generated/cumsum_block_scan.spv").string()},
                 {"cumsum_scan_block_sums", (root / "generated/cumsum_scan_block_sums.spv").string()},
@@ -1016,6 +1022,14 @@ namespace lfs::vis {
             uniforms.image_height = static_cast<std::uint32_t>(frame_view.size.y);
             uniforms.grid_width = _CEIL_DIV(uniforms.image_width, TILE_WIDTH);
             uniforms.grid_height = _CEIL_DIV(uniforms.image_height, TILE_HEIGHT);
+            const glm::ivec2 camera_size =
+                frame_view.subregion_full_size.x > 0 && frame_view.subregion_full_size.y > 0
+                    ? frame_view.subregion_full_size
+                    : frame_view.size;
+            uniforms.render_origin_x = static_cast<std::uint32_t>(std::max(frame_view.subregion_origin.x, 0));
+            uniforms.render_origin_y = static_cast<std::uint32_t>(std::max(frame_view.subregion_origin.y, 0));
+            uniforms.camera_width = static_cast<std::uint32_t>(std::max(camera_size.x, 1));
+            uniforms.camera_height = static_cast<std::uint32_t>(std::max(camera_size.y, 1));
             uniforms.num_splats = static_cast<std::uint32_t>(num_splats);
             uniforms.active_sh = static_cast<std::uint32_t>(active_sh_degree);
             uniforms.shN_layout_slots = shN_layout_slots;
@@ -1029,8 +1043,8 @@ namespace lfs::vis {
                         : lfs::rendering::DEFAULT_ORTHO_SCALE;
                 uniforms.fx = ortho_scale;
                 uniforms.fy = ortho_scale;
-                uniforms.cx = static_cast<float>(frame_view.size.x) * 0.5f;
-                uniforms.cy = static_cast<float>(frame_view.size.y) * 0.5f;
+                uniforms.cx = static_cast<float>(camera_size.x) * 0.5f;
+                uniforms.cy = static_cast<float>(camera_size.y) * 0.5f;
             } else if (frame_view.intrinsics_override) {
                 const auto& intrinsics = *frame_view.intrinsics_override;
                 uniforms.fx = intrinsics.focal_x;
@@ -1039,11 +1053,11 @@ namespace lfs::vis {
                 uniforms.cy = intrinsics.center_y;
             } else {
                 const auto [fx, fy] = lfs::rendering::computePixelFocalLengths(
-                    frame_view.size, frame_view.focal_length_mm);
+                    camera_size, frame_view.focal_length_mm);
                 uniforms.fx = fx;
                 uniforms.fy = fy;
-                uniforms.cx = static_cast<float>(frame_view.size.x) * 0.5f;
-                uniforms.cy = static_cast<float>(frame_view.size.y) * 0.5f;
+                uniforms.cx = static_cast<float>(camera_size.x) * 0.5f;
+                uniforms.cy = static_cast<float>(camera_size.y) * 0.5f;
             }
 
             const glm::mat3 camera_to_world =
@@ -1077,7 +1091,7 @@ namespace lfs::vis {
             glm::vec4 background{0.0f, 0.0f, 0.0f, 1.0f};
             float depth_min = 0.0f;
             float depth_max = 1.0f;
-            float pad1 = 0.0f;
+            std::uint32_t depth_visualization_mode = 0;
             float pad2 = 0.0f;
         };
 
@@ -3093,7 +3107,8 @@ namespace lfs::vis {
         const bool transparent_background,
         const bool depth_view,
         const float depth_min,
-        const float depth_max) {
+        const float depth_max,
+        const lfs::rendering::DepthVisualizationMode depth_visualization_mode) {
         if (auto ok = ensureComposePipeline(context); !ok) {
             return ok;
         }
@@ -3228,6 +3243,7 @@ namespace lfs::vis {
             .background = glm::vec4(background, 1.0f),
             .depth_min = depth_min,
             .depth_max = depth_max,
+            .depth_visualization_mode = static_cast<std::uint32_t>(depth_visualization_mode),
         };
         vkCmdPushConstants(cmd,
                            compose_->pipeline_layout,
@@ -3356,6 +3372,28 @@ namespace lfs::vis {
         return std::make_shared<lfs::core::Tensor>(std::move(tensor));
     }
 
+    std::expected<std::shared_ptr<lfs::core::Tensor>, std::string>
+    VksplatViewportRenderer::readOutputImageRgba8(VulkanContext& context, const OutputSlot output_slot) const {
+        const auto size = latestOutputImageSize(output_slot);
+        if (!size) {
+            return std::unexpected(size.error());
+        }
+
+        auto tensor = lfs::core::Tensor::empty(
+            {static_cast<std::size_t>(size->y), static_cast<std::size_t>(size->x), std::size_t{4}},
+            lfs::core::Device::CPU,
+            lfs::core::DataType::UInt8);
+        if (!tensor.is_valid()) {
+            return std::unexpected("VkSplat output readback failed to allocate CPU uint8 RGBA tensor");
+        }
+
+        auto ok = readOutputImageIntoCpuHwc(context, output_slot, tensor, 0, 0);
+        if (!ok) {
+            return std::unexpected(ok.error());
+        }
+        return std::make_shared<lfs::core::Tensor>(std::move(tensor));
+    }
+
     std::expected<void, std::string> VksplatViewportRenderer::readOutputImageIntoCpuHwc(
         VulkanContext& context,
         const OutputSlot output_slot,
@@ -3365,13 +3403,13 @@ namespace lfs::vis {
         if (!destination.is_valid() ||
             destination.device() != lfs::core::Device::CPU ||
             destination.ndim() != 3 ||
-            destination.size(2) != 3 ||
+            (destination.size(2) != 3 && destination.size(2) != 4) ||
             !destination.is_contiguous()) {
-            return std::unexpected("VkSplat output readback destination must be a contiguous CPU HWC RGB tensor");
+            return std::unexpected("VkSplat output readback destination must be a contiguous CPU HWC RGB/RGBA tensor");
         }
         if (destination.dtype() != lfs::core::DataType::Float32 &&
             destination.dtype() != lfs::core::DataType::UInt8) {
-            return std::unexpected("VkSplat output readback destination must be float32 or uint8 RGB");
+            return std::unexpected("VkSplat output readback destination must be float32 or uint8 RGB/RGBA");
         }
         if (destination_x < 0 || destination_y < 0) {
             return std::unexpected("VkSplat output readback destination offset is negative");
@@ -3536,6 +3574,7 @@ namespace lfs::vis {
 
         const std::size_t src_row_pixels = static_cast<std::size_t>(output.size.x);
         const std::size_t dst_row_pixels = static_cast<std::size_t>(destination_width);
+        const std::size_t dst_channels = static_cast<std::size_t>(destination.size(2));
         if (destination.dtype() == lfs::core::DataType::Float32) {
             auto* const dst = static_cast<float*>(destination_data);
             for (int row = 0; row < output.size.y; ++row) {
@@ -3543,13 +3582,16 @@ namespace lfs::vis {
                 auto* const dst_row =
                     dst + ((static_cast<std::size_t>(destination_y + row) * dst_row_pixels +
                             static_cast<std::size_t>(destination_x)) *
-                           3u);
+                           dst_channels);
                 for (int col = 0; col < output.size.x; ++col) {
                     const std::size_t src = static_cast<std::size_t>(col) * 4u;
-                    const std::size_t dst_index = static_cast<std::size_t>(col) * 3u;
+                    const std::size_t dst_index = static_cast<std::size_t>(col) * dst_channels;
                     dst_row[dst_index] = static_cast<float>(src_row[src]) / 255.0f;
                     dst_row[dst_index + 1u] = static_cast<float>(src_row[src + 1u]) / 255.0f;
                     dst_row[dst_index + 2u] = static_cast<float>(src_row[src + 2u]) / 255.0f;
+                    if (dst_channels == 4u) {
+                        dst_row[dst_index + 3u] = static_cast<float>(src_row[src + 3u]) / 255.0f;
+                    }
                 }
             }
         } else {
@@ -3559,13 +3601,16 @@ namespace lfs::vis {
                 auto* const dst_row =
                     dst + ((static_cast<std::size_t>(destination_y + row) * dst_row_pixels +
                             static_cast<std::size_t>(destination_x)) *
-                           3u);
+                           dst_channels);
                 for (int col = 0; col < output.size.x; ++col) {
                     const std::size_t src = static_cast<std::size_t>(col) * 4u;
-                    const std::size_t dst_index = static_cast<std::size_t>(col) * 3u;
+                    const std::size_t dst_index = static_cast<std::size_t>(col) * dst_channels;
                     dst_row[dst_index] = src_row[src];
                     dst_row[dst_index + 1u] = src_row[src + 1u];
                     dst_row[dst_index + 2u] = src_row[src + 2u];
+                    if (dst_channels == 4u) {
+                        dst_row[dst_index + 3u] = src_row[src + 3u];
+                    }
                 }
             }
         }
@@ -3601,10 +3646,6 @@ namespace lfs::vis {
         }
         if (x < 0 || y < 0 || x >= output.size.x || y >= output.size.y) {
             return -1.0f;
-        }
-
-        if (!context.waitForSubmittedFrames()) {
-            return std::unexpected(context.lastError());
         }
 
         const VkDevice device = context.device();
@@ -4324,7 +4365,8 @@ namespace lfs::vis {
                         request.transparent_background,
                         request.depth_view,
                         request.depth_view_min,
-                        request.depth_view_max);
+                        request.depth_view_max,
+                        request.depth_visualization_mode);
                 }
             }
         } catch (const std::exception& e) {
@@ -4704,7 +4746,8 @@ namespace lfs::vis {
                         request.transparent_background,
                         request.depth_view,
                         request.depth_view_min,
-                        request.depth_view_max);
+                        request.depth_view_max,
+                        request.depth_visualization_mode);
                 }
             }
             // record/composePixelState timer scope ends here.

@@ -31,6 +31,10 @@ layout(set = 0, binding = 5) readonly buffer SelectionColors {
     vec4 selection_colors[];
 };
 
+layout(set = 0, binding = 6) readonly buffer DeletedMask {
+    uint deleted_mask[];
+};
+
 layout(push_constant) uniform PushConstants {
     mat4 view_proj;
     mat4 view;
@@ -49,6 +53,7 @@ const int FLAG_HAS_INDICES     = 1 << 4;
 const int FLAG_HAS_SELECTION   = 1 << 5;
 const int FLAG_HAS_PREVIEW     = 1 << 6;
 const int FLAG_PREVIEW_ADD     = 1 << 7;
+const int FLAG_HAS_DELETED     = 1 << 9;
 const uint SELECTION_GROUP_MAX = 255u;
 const uint SELECTION_PREVIEW_COLOR_INDEX = 256u;
 const float SELECTION_COMMITTED_BLEND = 0.75;
@@ -72,6 +77,12 @@ void reject() {
 }
 
 void main() {
+    if ((PC_FLAGS & FLAG_HAS_DELETED) != 0 &&
+        deleted_mask[gl_VertexIndex] != 0u) {
+        reject();
+        return;
+    }
+
     int t_idx = 0;
     if (PC_N_TRANSFORMS > 0) {
         if ((PC_FLAGS & FLAG_HAS_INDICES) != 0) {

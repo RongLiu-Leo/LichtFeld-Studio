@@ -584,6 +584,8 @@ namespace lfs::vis::gui {
         cache.texture = {};
         cache.width = 0;
         cache.height = 0;
+        cache.depends_on_preview_textures = false;
+        cache.preview_texture_generation = 0;
     }
 
     void RmlUIManager::clearVulkanQueue() {
@@ -617,6 +619,20 @@ namespace lfs::vis::gui {
             queue.clear();
             return;
         }
+
+        const auto previewDependencyChanged = [this](const CachedVulkanContextRender& cache) {
+            return cache.depends_on_preview_textures &&
+                   cache.preview_texture_generation !=
+                       vulkan_render_interface_->previewTextureGeneration();
+        };
+        const auto recordPreviewDependency = [this](CachedVulkanContextRender& cache,
+                                                    const bool saved) {
+            cache.depends_on_preview_textures =
+                saved && vulkan_render_interface_->currentContextUsedPreviewTexture();
+            cache.preview_texture_generation = cache.depends_on_preview_textures
+                                                   ? vulkan_render_interface_->previewTextureGeneration()
+                                                   : 0;
+        };
 
         for (const auto& command : queue) {
             if (!command.context)
@@ -657,7 +673,8 @@ namespace lfs::vis::gui {
                         std::abs(command.cache->clip_x1 - fleft) > 0.5f ||
                         std::abs(command.cache->clip_y1 - ftop) > 0.5f;
                     const bool refresh_cache =
-                        command.refresh_cache || command.cache->texture == 0 || region_changed;
+                        command.refresh_cache || command.cache->texture == 0 || region_changed ||
+                        previewDependencyChanged(*command.cache);
 
                     if (refresh_cache) {
                         lfs::core::ScopedTimer timer(timer_name + ".cache_refresh", 0.25);
@@ -681,6 +698,7 @@ namespace lfs::vis::gui {
                             command.cache->clip_y1 = ftop;
                             command.cache->clip_x2 = fright;
                             command.cache->clip_y2 = fbottom;
+                            recordPreviewDependency(*command.cache, saved);
                         }
                     }
 
@@ -713,7 +731,8 @@ namespace lfs::vis::gui {
                     command.refresh_cache ||
                     command.cache->texture == 0 ||
                     command.cache->width != command.cache_width ||
-                    command.cache->height != command.cache_height;
+                    command.cache->height != command.cache_height ||
+                    previewDependencyChanged(*command.cache);
                 if (refresh_cache) {
                     lfs::core::ScopedTimer timer(timer_name + ".cache_refresh", 0.25);
                     if (command.cache->texture != 0)
@@ -733,6 +752,7 @@ namespace lfs::vis::gui {
                         const bool saved = command.cache->texture != 0;
                         command.cache->width = saved ? command.cache_width : 0;
                         command.cache->height = saved ? command.cache_height : 0;
+                        recordPreviewDependency(*command.cache, saved);
                     }
                 }
 

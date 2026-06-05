@@ -44,6 +44,7 @@ def _install_lf_stub(monkeypatch, tmp_path):
         panel_enabled_calls=[],
         load_file_calls=[],
         load_checkpoint_calls=[],
+        clear_scene_calls=0,
         dataset_browse_path=str(tmp_path / "dataset_browse"),
         output_browse_path=str(tmp_path / "output_browse"),
         init_browse_path=str(tmp_path / "seed.ply"),
@@ -92,6 +93,11 @@ def _install_lf_stub(monkeypatch, tmp_path):
     lf_stub.detect_dataset_info = lambda path: state.dataset_infos[str(path)]
     lf_stub.is_dataset_path = lambda path: str(path) in state.dataset_infos
     lf_stub.optimization_params = lambda: None
+    lf_stub.clear_scene = lambda: setattr(
+        state,
+        "clear_scene_calls",
+        state.clear_scene_calls + 1,
+    )
     lf_stub.load_file = _load_file
     lf_stub.read_checkpoint_header = lambda _path: state.checkpoint_header
     lf_stub.read_checkpoint_params = lambda _path: state.checkpoint_params
@@ -230,6 +236,22 @@ def test_dataset_import_panel_show_and_load(import_dialog_module):
         }
     ]
     assert state.panel_enabled_calls[-1] == ("lfs.dataset_import", False)
+
+
+def test_dataset_import_panel_can_clear_scene_on_confirm(import_dialog_module):
+    module, state = import_dialog_module
+    panel = module.DatasetImportPanel()
+    panel._handle = _HandleStub()
+
+    assert (
+        panel.show(str(state.dataset_info.base_path), clear_scene_on_load=True)
+        is True
+    )
+
+    panel._on_do_load()
+
+    assert state.clear_scene_calls == 1
+    assert state.load_file_calls[0]["path"] == str(state.dataset_info.base_path)
 
 
 def test_dataset_import_panel_preserves_unicode_paths(import_dialog_module):

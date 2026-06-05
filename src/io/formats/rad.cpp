@@ -1569,7 +1569,10 @@ namespace lfs::io {
 
                 // Build LOD tree if the source doesn't have one.
                 if (!export_source->lod_tree || !export_source->lod_tree->has_tree()) {
-                    auto lod_result = lfs::core::build_bhatt_lod(*export_source);
+                    auto lod_progress = [&](float p, const std::string& stage) -> bool {
+                        return report_progress(p * 0.1f, stage);
+                    };
+                    auto lod_result = lfs::core::build_bhatt_lod(*export_source, 1.25f, lod_progress);
                     if (lod_result && (*lod_result)->lod_tree && (*lod_result)->lod_tree->has_tree()) {
                         lod_splat_data = std::move(**lod_result);
                         export_source = &lod_splat_data.value();

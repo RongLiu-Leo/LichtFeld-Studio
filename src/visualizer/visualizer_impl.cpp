@@ -17,7 +17,6 @@
 #include "operation/undo_history.hpp"
 #include "operator/operator_registry.hpp"
 #include "operator/ops/align_ops.hpp"
-#include "operator/ops/brush_ops.hpp"
 #include "operator/ops/edit_ops.hpp"
 #include "operator/ops/scene_ops.hpp"
 #include "operator/ops/selection_ops.hpp"
@@ -27,7 +26,6 @@
 #include "rendering/coordinate_conventions.hpp"
 #include "scene/scene_manager.hpp"
 #include "tools/align_tool.hpp"
-#include "tools/brush_tool.hpp"
 #include "tools/builtin_tools.hpp"
 #include "tools/selection_tool.hpp"
 #include "visualizer/app_store.hpp"
@@ -119,7 +117,6 @@ namespace lfs::vis {
         op::registerTransformOperators();
         op::registerAlignOperators();
         op::registerSelectionOperators();
-        op::registerBrushOperators();
         op::registerEditOperators();
         op::registerSceneOperators();
 
@@ -136,7 +133,6 @@ namespace lfs::vis {
         // Clear operator system
         op::unregisterEditOperators();
         op::unregisterSceneOperators();
-        op::unregisterBrushOperators();
         op::unregisterSelectionOperators();
         op::unregisterAlignOperators();
         op::unregisterTransformOperators();
@@ -144,7 +140,6 @@ namespace lfs::vis {
 
         callback_cleanup_.clear();
         trainer_manager_.reset();
-        brush_tool_.reset();
         tool_context_.reset();
         if (gui_manager_) {
             gui_manager_->shutdown();
@@ -167,14 +162,6 @@ namespace lfs::vis {
         // Connect tool context to input controller
         if (input_controller_) {
             input_controller_->setToolContext(tool_context_.get());
-        }
-
-        brush_tool_ = std::make_shared<tools::BrushTool>();
-        if (!brush_tool_->initialize(*tool_context_)) {
-            LOG_ERROR("Failed to initialize brush tool");
-            brush_tool_.reset();
-        } else if (input_controller_) {
-            input_controller_->setBrushTool(brush_tool_);
         }
 
         align_tool_ = std::make_shared<tools::AlignTool>();
@@ -1085,9 +1072,6 @@ namespace lfs::vis {
         // Update editor context state from scene/trainer
         editor_context_.update(scene_manager_.get(), trainer_manager_.get());
 
-        if (brush_tool_ && brush_tool_->isEnabled() && tool_context_) {
-            brush_tool_->update(*tool_context_);
-        }
         if (selection_tool_ && selection_tool_->isEnabled() && tool_context_) {
             selection_tool_->update(*tool_context_);
         }
@@ -1358,6 +1342,9 @@ namespace lfs::vis {
         }
 
         if (!viewport_export_locked) {
+            if (frame_demand.python_redraw && gui_manager_)
+                gui_manager_->syncVisiblePanelsBeforeSceneRender();
+
             const auto vulkan_frame = rendering_manager_->renderVulkanFrame(context);
             if (gui_manager_) {
                 if (vulkan_frame.external_image != VK_NULL_HANDLE) {
@@ -1480,12 +1467,6 @@ namespace lfs::vis {
                 trainer_manager_->waitForCompletion();
             }
             trainer_manager_.reset();
-        }
-
-        // Shutdown tools
-        if (brush_tool_) {
-            brush_tool_->shutdown();
-            brush_tool_.reset();
         }
 
         // Clean up tool context

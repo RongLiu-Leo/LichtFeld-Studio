@@ -30,6 +30,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -111,6 +112,12 @@ public:
 
     /// Called by RmlUi when a texture is required by the library.
     Rml::TextureHandle LoadTexture(Rml::Vector2i& texture_dimensions, const Rml::String& source) override;
+    [[nodiscard]] uint64_t previewTextureGeneration() const {
+        return m_preview_texture_generation.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] bool currentContextUsedPreviewTexture() const {
+        return m_current_context_used_preview_texture;
+    }
     /// Called by RmlUi when a texture is required to be built from an internally-generated sequence of pixels.
     Rml::TextureHandle GenerateTexture(Rml::Span<const Rml::byte> source_data, Rml::Vector2i source_dimensions) override;
     /// Called by RmlUi when a loaded texture is no longer required.
@@ -162,6 +169,7 @@ private:
         std::string m_vram_scope;
         std::string m_vram_label;
         VkDeviceSize m_vram_allocation_size = 0;
+        bool m_is_async_preview = false;
     };
 
     struct async_preview_result_t {
@@ -734,6 +742,7 @@ private:
     Rml::Vector2f m_context_offset;
     VkRect2D m_context_clip_scissor{};
     bool m_context_clip_enabled = false;
+    bool m_current_context_used_preview_texture = false;
     texture_data_t m_texture_depthstencil;
 
     Rml::Matrix4f m_projection;
@@ -746,6 +755,7 @@ private:
     Rml::Vector<VkShaderModule> m_shaders;
     Rml::Array<Rml::Vector<texture_data_t*>, kSwapchainBackBufferCount> m_pending_for_deletion_textures_by_frames;
     std::vector<std::shared_ptr<async_preview_state_t>> m_async_preview_textures;
+    std::atomic<uint64_t> m_preview_texture_generation{0};
     Rml::Vector<render_layer_t> m_render_layers;
     Rml::CompiledGeometryHandle m_texture_quad_geometry = {};
     float m_texture_quad_x = 0.0f;

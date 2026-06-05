@@ -239,6 +239,7 @@ namespace lfs::vis {
                                                  settings_.raster_backend, settings_.gut);
             settings_.gut = lfs::rendering::isGutBackend(settings_.raster_backend);
             enforceProjectionBackend(settings_);
+            sanitizeDepthViewSettings(settings_);
             settings_.grid_plane = clampGridPlane(settings_.grid_plane);
             if (split_view_service_.isIndependentDualActive(settings_)) {
                 if (grid_plane_changed) {
@@ -249,6 +250,9 @@ namespace lfs::vis {
             }
             markDirty(dirty_flags);
         }
+
+        auto& render_settings_generation = app_store().render_settings_generation;
+        render_settings_generation.set(render_settings_generation.get() + 1);
 
         if (clear_metrics) {
             invalidateCameraMetricsRequests(true);
@@ -572,7 +576,13 @@ namespace lfs::vis {
         const auto content_bounds = getContentBounds(glm::ivec2(
             std::max(static_cast<int>(viewport_size.x), 0),
             std::max(static_cast<int>(viewport_size.y), 0)));
-        return viewport_pos.x + content_bounds.x + content_bounds.width * settings_.split_position;
+        const int content_width = std::max(static_cast<int>(std::lround(content_bounds.width)), 0);
+        if (content_width <= 0) {
+            return std::nullopt;
+        }
+
+        return viewport_pos.x + content_bounds.x +
+               static_cast<float>(splitViewDividerPixel(content_width, settings_.split_position));
     }
 
     Viewport& RenderingManager::resolvePanelViewport(Viewport& primary_viewport, const SplitViewPanelId panel) {
