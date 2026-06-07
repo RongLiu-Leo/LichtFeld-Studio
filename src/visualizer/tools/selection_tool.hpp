@@ -64,7 +64,7 @@ namespace lfs::vis::tools {
 
         static constexpr float DEPTH_MIN = 0.01f;
         static constexpr float DEPTH_MAX = 1000.0f;
-        static constexpr float DEFAULT_DEPTH_FAR = 5.3f;
+        static constexpr float DEFAULT_DEPTH_FAR = 6.0f;
         static constexpr float DEFAULT_FRUSTUM_HALF_WIDTH = 1.35f;
 
         void applySelectionFilterSettings(const ToolContext& ctx) const;

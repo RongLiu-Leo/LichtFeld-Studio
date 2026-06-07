@@ -38,8 +38,7 @@
     color: @{text};
 }
 
-.viewport-transform-meta__target,
-.viewport-transform-group-label {
+.viewport-transform-meta__target {
     color: @{text_dim};
 }
 
@@ -47,7 +46,9 @@
     border-color: @{alpha(border,0.30)};
 }
 
-.viewport-transform-option-group {
+.viewport-transform-option-group,
+.viewport-transform-tool-group,
+.viewport-selection-tool-group {
     background-color: @{toolbar.sub_background};
     border-color: @{alpha(border,0.39)};
 }

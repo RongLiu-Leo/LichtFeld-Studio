@@ -253,8 +253,8 @@ def test_toolbar_binds_overlay_model_fields(toolbar_module):
     assert "show_transform_pivot_controls" in model.bound_funcs
     assert "show_crop_toolbar" in model.bound_funcs
     assert "toolbar_action" in model.bound_events
-    assert "selection_tool_label" in model.bound_funcs
-    assert "selection_mode_label" in model.bound_funcs
+    assert "selection_tool_label" not in model.bound_funcs
+    assert "selection_mode_label" not in model.bound_funcs
     assert "selection_depth_mode_active" in model.bound_funcs
     assert "selection_can_delete" in model.bound_funcs
     assert "selection_can_undo" in model.bound_funcs
@@ -372,7 +372,6 @@ def test_selection_tool_uses_centered_modes(toolbar_module, monkeypatch):
     controller = module._GizmoToolbarController()
     snapshot = controller.snapshot()
 
-    assert snapshot["show_selection_toolbar"] is False
     assert snapshot["show_transform_toolbar"] is False
     assert snapshot["show_mirror_toolbar"] is False
     assert snapshot["show_transform_space_controls"] is False
@@ -396,7 +395,6 @@ def test_selection_tool_uses_centered_modes(toolbar_module, monkeypatch):
     snapshot = controller.snapshot()
     assert state.active_tool == "builtin.select"
     assert state.active_submode == "lasso"
-    assert snapshot["show_selection_toolbar"] is True
     assert snapshot["selection_group_buttons"][0]["selected"] is True
     assert snapshot["selection_group_buttons"][0]["icon_src"] == "../icon/selection.png"
     assert next(button for button in snapshot["selection_mode_buttons"] if button["value"] == "lasso")["selected"] is True
@@ -518,6 +516,11 @@ def test_transform_and_mirror_tools_use_centered_subtool_rows(toolbar_module, mo
     assert snapshot["show_transform_pivot_controls"] is True
     assert next(button for button in snapshot["submode_buttons"] if button["value"] == "world")["selected"] is True
     assert next(button for button in snapshot["pivot_buttons"] if button["value"] == "origin")["selected"] is True
+
+    monkeypatch.setattr(lf_stub, "get_selected_node_names", lambda: ["target"], raising=False)
+    snapshot = controller.snapshot()
+    assert snapshot["show_transform_toolbar"] is False
+    assert next(button for button in snapshot["transform_tool_buttons"] if button["value"] == "builtin.translate")["selected"] is True
 
     controller.dispatch("submode", "local")
     controller.dispatch("pivot", "bounds")
@@ -669,8 +672,6 @@ def test_viewport_overlay_template_moves_tools_left_and_transform_numbers_center
     locale_dir = project_root / "src" / "visualizer" / "gui" / "resources" / "locales"
     transform_tooltip_keys = (
         "transform_panel",
-        "transform_tool",
-        "transform_target",
         "transform_bake",
         "transform_reset",
         "transform_position",
@@ -696,8 +697,6 @@ def test_viewport_overlay_template_moves_tools_left_and_transform_numbers_center
     )
     selection_tooltip_keys = (
         "selection_panel",
-        "selection_tool",
-        "selection_mode",
         "selection_depth_range",
         "selection_depth_near",
         "selection_depth_far",
@@ -733,11 +732,16 @@ def test_viewport_overlay_template_moves_tools_left_and_transform_numbers_center
     assert rml.count('data-attr-data-shortcut="button.shortcut_text"') == 26
     assert "data-attr-data-tooltip" not in rml
     assert 'data-attr-title="button.tooltip_text"' in rml
-    assert rml.count('data-for="button : selection_mode_buttons"') == 2
+    assert rml.count('data-for="button : selection_mode_buttons"') == 1
     assert rml.count('data-for="button : transform_group_buttons"') == 2
-    assert rml.count('data-for="button : transform_tool_buttons"') == 2
+    assert rml.count('data-for="button : transform_tool_buttons"') == 3
     assert 'id="selection-block"' in rml
     assert 'class="viewport-selection-overlay hidden"' in rml
+    assert 'class="viewport-selection-row"' in rml
+    assert 'class="viewport-selection-tool-group"' in rml
+    assert "{{selection_tool_label}}" not in rml
+    assert "{{selection_mode_label}}" not in rml
+    assert 'data-if="selection_depth_mode_active"' in rml
     assert 'data-event-click="selection_action(\'toggle_depth\')"' in rml
     assert 'data-event-click="selection_action(\'delete\')"' in rml
     assert 'data-event-click="selection_action(\'undo\')"' in rml
@@ -755,7 +759,7 @@ def test_viewport_overlay_template_moves_tools_left_and_transform_numbers_center
     assert "../icon/scene/x.png" in rml
     assert 'id="transform-block"' in rml
     assert 'class="viewport-transform-overlay hidden"' in rml
-    assert 'class="viewport-transform-header"' in rml
+    assert 'class="viewport-transform-row"' in rml
     assert 'class="viewport-transform-context"' in rml
     assert 'data-class-hidden="!show_transform_space_controls"' in rml
     assert 'data-class-hidden="!show_transform_pivot_controls"' in rml
@@ -863,7 +867,19 @@ def test_viewport_overlay_template_moves_tools_left_and_transform_numbers_center
     assert "line-height: 20dp;" in rcss
     assert "width: 64dp;" in rcss
     assert "width: 24dp;" in rcss
+    assert ".toolbar-vertical .icon-btn {\n    position: relative;\n    display: flex;" in rcss
+    assert "width: 30dp;\n    height: 30dp;\n    min-width: 30dp;\n    min-height: 30dp;" in rcss
+    assert ".toolbar-hcenter .toolbar-container {\n    align-items: center;\n    padding: 5dp 6dp;" in rcss
+    assert ".toolbar-hcenter .icon-btn {\n    display: flex;" in rcss
+    assert "width: 22dp;\n    height: 22dp;\n    min-width: 22dp;\n    min-height: 22dp;" in rcss
+    assert ".toolbar-hcenter .icon-btn img {\n    width: 17dp;\n    height: 17dp;" in rcss
     assert "margin: 8dp 0 7dp;" in rcss
+    assert ".viewport-transform-overlay {\n    position: absolute;\n    top: 5dp;" in rcss
+    assert ".viewport-selection-overlay {\n    position: absolute;\n    top: 5dp;" in rcss
+    assert "#depth-view-block .viewport-depth-panel {\n    padding: 5dp 6dp;" in rcss
+    assert "#depth-view-block .viewport-depth-mode-select {\n    height: 22dp;" in rcss
+    assert "#depth-view-block .viewport-depth-axis {\n    height: 22dp;" in rcss
+    assert "#depth-view-block .viewport-selection-depth-axis > .number-input.viewport-depth-input {\n    height: 22dp;" in rcss
     assert ".toolbar-flyout-trigger.hidden" not in rcss
     assert ".viewport-transform-overlay" in rcss
     assert ".viewport-selection-overlay" in rcss
