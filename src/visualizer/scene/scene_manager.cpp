@@ -3284,6 +3284,16 @@ namespace lfs::vis {
             unique_name = std::format("{} {}", desired_name.empty() ? "Simplified Splat" : desired_name, i);
         }
 
+        if (auto allocator = makeExternalSplatAllocator()) {
+            if (auto migrated = lfs::io::migrateSplatTensorsToAllocator(*model, allocator); !migrated) {
+                LOG_ERROR("Failed to prepare generated splat node '{}' for rendering: {}",
+                          unique_name,
+                          migrated.error().format());
+                return {};
+            }
+            scene_.setCombinedModelAllocator(std::move(allocator));
+        }
+
         const auto history_options = sceneGraphCaptureOptions(true, false);
         auto history_before = op::SceneGraphPatchEntry::captureState(*this, {}, history_options);
 
