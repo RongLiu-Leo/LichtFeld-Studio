@@ -20,35 +20,39 @@
   <div id="asset-shell" data-class-is-floating="is_floating">
     <div id="asset-popup">
       <div id="asset-popup-toolbar">
-        <div class="asset-search-box">
-          <span class="asset-search-icon">{{search_icon_label}}</span>
-          <input type="text" placeholder="{{search_placeholder}}" data-value="search_query" />
+        <div class="toolbar-row toolbar-row-primary">
+          <div class="asset-search-box">
+            <span class="asset-search-icon">{{search_icon_label}}</span>
+            <input type="text" placeholder="{{search_placeholder}}" data-value="search_query" />
+          </div>
+
+          <div class="asset-import-dropdown">
+            <button class="asset-import-button" data-event-click="toggle_import_menu">{{import_label}} ▼</button>
+            <div class="asset-import-menu" data-class-is-visible="import_menu_open">
+              <div class="asset-import-menu-item" data-event-click="on_import_dataset">{{import_dataset_label}}</div>
+              <div class="asset-import-menu-item" data-event-click="on_import_splat">{{import_splat_label}}</div>
+              <div class="asset-import-menu-item" data-event-click="on_import_mesh">{{import_mesh_label}}</div>
+              <div class="asset-import-menu-item" data-event-click="on_import_checkpoint">{{import_checkpoint_label}}</div>
+              <div class="asset-import-menu-separator"></div>
+              <div class="asset-import-menu-item" data-event-click="on_import_from_url">{{import_from_url_label}}</div>
+            </div>
+          </div>
         </div>
 
-        <button class="asset-sort-button" data-event-click="cycle_sort_mode">
-          <span>{{sort_label}}</span>
-        </button>
+        <div class="toolbar-row toolbar-row-secondary">
+          <button class="asset-sort-button" data-event-click="cycle_sort_mode">
+            <span>{{sort_label}}</span>
+          </button>
 
-        <div class="asset-view-toggle">
-          <button class="asset-view-button" data-class-is-active="is_gallery_view" data-event-click="set_view_mode('gallery')">{{gallery_label}}</button>
-          <button class="asset-view-button" data-class-is-active="is_list_view" data-event-click="set_view_mode('list')">{{list_label}}</button>
-        </div>
-
-        <div class="asset-import-dropdown">
-          <button class="asset-import-button" data-event-click="toggle_import_menu">{{import_label}} ▼</button>
-          <div class="asset-import-menu" data-class-is-visible="import_menu_open">
-            <div class="asset-import-menu-item" data-event-click="on_import_dataset">{{import_dataset_label}}</div>
-            <div class="asset-import-menu-item" data-event-click="on_import_splat">{{import_splat_label}}</div>
-            <div class="asset-import-menu-item" data-event-click="on_import_mesh">{{import_mesh_label}}</div>
-            <div class="asset-import-menu-item" data-event-click="on_import_checkpoint">{{import_checkpoint_label}}</div>
-            <div class="asset-import-menu-separator"></div>
-            <div class="asset-import-menu-item" data-event-click="on_import_from_url">{{import_from_url_label}}</div>
+          <div class="asset-view-toggle">
+            <button class="asset-view-button" data-class-is-active="is_gallery_view" data-event-click="set_view_mode('gallery')">{{gallery_label}}</button>
+            <button class="asset-view-button" data-class-is-active="is_list_view" data-event-click="set_view_mode('list')">{{list_label}}</button>
           </div>
         </div>
       </div>
 
       <div id="asset-main-row">
-        <div id="asset-sidebar" data-style-width="sidebar_width">
+        <div id="asset-sidebar" data-style-height="sidebar_height">
           <div class="asset-sidebar-inner">
           <div class="asset-sidebar-section">
             <div class="asset-sidebar-title" style="display: flex; justify-content: space-between; align-items: center; cursor: pointer;" data-event-click="toggle_folders_collapsed">

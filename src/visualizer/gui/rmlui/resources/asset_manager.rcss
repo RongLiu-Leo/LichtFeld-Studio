@@ -98,15 +98,31 @@
 
 #asset-popup-toolbar {
     display: flex;
-    flex-direction: row;
-    align-items: center;
+    flex-direction: column;
+    align-items: stretch;
     flex-shrink: 0;
-    gap: 10dp;
+    gap: 16dp;
     padding: 10dp 12dp;
     background-color: #2b2825;
     border-bottom-width: 1dp;
     border-bottom-color: #3c3630;
     min-height: 44dp;
+}
+
+.toolbar-row {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 8dp;
+    min-height: 0;
+}
+
+.toolbar-row-primary {
+    flex: 1;
+}
+
+.toolbar-row-secondary {
+    flex-shrink: 0;
 }
 
 .asset-search-box {
@@ -264,7 +280,7 @@
 #asset-main-row {
     flex: 1;
     display: flex;
-    flex-direction: row;
+    flex-direction: column;
     align-items: stretch;
     min-height: 0;
     min-width: 0;
@@ -272,15 +288,16 @@
 }
 
 #asset-sidebar {
-    width: 176dp;
-    min-width: 160dp;
-    min-height: 240dp;
+    height: 176dp;
+    min-height: 120dp;
+    max-height: 400dp;
     background-color: #2b2825;
-    border-right-width: 1dp;
-    border-right-color: #3c3630;
+    border-bottom-width: 1dp;
+    border-bottom-color: #3c3630;
     display: flex;
     flex-direction: column;
     overflow: hidden;
+    flex-shrink: 0;
 }
 
 .asset-sidebar-inner {
@@ -293,11 +310,12 @@
 }
 
 #sidebar-resize-handle {
-    width: 6dp;
-    min-width: 6dp;
-    cursor: ew-resize;
+    height: 6dp;
+    min-height: 6dp;
+    cursor: ns-resize;
     background-color: transparent;
     z-index: 10;
+    flex-shrink: 0;
 }
 
 #sidebar-resize-handle:hover {

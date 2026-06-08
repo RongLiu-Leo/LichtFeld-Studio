@@ -723,7 +723,7 @@ def test_dom_card_click_selects_asset_from_stable_parent(asset_manager_panel_mod
         collections={},
     )
 
-    container = _ElementStub({"id": "asset-popup-content"})
+    container = _ElementStub({"id": "asset-main-row"})
     card = _ElementStub(
         {"data-asset-id": "a1", "data-asset-action": "select"},
         parent=container,
@@ -754,7 +754,7 @@ def test_dom_card_ctrl_click_adds_to_multi_selection(asset_manager_panel_module)
         collections={},
     )
 
-    container = _ElementStub({"id": "asset-popup-content"})
+    container = _ElementStub({"id": "asset-main-row"})
     card_a1 = _ElementStub(
         {"data-asset-id": "a1", "data-asset-action": "select"},
         parent=container,
@@ -984,11 +984,11 @@ def test_bind_dom_event_listeners_registers_gallery_wheel_handler(
     asset_manager_panel_module,
 ):
     panel = asset_manager_panel_module.AssetManagerPanel()
-    content = _ElementStub({"id": "asset-popup-content"})
+    content = _ElementStub({"id": "asset-main-row"})
     gallery_scroll = _ElementStub({"id": "asset-gallery-scroll"})
     doc = _DocumentStub(
         {
-            "asset-popup-content": content,
+            "asset-main-row": content,
             "asset-gallery-scroll": gallery_scroll,
         }
     )

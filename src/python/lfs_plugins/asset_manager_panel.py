@@ -331,9 +331,9 @@ class AssetManagerPanel(Panel):
 
         # Panel resize drag state
         self._sidebar_dragging: bool = False
-        self._sidebar_drag_start_x: float = 0.0
-        self._sidebar_start_width: float = 176.0
-        self._sidebar_width: float = 176.0
+        self._sidebar_drag_start_y: float = 0.0
+        self._sidebar_start_height: float = 176.0
+        self._sidebar_height: float = 176.0
         self._right_panel_dragging: bool = False
         self._right_panel_drag_start_x: float = 0.0
         self._right_panel_start_width: float = 300.0
@@ -387,8 +387,8 @@ class AssetManagerPanel(Panel):
         model.bind_func("is_list_view", lambda: self._view_mode == "list")
         model.bind_func("sort_label", self.get_sort_label)
 
-        # Panel widths for resizable sidebar and info panel
-        model.bind_func("sidebar_width", lambda: f"{self._sidebar_width}dp")
+        # Panel dimensions for resizable sidebar and info panel
+        model.bind_func("sidebar_height", lambda: f"{self._sidebar_height}dp")
         model.bind_func("right_panel_width", lambda: f"{self._right_panel_width}dp")
         model.bind_func("bottom_panel_height", lambda: f"{self._bottom_panel_height}dp")
 
@@ -2618,22 +2618,22 @@ class AssetManagerPanel(Panel):
     def on_sidebar_resize_start(self, _handle, event, _args):
         """Start dragging the sidebar resize handle."""
         self._sidebar_dragging = True
-        self._sidebar_drag_start_x = float(event.get_parameter("mouse_x", "0"))
-        # Use the current width from instance variable
-        self._sidebar_start_width = self._sidebar_width
+        self._sidebar_drag_start_y = float(event.get_parameter("mouse_y", "0"))
+        # Use the current height from instance variable
+        self._sidebar_start_height = self._sidebar_height
         event.stop_propagation()
 
-    def on_sidebar_resize_delta(self, mouse_x: float) -> None:
-        """Update sidebar width during drag."""
+    def on_sidebar_resize_delta(self, mouse_y: float) -> None:
+        """Update sidebar height during drag."""
         if not self._sidebar_dragging:
             return
-        delta_x = mouse_x - self._sidebar_drag_start_x
-        new_width = self._sidebar_start_width + delta_x
-        # Enforce minimum width of 160dp
-        new_width = max(160.0, new_width)
-        self._sidebar_width = new_width
-        # The width is bound via data-style-width, so just dirty the model
-        self._dirty_model("sidebar_width")
+        delta_y = mouse_y - self._sidebar_drag_start_y
+        new_height = self._sidebar_start_height + delta_y
+        # Enforce minimum height of 120dp and maximum of 400dp
+        new_height = max(120.0, min(400.0, new_height))
+        self._sidebar_height = new_height
+        # The height is bound via data-style-height, so just dirty the model
+        self._dirty_model("sidebar_height")
 
     def on_sidebar_resize_end(self) -> None:
         """End sidebar resize drag."""
@@ -4212,7 +4212,7 @@ class AssetManagerPanel(Panel):
         Binding once to a stable parent mirrors the working popup panels and
         avoids relying on per-row data-event callbacks for card selection.
         """
-        content = doc.get_element_by_id("asset-popup-content")
+        content = doc.get_element_by_id("asset-main-row")
         if content:
             content.add_event_listener("mousedown", self._on_asset_manager_mousedown)
             content.add_event_listener("click", self._on_asset_manager_click)
