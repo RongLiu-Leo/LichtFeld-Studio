@@ -213,6 +213,25 @@ def test_asset_manager_requests_update_from_reactive_store(asset_manager_panel_m
     assert panel._handle.dirty_fields == ["__update__", "__update__"]
 
 
+def test_scan_status_transition_requests_model_update(asset_manager_panel_module, monkeypatch):
+    panel = asset_manager_panel_module.AssetManagerPanel()
+    requested = []
+    monkeypatch.setattr(panel, "_request_model_update", lambda: requested.append(True))
+
+    panel._set_scan_status("scanning")
+
+    assert panel.get_scan_status_visible() is True
+    assert panel.get_scan_status_label() == "asset_manager.status.scanning"
+    assert panel.get_scan_status_class() == "scan-status-scanning"
+    assert requested == [True]
+
+    panel._set_scan_status("idle")
+    assert panel.get_scan_status_class() == "scan-status-idle"
+    assert panel.get_scan_status_visible() is True
+    assert panel.get_scan_status_label() == "asset_manager.status.scanning"
+    assert requested == [True, True]
+
+
 def test_asset_rows_expose_scalar_tag_label(asset_manager_panel_module):
     panel = asset_manager_panel_module.AssetManagerPanel()
     row = panel._format_asset_for_ui(_make_asset())
@@ -303,6 +322,7 @@ def test_asset_manager_rml_uses_text_interpolation_for_display_values():
     assert "{{asset.display_name}}" in rml
     assert "{{selected_asset_name}}" in rml
     assert "{{selected_asset_dataset_image_count}}" in rml
+    assert "data-if=\"selected_asset_has_sh_degree\"" in rml
     assert 'data-style-decorator="asset.thumbnail_decorator"' in rml
 
 
@@ -589,6 +609,27 @@ def test_asset_selection_dirties_info_fields(asset_manager_panel_module):
     dirty = panel._handle.dirty_fields
     assert "selected_asset_path" in dirty or "__all__" in dirty
     assert "show_selection_asset" in dirty or "__all__" in dirty
+
+
+def test_selected_asset_sh_degree_is_visible_for_any_geometry_asset_type(
+    asset_manager_panel_module,
+):
+    panel = asset_manager_panel_module.AssetManagerPanel()
+    asset = _make_asset()
+    asset["type"] = "mesh"
+    asset["geometry_metadata"] = {"sh_degree": 0}
+    panel._asset_index = SimpleNamespace(
+        assets={"a1": asset},
+        folders={"p1": {"id": "p1", "name": "Imported Datasets", "scene_ids": ["s1"]}},
+        scenes={"s1": {"id": "s1", "name": "bicycle", "folder_id": "p1"}},
+        tags={},
+        collections={},
+    )
+    panel._selected_asset_ids = {"a1"}
+    panel._selection_type = "asset"
+
+    assert panel.get_selected_asset_has_sh_degree() is True
+    assert panel.get_selected_asset_sh_degree() == "0"
 
 
 def test_asset_selection_resolves_asset_id_from_clicked_element(asset_manager_panel_module):
@@ -916,6 +957,27 @@ def test_edit_watch_dirs_uses_clicked_folder_without_selecting_it(
 
     assert panel._selected_folder_id == "default"
     assert opened == ["target"]
+
+
+def test_repair_selected_folder_prefers_default_name_when_selection_is_stale(
+    asset_manager_panel_module,
+):
+    panel = asset_manager_panel_module.AssetManagerPanel()
+    panel._asset_index = SimpleNamespace(
+        assets={},
+        folders={
+            "zeta": {"id": "zeta", "name": "Zeta", "scene_ids": []},
+            "default": {"id": "default", "name": "Default", "scene_ids": []},
+        },
+        scenes={},
+        tags={},
+        collections={},
+    )
+    panel._selected_folder_id = "missing"
+    panel._selection_type = "folder"
+
+    assert panel._repair_selected_folder() == "default"
+    assert panel._selected_folder_id == "default"
 
 
 def test_bind_dom_event_listeners_registers_gallery_wheel_handler(

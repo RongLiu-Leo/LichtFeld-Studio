@@ -97,6 +97,9 @@
           <button class="asset-action-button" data-event-click="refresh_catalog" data-tooltip="asset_manager.tooltip.refresh">{{refresh_label}}</button>
           <button class="asset-action-button" data-event-click="clean_missing" data-tooltip="asset_manager.tooltip.clean_missing">{{clean_missing_label}}</button>
         </div>
+        <div class="asset-scan-status" data-if="scan_status_visible">
+          <span data-attr-class="scan_status_class">{{scan_status_label}}</span>
+        </div>
         </div>
       </div>
 
@@ -235,6 +238,10 @@
               <div class="parameter-row">
                 <span class="parameter-label">{{prop_points_label}}</span>
                 <span class="parameter-value">{{selected_asset_points}}</span>
+              </div>
+              <div class="parameter-row" data-if="selected_asset_has_sh_degree">
+                <span class="parameter-label">{{prop_sh_degree_label}}</span>
+                <span class="parameter-value">{{selected_asset_sh_degree}}</span>
               </div>
               <div class="parameter-row">
                 <span class="parameter-label">{{prop_size_label}}</span>
