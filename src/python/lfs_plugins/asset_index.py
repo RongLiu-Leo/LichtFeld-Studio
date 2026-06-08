@@ -578,25 +578,34 @@ class AssetIndex:
         if folder_id not in self._folders:
             return False
 
-        # Delete associated scenes
-        scenes_to_delete = [
+        now = datetime.now().isoformat()
+        scenes_to_delete = {
             sid for sid, s in self._scenes.items() if s.folder_id == folder_id
-        ]
-        for sid in scenes_to_delete:
-            self.delete_scene(sid)
-
-        # Delete associated assets (not tied to scenes)
-        assets_to_delete = [
+        }
+        assets_to_delete = {
             aid
             for aid, a in self._assets.items()
-            if a.folder_id == folder_id and a.scene_id is None
-        ]
+            if a.folder_id == folder_id or a.scene_id in scenes_to_delete
+        }
+
+        for scene in self._scenes.values():
+            if scene.dataset_asset_id in assets_to_delete:
+                scene.dataset_asset_id = None
+                scene.modified_at = now
         for aid in assets_to_delete:
             del self._assets[aid]
 
-        del self._folders[folder_id]
-        self.save()
-        return True
+        for sid in scenes_to_delete:
+            del self._scenes[sid]
+
+        if folder_id == DEFAULT_FOLDER_ID:
+            folder = self._folders[folder_id]
+            folder.scene_ids = []
+            folder.modified_at = now
+        else:
+            del self._folders[folder_id]
+        self.rebuild_tag_index(save=False)
+        return self.save()
 
     @_synchronized
     def get_folder(self, folder_id: str) -> Optional[Folder]:
@@ -842,6 +851,9 @@ class AssetIndex:
         created_at: Optional[str] = None,
         modified_at: Optional[str] = None,
         exists: Optional[bool] = None,
+        save: bool = True,
+        check_existing: bool = True,
+        rebuild_tags: bool = True,
     ) -> Optional[Asset]:
         """Create a new asset.
 
@@ -867,42 +879,45 @@ class AssetIndex:
             return None
 
         normalized_abs_path = os.path.abspath(absolute_path or path)
-        existing_asset = self.find_asset_by_path(
-            normalized_abs_path,
-            folder_id=folder_id,
-        )
-        if existing_asset is not None:
-            merged_tags = list(
-                dict.fromkeys((existing_asset.tags or []) + (tags or []))
+        if check_existing:
+            existing_asset = self.find_asset_by_path(
+                normalized_abs_path,
+                folder_id=folder_id,
             )
-            updated = self.update_asset(
-                existing_asset.id,
-                folder_id=folder_id
-                if folder_id is not None
-                else existing_asset.folder_id,
-                scene_id=scene_id if scene_id is not None else existing_asset.scene_id,
-                name=name or existing_asset.name,
-                type=type or existing_asset.type,
-                role=role or existing_asset.role,
-                path=path,
-                absolute_path=normalized_abs_path,
-                file_size_bytes=file_size_bytes or existing_asset.file_size_bytes,
-                thumbnail_path=thumbnail_path
-                if thumbnail_path is not None
-                else existing_asset.thumbnail_path,
-                geometry_metadata=geometry_metadata
-                if geometry_metadata is not None
-                else existing_asset.geometry_metadata,
-                dataset_metadata=dataset_metadata
-                if dataset_metadata is not None
-                else existing_asset.dataset_metadata,
-                tags=merged_tags,
-                created_at=created_at or existing_asset.created_at,
-                exists=os.path.exists(normalized_abs_path)
-                if exists is None
-                else exists,
-            )
-            return updated
+            if existing_asset is not None:
+                merged_tags = list(
+                    dict.fromkeys((existing_asset.tags or []) + (tags or []))
+                )
+                updated = self.update_asset(
+                    existing_asset.id,
+                    folder_id=folder_id
+                    if folder_id is not None
+                    else existing_asset.folder_id,
+                    scene_id=scene_id if scene_id is not None else existing_asset.scene_id,
+                    name=name or existing_asset.name,
+                    type=type or existing_asset.type,
+                    role=role or existing_asset.role,
+                    path=path,
+                    absolute_path=normalized_abs_path,
+                    file_size_bytes=file_size_bytes or existing_asset.file_size_bytes,
+                    thumbnail_path=thumbnail_path
+                    if thumbnail_path is not None
+                    else existing_asset.thumbnail_path,
+                    geometry_metadata=geometry_metadata
+                    if geometry_metadata is not None
+                    else existing_asset.geometry_metadata,
+                    dataset_metadata=dataset_metadata
+                    if dataset_metadata is not None
+                    else existing_asset.dataset_metadata,
+                    tags=merged_tags,
+                    created_at=created_at or existing_asset.created_at,
+                    exists=os.path.exists(normalized_abs_path)
+                    if exists is None
+                    else exists,
+                    save=save,
+                    rebuild_tags=rebuild_tags,
+                )
+                return updated
 
         asset = Asset(
             id=str(uuid.uuid4()),
@@ -929,16 +944,25 @@ class AssetIndex:
         if scene_id and scene_id in self._scenes:
             self._scenes[scene_id].modified_at = datetime.now().isoformat()
 
-        self.rebuild_tag_index(save=False)
-        if not self.save():
-            _log.error("Failed to save library during asset creation for %s", asset.id)
-            # Clean up in-memory state to maintain consistency with disk
-            del self._assets[asset.id]
-            return None
+        if rebuild_tags:
+            self.rebuild_tag_index(save=False)
+        if save:
+            if not self.save():
+                _log.error("Failed to save library during asset creation for %s", asset.id)
+                # Clean up in-memory state to maintain consistency with disk
+                del self._assets[asset.id]
+                return None
         return asset
 
     @_synchronized
-    def update_asset(self, asset_id: str, **kwargs) -> Optional[Asset]:
+    def update_asset(
+        self,
+        asset_id: str,
+        *,
+        save: bool = True,
+        rebuild_tags: bool = True,
+        **kwargs,
+    ) -> Optional[Asset]:
         """Update an asset.
 
         Args:
@@ -957,10 +981,12 @@ class AssetIndex:
             if hasattr(asset, key):
                 setattr(asset, key, value)
         asset.modified_at = explicit_modified_at or datetime.now().isoformat()
-        self.rebuild_tag_index(save=False)
-        if not self.save():
-            _log.error("Failed to save library during asset update for %s", asset_id)
-            return None
+        if rebuild_tags:
+            self.rebuild_tag_index(save=False)
+        if save:
+            if not self.save():
+                _log.error("Failed to save library during asset update for %s", asset_id)
+                return None
         return asset
 
     @_synchronized

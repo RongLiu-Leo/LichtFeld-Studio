@@ -113,9 +113,7 @@
           <div class="asset-sidebar-actions">
             <button class="asset-action-button" data-event-click="refresh_catalog" data-tooltip="asset_manager.tooltip.refresh">{{refresh_label}}</button>
             <button class="asset-action-button" data-event-click="clean_missing" data-tooltip="asset_manager.tooltip.clean_missing">{{clean_missing_label}}</button>
-          </div>
-          <div class="asset-scan-status" data-if="scan_status_visible">
-            <span data-attr-class="scan_status_class">{{scan_status_label}}</span>
+
           </div>
           </div>
         </div>
@@ -126,89 +124,98 @@
           <div class="asset-gallery-header">
             <span class="asset-gallery-title" data-if="is_gallery_view">{{gallery_title}}</span>
             <span class="asset-gallery-title" data-if="is_list_view">{{list_title}}</span>
-          </div>
+          <span class="asset-gallery-subtitle" data-if="asset_results_summary_visible">{{asset_results_summary}}</span>
+        </div>
 
           <div id="asset-gallery-scroll" class="asset-gallery-scroll">
-            <div class="asset-card-grid" data-if="is_gallery_view">
-              <div data-for="asset : assets">
-                <div class="asset-card" data-class-is-selected="asset.is_selected" data-class-is-missing="!asset.exists" data-attr-data-asset-id="asset.id" data-asset-action="select">
-                  <div data-attr-class="'asset-card-thumb ' + asset.thumb_class" data-style-decorator="asset.thumbnail_decorator">
-                    <div class="asset-card-overlay">
-                      <span data-attr-class="'asset-pill ' + asset.pill_class">{{asset.type_label}}</span>
-                    </div>
-                  </div>
-                  <div class="asset-card-body">
-                    <div class="asset-card-title-row">
-                      <span class="asset-card-title">{{asset.display_name}}</span>
-                    </div>
-                    <div class="asset-card-subtitle">{{asset.display_subtitle}}</div>
-                    <div class="asset-card-meta">
-                      <span>{{asset.role_label}}</span>
-                      <span data-if="asset.points_label">{{asset.points_label}}</span>
-                      <span>{{asset.size_label}}</span>
-                    </div>
-                    <div class="asset-card-tags" data-if="asset.tags_label">
-                      <span class="asset-card-tag">{{asset.tags_label}}</span>
-                    </div>
-                    <div class="asset-card-actions">
-                      <button class="asset-card-button" data-attr-data-asset-id="asset.id" data-asset-action="load">{{load_button_label}}</button>
-                    </div>
-                  </div>
-                  <button class="asset-card-menu" data-attr-data-asset-id="asset.id" data-asset-action="menu"><img src="../icon/more-vertical.png" /></button>
-                  <div class="asset-load-menu" data-class-is-visible="asset.load_menu_open">
-                    <div class="asset-dropdown-item" data-if="asset.can_load" data-attr-data-asset-id="asset.id" data-asset-action="load_new">{{load_new_label}}</div>
-                    <div class="asset-dropdown-item" data-if="asset.can_load" data-attr-data-asset-id="asset.id" data-asset-action="add_to_scene">{{add_to_scene_label}}</div>
-                    <div class="asset-dropdown-item is-danger" data-attr-data-asset-id="asset.id" data-asset-action="remove_from_menu">{{remove_from_catalog_label}}</div>
-                  </div>
-                  <div class="asset-card-dropdown" data-class-is-visible="asset.menu_open">
-                    <div data-if="asset.type != 'dataset'">
-                      <div class="asset-dropdown-item" data-attr-data-asset-id="asset.id" data-asset-action="update_thumbnail">{{update_thumbnail_label}}</div>
-                    </div>
-                    <div class="asset-dropdown-item" data-attr-data-asset-id="asset.id" data-asset-action="rename">{{rename_label}}</div>
-                    <div class="asset-dropdown-item has-submenu" data-attr-data-asset-id="asset.id">
-                      <span>{{move_to_folder_label}}</span>
-                      <span class="submenu-arrow">&#x203A;</span>
-                      <div class="asset-dropdown-submenu">
-                        <div class="asset-dropdown-item" data-attr-data-asset-id="asset.id" data-asset-action="create_folder">{{new_folder_label}}</div>
-                        <div class="asset-submenu-divider"></div>
-                        <div data-for="folder : move_menu_folders">
-                          <div class="asset-dropdown-item folder-option" data-attr-data-asset-id="asset.id" data-attr-data-folder-id="folder.id" data-asset-action="move_to_existing_folder">{{folder.name}}</div>
-                        </div>
+            <div class="asset-scroll-shell asset-scroll-shell-gallery" data-if="is_gallery_view">
+              <div id="asset-card-grid" class="asset-card-grid">
+                <div class="asset-card-slot" data-style-width="asset_card_slot_width" data-for="asset : assets">
+                  <div class="asset-card" data-class-is-selected="asset.is_selected" data-class-is-missing="!asset.exists" data-attr-data-asset-id="asset.id" data-asset-action="select">
+                    <div data-attr-class="'asset-card-thumb ' + asset.thumb_class" data-style-decorator="asset.thumbnail_decorator">
+                      <div class="asset-card-overlay">
+                        <span data-attr-class="'asset-pill ' + asset.pill_class">{{asset.type_label}}</span>
                       </div>
                     </div>
-                    <div class="asset-dropdown-item" data-attr-data-asset-id="asset.id" data-asset-action="show_in_folder">{{show_in_folder_label}}</div>
-                    <div class="asset-dropdown-item is-danger" data-attr-data-asset-id="asset.id" data-asset-action="remove_from_menu">{{remove_label}}</div>
+                    <div class="asset-card-body">
+                      <div class="asset-card-title-row">
+                        <span class="asset-card-title">{{asset.display_name}}</span>
+                      </div>
+                      <div class="asset-card-subtitle">{{asset.display_subtitle}}</div>
+                      <div class="asset-card-meta">
+                        <span>{{asset.role_label}}</span>
+                        <span data-if="asset.points_label">{{asset.points_label}}</span>
+                        <span>{{asset.size_label}}</span>
+                      </div>
+                      <div class="asset-card-tags" data-if="asset.tags_label">
+                        <span class="asset-card-tag">{{asset.tags_label}}</span>
+                      </div>
+                      <div class="asset-card-actions">
+                        <button class="asset-card-button" data-attr-data-asset-id="asset.id" data-asset-action="load">{{load_button_label}}</button>
+                      </div>
+                    </div>
+                    <button class="asset-card-menu" data-attr-data-asset-id="asset.id" data-asset-action="menu"><img src="../icon/more-vertical.png" /></button>
+                    <div class="asset-load-menu" data-class-is-visible="asset.load_menu_open">
+                      <div class="asset-dropdown-item" data-if="asset.can_load" data-attr-data-asset-id="asset.id" data-asset-action="load_new">{{load_new_label}}</div>
+                      <div class="asset-dropdown-item" data-if="asset.can_load" data-attr-data-asset-id="asset.id" data-asset-action="add_to_scene">{{add_to_scene_label}}</div>
+                      <div class="asset-dropdown-item is-danger" data-attr-data-asset-id="asset.id" data-asset-action="remove_from_menu">{{remove_from_catalog_label}}</div>
+                    </div>
+                    <div class="asset-card-dropdown" data-class-is-visible="asset.menu_open">
+                      <div data-if="asset.type != 'dataset'">
+                        <div class="asset-dropdown-item" data-attr-data-asset-id="asset.id" data-asset-action="update_thumbnail">{{update_thumbnail_label}}</div>
+                      </div>
+                      <div class="asset-dropdown-item" data-attr-data-asset-id="asset.id" data-asset-action="rename">{{rename_label}}</div>
+                      <div class="asset-dropdown-item has-submenu" data-attr-data-asset-id="asset.id">
+                        <span>{{move_to_folder_label}}</span>
+                        <span class="submenu-arrow">&#x203A;</span>
+                        <div class="asset-dropdown-submenu">
+                          <div class="asset-dropdown-item" data-attr-data-asset-id="asset.id" data-asset-action="create_folder">{{new_folder_label}}</div>
+                          <div class="asset-submenu-divider"></div>
+                          <div data-for="folder : move_menu_folders">
+                            <div class="asset-dropdown-item folder-option" data-attr-data-asset-id="asset.id" data-attr-data-folder-id="folder.id" data-asset-action="move_to_existing_folder">{{folder.name}}</div>
+                          </div>
+                        </div>
+                      </div>
+                      <div class="asset-dropdown-item" data-attr-data-asset-id="asset.id" data-asset-action="show_in_folder">{{show_in_folder_label}}</div>
+                      <div class="asset-dropdown-item is-danger" data-attr-data-asset-id="asset.id" data-asset-action="remove_from_menu">{{remove_label}}</div>
+                    </div>
                   </div>
                 </div>
               </div>
             </div>
 
-            <div class="asset-list-view" data-if="is_list_view">
-            <div class="asset-list-header">
-              <span class="asset-col asset-col-name">{{col_name_label}}</span>
-              <span class="asset-col asset-col-type">{{col_type_label}}</span>
-              <span class="asset-col asset-col-folder">{{col_folder_label}}</span>
-              <span class="asset-col asset-col-size">{{col_size_label}}</span>
-              <span class="asset-col asset-col-modified">{{col_modified_label}}</span>
-            </div>
-              <div data-for="asset : assets">
-                <div class="asset-list-row" data-class-is-selected="asset.is_selected" data-class-is-missing="!asset.exists" data-attr-data-asset-id="asset.id" data-asset-action="select">
-                  <span class="asset-col asset-col-name">
-                    <span class="asset-list-primary">{{asset.display_name}}</span>
-                    <span class="asset-list-secondary">{{asset.display_subtitle}}</span>
-                  </span>
-                  <span class="asset-col asset-col-type">{{asset.type_label}}</span>
-                  <span class="asset-col asset-col-folder">{{asset.folder_name}}</span>
-                  <span class="asset-col asset-col-size">{{asset.size_label}}</span>
-                  <span class="asset-col asset-col-modified">{{asset.modified_label}}</span>
-                  <div class="asset-load-menu" data-class-is-visible="asset.load_menu_open">
-                    <div class="asset-dropdown-item" data-if="asset.can_load" data-attr-data-asset-id="asset.id" data-asset-action="load_new">{{load_new_label}}</div>
-                    <div class="asset-dropdown-item" data-if="asset.can_load" data-attr-data-asset-id="asset.id" data-asset-action="add_to_scene">{{add_to_scene_label}}</div>
-                    <div class="asset-dropdown-item is-danger" data-attr-data-asset-id="asset.id" data-asset-action="remove_from_menu">{{remove_from_catalog_label}}</div>
+            <div class="asset-scroll-shell asset-scroll-shell-list" data-if="is_list_view">
+              <div id="asset-list-view" class="asset-list-view">
+                <div class="asset-list-header">
+                  <span class="asset-col asset-col-name">{{col_name_label}}</span>
+                  <span class="asset-col asset-col-type">{{col_type_label}}</span>
+                  <span class="asset-col asset-col-folder">{{col_folder_label}}</span>
+                  <span class="asset-col asset-col-size">{{col_size_label}}</span>
+                  <span class="asset-col asset-col-modified">{{col_modified_label}}</span>
+                </div>
+                <div data-for="asset : assets">
+                  <div class="asset-list-row" data-class-is-selected="asset.is_selected" data-class-is-missing="!asset.exists" data-attr-data-asset-id="asset.id" data-asset-action="select">
+                    <span class="asset-col asset-col-name">
+                      <span class="asset-list-primary">{{asset.display_name}}</span>
+                      <span class="asset-list-secondary">{{asset.display_subtitle}}</span>
+                    </span>
+                    <span class="asset-col asset-col-type">{{asset.type_label}}</span>
+                    <span class="asset-col asset-col-folder">{{asset.folder_name}}</span>
+                    <span class="asset-col asset-col-size">{{asset.size_label}}</span>
+                    <span class="asset-col asset-col-modified">{{asset.modified_label}}</span>
+                    <div class="asset-load-menu" data-class-is-visible="asset.load_menu_open">
+                      <div class="asset-dropdown-item" data-if="asset.can_load" data-attr-data-asset-id="asset.id" data-asset-action="load_new">{{load_new_label}}</div>
+                      <div class="asset-dropdown-item" data-if="asset.can_load" data-attr-data-asset-id="asset.id" data-asset-action="add_to_scene">{{add_to_scene_label}}</div>
+                      <div class="asset-dropdown-item is-danger" data-attr-data-asset-id="asset.id" data-asset-action="remove_from_menu">{{remove_from_catalog_label}}</div>
+                    </div>
                   </div>
                 </div>
               </div>
             </div>
+          </div>
+
+          <div class="asset-results-footer" data-if="asset_results_more_visible">
+            <button class="asset-show-more-button" data-event-click="show_more_assets">{{show_more_assets_label}}</button>
           </div>
         </div>
       </div>
