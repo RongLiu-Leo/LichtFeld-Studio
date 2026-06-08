@@ -34,7 +34,7 @@ def _install_lf_stub(monkeypatch):
 
     lf_stub = ModuleType("lichtfeld")
     lf_stub.ui = SimpleNamespace(
-        PanelSpace=SimpleNamespace(FLOATING="FLOATING"),
+        PanelSpace=SimpleNamespace(FLOATING="FLOATING", BOTTOM_DOCK="BOTTOM_DOCK", LEFT_DOCK="LEFT_DOCK"),
         PanelHeightMode=SimpleNamespace(FILL="FILL", CONTENT="CONTENT"),
         tr=lambda key: key,
     )

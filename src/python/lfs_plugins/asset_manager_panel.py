@@ -85,7 +85,7 @@ class AssetManagerPanel(Panel):
 
     id = "lfs.asset_manager"
     label = "Asset Manager"
-    space = lf.ui.PanelSpace.FLOATING
+    space = lf.ui.PanelSpace.LEFT_DOCK
     order = 20
     template = "rmlui/asset_manager.rml"
     height_mode = lf.ui.PanelHeightMode.FILL
@@ -339,6 +339,15 @@ class AssetManagerPanel(Panel):
         self._right_panel_start_width: float = 300.0
         self._right_panel_width: float = 300.0
 
+        self._bottom_panel_dragging: bool = False
+        self._bottom_panel_drag_start_y: float = 0.0
+        self._bottom_panel_start_height: float = 220.0
+        self._bottom_panel_height: float = 220.0
+
+        # Dock state tracking (mirror histogram_panel pattern)
+        self._panel_space = lf.ui.PanelSpace.LEFT_DOCK
+        self._is_floating = False
+
     # ── Initialization ────────────────────────────────────────
 
     def _initialize_backend(self):
@@ -381,6 +390,7 @@ class AssetManagerPanel(Panel):
         # Panel widths for resizable sidebar and info panel
         model.bind_func("sidebar_width", lambda: f"{self._sidebar_width}dp")
         model.bind_func("right_panel_width", lambda: f"{self._right_panel_width}dp")
+        model.bind_func("bottom_panel_height", lambda: f"{self._bottom_panel_height}dp")
 
         # Active states
         model.bind_func("active_filters", self.get_active_filters)
@@ -397,6 +407,11 @@ class AssetManagerPanel(Panel):
 
         # Panel label for floating window template
         model.bind_func("panel_label", lambda: tr("asset_manager.panel_title"))
+
+        # Dock state (mirror histogram_panel pattern)
+        model.bind_func("is_floating", lambda: self._is_floating)
+        model.bind_func("dock_toggle_label", self._dock_toggle_label)
+        model.bind_func("close_label", lambda: tr("common.close"))
 
         # Import menu state
         model.bind_func("import_menu_open", self.get_import_menu_open)
@@ -642,6 +657,7 @@ class AssetManagerPanel(Panel):
         # Panel resize event handlers
         model.bind_event("on_sidebar_resize_start", self.on_sidebar_resize_start)
         model.bind_event("on_right_panel_resize_start", self.on_right_panel_resize_start)
+        model.bind_event("on_bottom_panel_resize_start", self.on_bottom_panel_resize_start)
 
         # New folder event handlers
         model.bind_event("toggle_new_folder_menu", self.toggle_new_folder_menu)
@@ -656,6 +672,10 @@ class AssetManagerPanel(Panel):
         model.bind_func("filters_expanded", self.get_filters_expanded)
         model.bind_event("toggle_folders_collapsed", self.toggle_folders_collapsed)
         model.bind_event("toggle_filters_collapsed", self.toggle_filters_collapsed)
+
+        # Dock toggle / close events
+        model.bind_event("toggle_dock_mode", self._on_toggle_dock_mode)
+        model.bind_event("close_panel", self._on_close_panel)
 
     # ── Data Retrieval Methods ─────────────────────────────────
 
@@ -2643,6 +2663,28 @@ class AssetManagerPanel(Panel):
         """End right panel resize drag."""
         self._right_panel_dragging = False
 
+    def on_bottom_panel_resize_start(self, _handle, event, _args):
+        """Start dragging the bottom panel resize handle."""
+        self._bottom_panel_dragging = True
+        self._bottom_panel_drag_start_y = float(event.get_parameter("mouse_y", "0"))
+        self._bottom_panel_start_height = self._bottom_panel_height
+        event.stop_propagation()
+
+    def on_bottom_panel_resize_delta(self, mouse_y: float) -> None:
+        """Update bottom panel height during drag."""
+        if not self._bottom_panel_dragging:
+            return
+        delta_y = self._bottom_panel_drag_start_y - mouse_y
+        new_height = self._bottom_panel_start_height + delta_y
+        # Enforce min/max height
+        new_height = max(120.0, min(400.0, new_height))
+        self._bottom_panel_height = new_height
+        self._dirty_model("bottom_panel_height")
+
+    def on_bottom_panel_resize_end(self) -> None:
+        """End bottom panel resize drag."""
+        self._bottom_panel_dragging = False
+
     def on_import_splat(self, _handle, _ev, args):
         """Import a splat/point-cloud file (PLY, SOG, SPZ, USD formats)."""
         if not self._asset_index:
@@ -3981,6 +4023,7 @@ class AssetManagerPanel(Panel):
         self._doc = doc
         set_active_asset_manager_panel(self)
         self._bind_dom_event_listeners(doc)
+        self._sync_panel_space_state()
 
         # Initialize backend
         backend_ok = self._initialize_backend()
@@ -4026,6 +4069,11 @@ class AssetManagerPanel(Panel):
     def on_update(self, doc):
         """Dirty-policy update for catalog and deferred scene work."""
         changed = False
+
+        space_changed = self._sync_panel_space_state()
+        if space_changed and self._handle:
+            self._handle.dirty_all()
+            changed = True
 
         language_generation = RuntimeState.language_generation.value
         if language_generation != self._last_language_generation:
@@ -4463,6 +4511,7 @@ class AssetManagerPanel(Panel):
         """Handle mousemove for panel resizing."""
         try:
             mouse_x = float(event.get_parameter("mouse_x", "0"))
+            mouse_y = float(event.get_parameter("mouse_y", "0"))
         except (TypeError, ValueError):
             return
         if self._sidebar_dragging:
@@ -4471,11 +4520,15 @@ class AssetManagerPanel(Panel):
         elif self._right_panel_dragging:
             self.on_right_panel_resize_delta(mouse_x)
             event.stop_propagation()
+        elif self._bottom_panel_dragging:
+            self.on_bottom_panel_resize_delta(mouse_y)
+            event.stop_propagation()
 
     def _on_resize_mouseup(self, _event) -> None:
         """Handle mouseup to end panel resizing."""
         self.on_sidebar_resize_end()
         self.on_right_panel_resize_end()
+        self.on_bottom_panel_resize_end()
 
     # ── Integration Hooks (Stubs) ─────────────────────────────
 
@@ -4859,6 +4912,40 @@ class AssetManagerPanel(Panel):
         self._import_menu_open = False
         self._dirty_model("import_menu_open")
         self._with_import_folder(lambda _folder_id: open_url_import_panel())
+
+
+    # ── Dock helpers ──────────────────────────────────────────
+
+    def _dock_toggle_label(self) -> str:
+        return "Dock" if self._is_floating else "Undock"
+
+    def _sync_panel_space_state(self) -> bool:
+        info = None
+        try:
+            info = lf.ui.get_panel(self.id)
+        except Exception:
+            info = None
+        panel_space = getattr(info, "space", self._panel_space)
+        is_floating = panel_space == lf.ui.PanelSpace.FLOATING
+        changed = panel_space != self._panel_space or is_floating != self._is_floating
+        self._panel_space = panel_space
+        self._is_floating = is_floating
+        return changed
+
+    def _on_toggle_dock_mode(self, _handle, _event, _args):
+        target_space = lf.ui.PanelSpace.LEFT_DOCK if self._is_floating else lf.ui.PanelSpace.FLOATING
+        try:
+            changed = bool(lf.ui.set_panel_space(self.id, target_space))
+        except Exception:
+            changed = False
+        if not changed:
+            return
+        self._sync_panel_space_state()
+        if self._handle:
+            self._handle.dirty_all()
+
+    def _on_close_panel(self, _handle, _event, _args):
+        lf.ui.set_panel_enabled(self.id, False)
 
 
 # ── atexit backup ─────────────────────────────────────────

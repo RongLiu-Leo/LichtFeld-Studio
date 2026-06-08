@@ -230,7 +230,9 @@ class PanelSpace(enum.Enum):
 
     BOTTOM_DOCK = 5
 
-    STATUS_BAR = 6
+    LEFT_DOCK = 6
+
+    STATUS_BAR = 7
 
 class PanelHeightMode(enum.Enum):
     FILL = 0
@@ -2527,7 +2529,9 @@ def has_clipboard_image() -> bool:
     """Return True if the system clipboard holds an image"""
 
 def get_clipboard_image_texture() -> tuple:
-    """Read clipboard image as UI texture, returns (texture_id, width, height)"""
+    """
+    Read an image from the clipboard as a UI texture, returns (texture_id, width, height)
+    """
 
 def save_clipboard_image(path: str) -> bool:
     """Decode the clipboard image and write it to path; returns success"""
