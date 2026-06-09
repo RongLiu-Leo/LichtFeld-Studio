@@ -455,6 +455,14 @@
                 <span id="lod-stats-chunks" class="viewport-lod-stats-value">--</span>
             </div>
             <div class="viewport-lod-stats-row">
+                <span class="viewport-lod-stats-label">Cache</span>
+                <span id="lod-stats-cache" class="viewport-lod-stats-value">--</span>
+            </div>
+            <div class="viewport-lod-stats-row">
+                <span class="viewport-lod-stats-label">Selector</span>
+                <span id="lod-stats-selector" class="viewport-lod-stats-value">--</span>
+            </div>
+            <div class="viewport-lod-stats-row">
                 <span class="viewport-lod-stats-label">Pixel</span>
                 <span id="lod-stats-pixel" class="viewport-lod-stats-value">--</span>
             </div>
@@ -467,7 +475,7 @@
                 <span id="lod-stats-foveation" class="viewport-lod-stats-value">--</span>
             </div>
             <div class="viewport-lod-stats-row">
-                <span class="viewport-lod-stats-label">Hash</span>
+                <span class="viewport-lod-stats-label">Source</span>
                 <span id="lod-stats-hash" class="viewport-lod-stats-value">--</span>
             </div>
         </div>

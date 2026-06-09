@@ -368,6 +368,8 @@ namespace lfs::vis::gui {
             lod_stats_overlay_.traversal_text != state.traversal_text ||
             lod_stats_overlay_.stop_text != state.stop_text ||
             lod_stats_overlay_.chunks_text != state.chunks_text ||
+            lod_stats_overlay_.cache_text != state.cache_text ||
+            lod_stats_overlay_.selector_text != state.selector_text ||
             lod_stats_overlay_.pixel_text != state.pixel_text ||
             lod_stats_overlay_.render_text != state.render_text ||
             lod_stats_overlay_.foveation_text != state.foveation_text ||
@@ -578,6 +580,8 @@ namespace lfs::vis::gui {
         set_text("lod-stats-traversal", lod_stats_overlay_.traversal_text);
         set_text("lod-stats-stop", lod_stats_overlay_.stop_text);
         set_text("lod-stats-chunks", lod_stats_overlay_.chunks_text);
+        set_text("lod-stats-cache", lod_stats_overlay_.cache_text);
+        set_text("lod-stats-selector", lod_stats_overlay_.selector_text);
         set_text("lod-stats-pixel", lod_stats_overlay_.pixel_text);
         set_text("lod-stats-render", lod_stats_overlay_.render_text);
         set_text("lod-stats-foveation", lod_stats_overlay_.foveation_text);

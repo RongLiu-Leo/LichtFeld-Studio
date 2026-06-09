@@ -296,6 +296,7 @@ set(TEST_FILES
     test_vram_profiler_metrics.cpp
 )
 list(APPEND TEST_FILES test_vksplat_input_packer.cpp)
+list(APPEND TEST_FILES test_lod_page_cache.cpp)
 
 # Build test sources list
 set(TEST_SOURCES test_main.cpp)

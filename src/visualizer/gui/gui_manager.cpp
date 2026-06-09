@@ -177,6 +177,8 @@ namespace lfs::vis::gui {
 
             if (stats.full_quality_reference) {
                 state.status_text = "Full quality reference";
+            } else if (stats.active && stats.gpu_selection) {
+                state.status_text = "Active, GPU select";
             } else if (stats.active) {
                 state.status_text = stats.async_result_ready ? "Active, async ready" : "Active";
             } else if (stats.has_tree || stats.available) {
@@ -195,6 +197,11 @@ namespace lfs::vis::gui {
                                               formatLodPercent(selected, full_quality));
             if (stats.full_quality_reference) {
                 state.budget_text = "leaf set";
+            } else if (stats.budget_repair_active &&
+                       stats.selected_splats > stats.max_splats) {
+                state.budget_text = std::format("{} repair | {} max",
+                                                formatLodCount(stats.selected_splats),
+                                                formatLodCount(stats.max_splats));
             } else if (stats.requested_max_splats > 0 &&
                        stats.max_splats != stats.requested_max_splats) {
                 state.budget_text = std::format("{} result | {} requested",
@@ -210,7 +217,9 @@ namespace lfs::vis::gui {
                                           formatLodCount(stats.full_quality_splats));
 
             std::string stop_reason = "complete";
-            if (stats.full_quality_reference) {
+            if (stats.gpu_selection) {
+                stop_reason = stats.budget_limited ? "capacity clamp" : "pixel threshold";
+            } else if (stats.full_quality_reference) {
                 stop_reason = "leaf complete";
             } else if (stats.output_limited && stats.budget_limited) {
                 stop_reason = "budget and output cap";
@@ -218,13 +227,24 @@ namespace lfs::vis::gui {
                 stop_reason = "budget before expansion";
             } else if (stats.output_limited) {
                 stop_reason = "output cap";
+            } else if (stats.budget_repair_active && stats.budget_limited) {
+                stop_reason = "repair cap";
+            } else if (stats.budget_repair_active) {
+                stop_reason = "budget repair";
+            } else if (stats.budget_fill_active && stats.threshold_limited) {
+                stop_reason = "budget-fill threshold";
+            } else if (stats.budget_fill_active) {
+                stop_reason = "budget fill";
             } else if (stats.threshold_limited) {
                 stop_reason = "pixel threshold";
             }
-            state.traversal_text = std::format("{} output | {} frontier | {} leaf",
-                                               formatLodCount(stats.output_size),
-                                               formatLodCount(stats.frontier_size),
-                                               formatLodCount(stats.leaf_count));
+            state.traversal_text = stats.gpu_selection
+                                       ? std::format("{} output | per-frame GPU cut",
+                                                     formatLodCount(stats.output_size))
+                                       : std::format("{} output | {} frontier | {} leaf",
+                                                     formatLodCount(stats.output_size),
+                                                     formatLodCount(stats.frontier_size),
+                                                     formatLodCount(stats.leaf_count));
             state.stop_text = stop_reason;
             state.chunks_text = stats.chunk_count > 0
                                     ? std::format("{} touched | {} resident | {} total @ {} splats",
@@ -233,20 +253,56 @@ namespace lfs::vis::gui {
                                                   formatLodCount(stats.chunk_count),
                                                   formatLodCount(stats.chunk_splats))
                                     : "--";
-            state.pixel_text = std::format("limit {} | min {}",
-                                           formatLodFloat(stats.pixel_scale_limit),
-                                           formatLodFloat(stats.min_pixel_scale));
+            if (stats.pool_pages > 0 && stats.chunk_splats > 0) {
+                const std::size_t pool_splats = stats.pool_pages * stats.chunk_splats;
+                const std::string streaming =
+                    stats.streaming_jobs > 0
+                        ? std::format("{} pages loading", stats.streaming_jobs)
+                        : (stats.resident_chunks >= stats.chunk_count ? "fully resident"
+                                                                      : "idle");
+                state.cache_text = std::format("{}/{} pages | {} splat pool | {}",
+                                               formatLodCount(std::min(stats.resident_chunks, stats.pool_pages)),
+                                               formatLodCount(stats.pool_pages),
+                                               formatLodCount(pool_splats),
+                                               streaming);
+            } else {
+                state.cache_text = "--";
+            }
+            state.selector_text =
+                stats.gpu_selection
+                    ? std::format("cap {} | overflow {} | feedback x{:.2f}",
+                                  formatLodCount(stats.gpu_output_capacity),
+                                  formatLodCount(stats.gpu_overflow),
+                                  stats.gpu_pixel_scale_feedback)
+                    : "CPU traversal";
+            // min_pixel_scale and the per-node view counters come from the CPU
+            // traversal and are frozen at the bootstrap cut in GPU mode.
+            state.pixel_text = stats.gpu_selection
+                                   ? std::format("limit {}", formatLodFloat(stats.pixel_scale_limit))
+                                   : std::format("limit {} | min {}",
+                                                 formatLodFloat(stats.pixel_scale_limit),
+                                                 formatLodFloat(stats.min_pixel_scale));
             state.render_text = stats.full_quality_reference
                                     ? "leaf-only reference"
                                     : std::format("LOD scale x{:.1f}", stats.lod_render_scale);
-            state.foveation_text = std::format("cone {:.0f}/{:.0f} deg | edge x{:.2f} | behind x{:.2f}",
-                                               stats.cone_inner_degrees,
-                                               stats.cone_outer_degrees,
-                                               stats.cone_foveation,
-                                               stats.behind_camera_penalty);
-            state.hash_text = std::format("{:08x}",
-                                          static_cast<std::uint32_t>(
-                                              stats.selection_hash & 0xffffffffull));
+            state.foveation_text = stats.gpu_selection
+                                       ? std::format("cone {:.0f}/{:.0f} deg | edge x{:.2f} | behind x{:.2f}",
+                                                     stats.cone_inner_degrees,
+                                                     stats.cone_outer_degrees,
+                                                     stats.cone_foveation,
+                                                     stats.behind_camera_penalty)
+                                       : std::format("cone {:.0f}/{:.0f} deg | edge x{:.2f} | behind x{:.2f} | view {}/{}",
+                                                     stats.cone_inner_degrees,
+                                                     stats.cone_outer_degrees,
+                                                     stats.cone_foveation,
+                                                     stats.behind_camera_penalty,
+                                                     formatLodCount(stats.outside_view_nodes),
+                                                     formatLodCount(stats.behind_view_nodes));
+            state.hash_text = stats.gpu_selection
+                                  ? "GPU selector"
+                                  : std::format("CPU {:08x}",
+                                                static_cast<std::uint32_t>(
+                                                    stats.selection_hash & 0xffffffffull));
             return state;
         }
 

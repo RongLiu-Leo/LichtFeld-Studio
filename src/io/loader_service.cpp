@@ -7,6 +7,7 @@
 #include "core/path_utils.hpp"
 #include "core/splat_data.hpp"
 #include "io/error.hpp"
+#include "io/formats/rad.hpp"
 #include "io/loaders/blender_loader.hpp"
 #include "io/loaders/checkpoint_loader.hpp"
 #include "io/loaders/colmap_loader.hpp"
@@ -52,24 +53,7 @@ namespace lfs::io {
         }
 
         [[nodiscard]] bool pagedRadGpuResidencyRequested(const lfs::core::SplatData& model) {
-            if (!model.lod_tree || !model.lod_tree->rad_source.valid()) {
-                return false;
-            }
-            const std::size_t logical_chunks = model.lod_tree->chunk_count();
-            if (logical_chunks <= 1) {
-                return false;
-            }
-            const char* const env = std::getenv("LFS_LOD_PAGE_CAPACITY");
-            if (env == nullptr || env[0] == '\0') {
-                return false;
-            }
-            try {
-                const std::size_t requested = static_cast<std::size_t>(std::stoull(env));
-                const std::size_t physical_pages = std::clamp(requested, std::size_t{1}, logical_chunks);
-                return physical_pages < logical_chunks;
-            } catch (...) {
-                return false;
-            }
+            return lfs::io::rad_paged_load_recommended(model);
         }
     } // namespace
 
@@ -80,10 +64,11 @@ namespace lfs::io {
         }
         if (pagedRadGpuResidencyRequested(model)) {
             model.set_tensor_allocator(allocator);
+            const char* const page_capacity_env = std::getenv("LFS_LOD_PAGE_CAPACITY");
             LOG_INFO("RAD paged LOD active: skipping full renderer-storage migration "
                      "(chunks={}, requested_pages={})",
                      model.lod_tree->chunk_count(),
-                     std::getenv("LFS_LOD_PAGE_CAPACITY"));
+                     page_capacity_env != nullptr ? page_capacity_env : "auto");
             return {};
         }
         if (splat_tensor_renderer_ready(model.means_raw()) &&

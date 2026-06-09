@@ -25,7 +25,7 @@ PACK_STRUCT(struct VulkanGSRendererUniforms {
     uint32_t render_origin_y;
     uint32_t camera_width;
     uint32_t camera_height;
-    uint32_t pad2;
+    uint32_t model_num_splats;
     float fx;
     float fy;
     float cx;
@@ -35,6 +35,35 @@ PACK_STRUCT(struct VulkanGSRendererUniforms {
     float world_view_transform[16];
 });
 static_assert(sizeof(VulkanGSRendererUniforms) == 176);
+
+PACK_STRUCT(struct VulkanGSLodSelectUniforms {
+    uint32_t node_count;
+    uint32_t output_capacity;
+    uint32_t chunk_splats;
+    uint32_t invalid_page;
+    float pixel_scale_limit;
+    float object_scale;
+    float behind_camera_penalty;
+    float cone_foveation;
+    float cone_dot0;
+    float cone_dot;
+    float cone_blend_denominator;
+    float cone_tail_valid;
+    float view_row0[4];
+    float view_row1[4];
+    float view_row2[4];
+    float outside_view_foveation;
+    float viewport_half_tan_x;
+    float viewport_half_tan_y;
+    float ortho_half_width;
+    float ortho_half_height;
+    uint32_t viewport_foveation;
+    uint32_t orthographic;
+    uint32_t physical_node_count;
+    uint32_t logical_chunk_count;
+    uint32_t pad4[3];
+});
+static_assert(sizeof(VulkanGSLodSelectUniforms) == 144);
 
 PACK_STRUCT(struct VulkanGSSelectionMaskUniforms {
     uint32_t num_splats;
@@ -78,6 +107,15 @@ public:
         size_t visible_count = 0;
         size_t num_splats = 0;
     };
+    struct LodSelectionStats {
+        size_t candidate_count = 0;
+        size_t rendered_capacity = 0;
+        size_t overflow_count = 0;
+        // Per-logical-chunk traversal interest: 0 = untouched, 0xffffffff =
+        // rendered from this frame, otherwise float bits of the touching
+        // node's pixel scale (orderable as uint).
+        std::vector<uint32_t> chunk_touch;
+    };
 
     VulkanGSRenderer();
     ~VulkanGSRenderer();
@@ -93,7 +131,9 @@ public:
     void cleanup();
 
     void tagDeferredVisibleCountReadback(VkSemaphore semaphore, std::uint64_t value);
+    void tagDeferredLodSelectionReadback(VkSemaphore semaphore, std::uint64_t value);
     [[nodiscard]] std::optional<PrimitiveVisibilityStats> pollDeferredPrimitiveVisibilityStats();
+    [[nodiscard]] std::optional<LodSelectionStats> pollDeferredLodSelectionStats();
     [[nodiscard]] bool shrinkSortBuffersForCapacity(VulkanGSPipelineBuffers& buffers,
                                                     size_t target_capacity);
 
@@ -107,7 +147,19 @@ public:
                                   bool use_gut_projection = false,
                                   const _VulkanBuffer& lod_indices = _VulkanBuffer(),
                                   const _VulkanBuffer& lod_logical_indices = _VulkanBuffer(),
-                                  const _VulkanBuffer& lod_levels = _VulkanBuffer());
+                                  const _VulkanBuffer& lod_levels = _VulkanBuffer(),
+                                  const _VulkanBuffer& lod_weights = _VulkanBuffer(),
+                                  const _VulkanBuffer& lod_counts = _VulkanBuffer());
+    void executeMapLodIndices(std::uint32_t lod_count,
+                              std::uint32_t chunk_splats,
+                              std::uint32_t invalid_page,
+                              VulkanGSPipelineBuffers& buffers,
+                              const _VulkanBuffer& chunk_to_page);
+    void executeSelectLodThreshold(const VulkanGSLodSelectUniforms& uniforms,
+                                   VulkanGSPipelineBuffers& buffers,
+                                   const _VulkanBuffer& node_bounds,
+                                   const _VulkanBuffer& node_links,
+                                   const _VulkanBuffer& chunk_to_page);
     void executeGenerateKeys(const VulkanGSRendererUniforms& uniforms, VulkanGSPipelineBuffers& buffers);
     void executeComputeTileRanges(const VulkanGSRendererUniforms& uniforms, VulkanGSPipelineBuffers& buffers);
     void executeRasterizeForward(const VulkanGSRendererUniforms& uniforms,
@@ -185,8 +237,8 @@ protected:
                                         const _VulkanBuffer& overlay_params,
                                         bool overlays_active);
 
-    _ComputePipeline pipeline_projection_forward = _ComputePipeline(21);
-    _ComputePipeline pipeline_projection_forward_3dgut = _ComputePipeline(21);
+    _ComputePipeline pipeline_projection_forward = _ComputePipeline(24);
+    _ComputePipeline pipeline_projection_forward_3dgut = _ComputePipeline(24);
     _ComputePipeline pipeline_selection_mask = _ComputePipeline(9);
     _ComputePipeline pipeline_selection_polygon_rasterize = _ComputePipeline(2);
     _ComputePipeline pipeline_generate_keys = _ComputePipeline(7);
@@ -196,6 +248,8 @@ protected:
     _ComputePipeline pipeline_prepare_visible_sort = _ComputePipeline(3);
     _ComputePipeline pipeline_prepare_tile_sort = _ComputePipeline(3);
     _ComputePipeline pipeline_compact_visible_primitives = _ComputePipeline(5);
+    _ComputePipeline pipeline_lod_map_indices = _ComputePipeline(3);
+    _ComputePipeline pipeline_lod_select_threshold = _ComputePipeline(9);
     // 3 bindings: sorted_keys, out_tile_ranges, index_buffer_offset (for num_isects).
     _ComputePipeline pipeline_compute_tile_ranges[2] = {
         _ComputePipeline(3),
@@ -244,7 +298,22 @@ protected:
     std::uint64_t visible_count_readback_value_ = 0;
     size_t visible_count_readback_num_splats_ = 0;
 
+    _VulkanBuffer lod_selection_readback_buffer_{};
+    uint32_t* lod_selection_readback_mapped_ = nullptr;
+    bool lod_selection_readback_initialized_ = false;
+    bool lod_selection_readback_pending_ = false;
+    VkSemaphore lod_selection_readback_signal_ = VK_NULL_HANDLE;
+    std::uint64_t lod_selection_readback_value_ = 0;
+    size_t lod_selection_readback_capacity_ = 0;
+    size_t lod_selection_readback_chunk_capacity_ = 0;
+    size_t lod_selection_readback_chunk_count_ = 0;
+
     void ensureVisibleCountReadback();
     void destroyVisibleCountReadback();
     void recordVisibleCountReadback(VulkanGSPipelineBuffers& buffers, size_t num_splats);
+    void ensureLodSelectionReadback(size_t chunk_capacity);
+    void destroyLodSelectionReadback();
+    void recordLodSelectionReadback(VulkanGSPipelineBuffers& buffers,
+                                    size_t rendered_capacity,
+                                    size_t chunk_count);
 };

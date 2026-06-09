@@ -62,6 +62,8 @@ namespace lfs::vis::gui {
             std::string traversal_text;
             std::string stop_text;
             std::string chunks_text;
+            std::string cache_text;
+            std::string selector_text;
             std::string pixel_text;
             std::string render_text;
             std::string foveation_text;

@@ -160,12 +160,20 @@ struct VulkanGSPipelineBuffers {
     size_t num_indices_high_water = 0;
 
     // LOD index indirection buffer
-    Buffer<uint32_t> lod_indices;         // [M] selected physical splat indices
-    Buffer<uint32_t> lod_logical_indices; // [M] selected logical/model splat indices
-    Buffer<uint32_t> lod_levels;          // [M] selected splat LOD levels
+    Buffer<uint32_t> lod_indices;             // [M] selected physical splat indices
+    Buffer<uint32_t> lod_logical_indices;     // [M] selected logical/model splat indices
+    Buffer<uint32_t> lod_levels;              // [M] selected splat LOD levels
+    Buffer<float> lod_weights;                // [M] selected splat transition opacity weights
+    Buffer<uint32_t> lod_gpu_indices;         // [M] GPU-produced physical splat indices
+    Buffer<uint32_t> lod_gpu_logical_indices; // [M] GPU-produced logical/model splat indices
+    Buffer<float> lod_gpu_weights;            // [M] GPU-produced transition opacity weights
+    Buffer<uint32_t> lod_gpu_counts;          // [0]=selected, [1]=overflow
+    Buffer<uint32_t> lod_chunk_touch;         // [C] per-chunk traversal priority (0xffffffff = in use)
+    Buffer<uint32_t> lod_gpu_levels;          // [M] GPU-produced splat LOD levels
     bool has_lod_indices = false;
     bool has_lod_logical_indices = false;
     bool has_lod_levels = false;
+    bool has_lod_weights = false;
 
     [[nodiscard]] size_t getTotalOwnedAllocSize() const;
     [[nodiscard]] std::map<std::string, size_t> getOwnedVramBreakdown() const;

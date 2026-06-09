@@ -39,11 +39,13 @@ VulkanGSRenderer::~VulkanGSRenderer() {
     if (commandBatchInProgress)
         endCommandBatch(false);
     destroyVisibleCountReadback();
+    destroyLodSelectionReadback();
     cleanup();
 }
 
 void VulkanGSRenderer::cleanup() {
     destroyVisibleCountReadback();
+    destroyLodSelectionReadback();
     VulkanGSPipeline::cleanup();
 }
 
@@ -52,6 +54,14 @@ void VulkanGSRenderer::tagDeferredVisibleCountReadback(const VkSemaphore semapho
     if (visible_count_readback_pending_) {
         visible_count_readback_signal_ = semaphore;
         visible_count_readback_value_ = value;
+    }
+}
+
+void VulkanGSRenderer::tagDeferredLodSelectionReadback(const VkSemaphore semaphore,
+                                                       const std::uint64_t value) {
+    if (lod_selection_readback_pending_) {
+        lod_selection_readback_signal_ = semaphore;
+        lod_selection_readback_value_ = value;
     }
 }
 
@@ -144,6 +154,71 @@ void VulkanGSRenderer::destroyVisibleCountReadback() {
     visible_count_readback_num_splats_ = 0;
 }
 
+void VulkanGSRenderer::ensureLodSelectionReadback(const size_t chunk_capacity) {
+    if (lod_selection_readback_initialized_) {
+        if (lod_selection_readback_chunk_capacity_ >= chunk_capacity)
+            return;
+        // Growing requires a recreate; never destroy under an in-flight copy.
+        if (lod_selection_readback_pending_)
+            return;
+        destroyLodSelectionReadback();
+    }
+
+    const VkDeviceSize byte_size = (2 + chunk_capacity) * sizeof(uint32_t);
+    VkBufferCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    info.size = byte_size;
+    info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VmaAllocationCreateInfo aci{};
+    aci.usage = VMA_MEMORY_USAGE_AUTO;
+    aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
+                VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+    VmaAllocationInfo alloc_info{};
+    if (vmaCreateBuffer(allocator, &info, &aci,
+                        &lod_selection_readback_buffer_.buffer,
+                        &lod_selection_readback_buffer_.allocation,
+                        &alloc_info) != VK_SUCCESS) {
+        lod_selection_readback_buffer_.buffer = VK_NULL_HANDLE;
+        lod_selection_readback_buffer_.allocation = VK_NULL_HANDLE;
+        _CHECK_FATAL("Failed to allocate LOD selection readback buffer");
+    }
+    lod_selection_readback_buffer_.allocSize = byte_size;
+    lod_selection_readback_buffer_.size = byte_size;
+    lod_selection_readback_mapped_ = static_cast<uint32_t*>(alloc_info.pMappedData);
+    if (lod_selection_readback_mapped_) {
+        std::memset(lod_selection_readback_mapped_, 0, byte_size);
+    }
+    lod_selection_readback_initialized_ = true;
+    lod_selection_readback_pending_ = false;
+    lod_selection_readback_signal_ = VK_NULL_HANDLE;
+    lod_selection_readback_value_ = 0;
+    lod_selection_readback_capacity_ = 0;
+    lod_selection_readback_chunk_capacity_ = chunk_capacity;
+    lod_selection_readback_chunk_count_ = 0;
+}
+
+void VulkanGSRenderer::destroyLodSelectionReadback() {
+    if (!lod_selection_readback_initialized_)
+        return;
+    if (lod_selection_readback_buffer_.buffer != VK_NULL_HANDLE) {
+        vmaDestroyBuffer(allocator,
+                         lod_selection_readback_buffer_.buffer,
+                         lod_selection_readback_buffer_.allocation);
+    }
+    lod_selection_readback_buffer_ = {};
+    lod_selection_readback_mapped_ = nullptr;
+    lod_selection_readback_initialized_ = false;
+    lod_selection_readback_pending_ = false;
+    lod_selection_readback_signal_ = VK_NULL_HANDLE;
+    lod_selection_readback_value_ = 0;
+    lod_selection_readback_capacity_ = 0;
+    lod_selection_readback_chunk_capacity_ = 0;
+    lod_selection_readback_chunk_count_ = 0;
+}
+
 std::optional<VulkanGSRenderer::PrimitiveVisibilityStats>
 VulkanGSRenderer::pollDeferredPrimitiveVisibilityStats() {
     // Consume only after the tagged render-completion timeline has signaled;
@@ -163,6 +238,35 @@ VulkanGSRenderer::pollDeferredPrimitiveVisibilityStats() {
     visible_count_readback_pending_ = false;
     visible_count_readback_signal_ = VK_NULL_HANDLE;
     visible_count_readback_value_ = 0;
+    return stats;
+}
+
+std::optional<VulkanGSRenderer::LodSelectionStats>
+VulkanGSRenderer::pollDeferredLodSelectionStats() {
+    if (!lod_selection_readback_pending_ || !lod_selection_readback_mapped_)
+        return std::nullopt;
+    if (lod_selection_readback_signal_ == VK_NULL_HANDLE || lod_selection_readback_value_ == 0)
+        return std::nullopt;
+    if (!timelineValueComplete(lod_selection_readback_signal_, lod_selection_readback_value_))
+        return std::nullopt;
+    const size_t chunk_count = lod_selection_readback_chunk_count_;
+    if (!invalidateReadbackBuffer(lod_selection_readback_buffer_,
+                                  (2 + chunk_count) * sizeof(uint32_t)))
+        return std::nullopt;
+
+    LodSelectionStats stats{};
+    stats.candidate_count = lod_selection_readback_mapped_[0];
+    stats.rendered_capacity = lod_selection_readback_capacity_;
+    stats.overflow_count = lod_selection_readback_mapped_[1];
+    if (chunk_count > 0) {
+        stats.chunk_touch.assign(lod_selection_readback_mapped_ + 2,
+                                 lod_selection_readback_mapped_ + 2 + chunk_count);
+    }
+    lod_selection_readback_pending_ = false;
+    lod_selection_readback_signal_ = VK_NULL_HANDLE;
+    lod_selection_readback_value_ = 0;
+    lod_selection_readback_capacity_ = 0;
+    lod_selection_readback_chunk_count_ = 0;
     return stats;
 }
 
@@ -189,6 +293,55 @@ void VulkanGSRenderer::recordVisibleCountReadback(VulkanGSPipelineBuffers& buffe
     visible_count_readback_num_splats_ = num_splats;
 }
 
+void VulkanGSRenderer::recordLodSelectionReadback(VulkanGSPipelineBuffers& buffers,
+                                                  const size_t rendered_capacity,
+                                                  const size_t chunk_count) {
+    ensureLodSelectionReadback(chunk_count);
+    if (buffers.lod_gpu_counts.deviceBuffer.buffer == VK_NULL_HANDLE)
+        return;
+
+    const bool copy_chunk_touch =
+        chunk_count > 0 &&
+        chunk_count <= lod_selection_readback_chunk_capacity_ &&
+        buffers.lod_chunk_touch.deviceBuffer.buffer != VK_NULL_HANDLE &&
+        buffers.lod_chunk_touch.deviceSize() >= chunk_count;
+
+    std::vector<std::pair<_VulkanBuffer, BarrierMask>> src_barriers = {
+        {buffers.lod_gpu_counts.deviceBuffer, COMPUTE_SHADER_WRITE}};
+    if (copy_chunk_touch) {
+        src_barriers.push_back({buffers.lod_chunk_touch.deviceBuffer, COMPUTE_SHADER_WRITE});
+    }
+    bufferMemoryBarrier(src_barriers, TRANSFER_READ);
+
+    VkBufferCopy copy{};
+    copy.srcOffset = buffers.lod_gpu_counts.deviceBuffer.offset;
+    copy.dstOffset = 0;
+    copy.size = 2 * sizeof(uint32_t);
+    vkCmdCopyBuffer(command_buffer,
+                    buffers.lod_gpu_counts.deviceBuffer.buffer,
+                    lod_selection_readback_buffer_.buffer,
+                    1,
+                    &copy);
+    if (copy_chunk_touch) {
+        VkBufferCopy touch_copy{};
+        touch_copy.srcOffset = buffers.lod_chunk_touch.deviceBuffer.offset;
+        touch_copy.dstOffset = 2 * sizeof(uint32_t);
+        touch_copy.size = chunk_count * sizeof(uint32_t);
+        vkCmdCopyBuffer(command_buffer,
+                        buffers.lod_chunk_touch.deviceBuffer.buffer,
+                        lod_selection_readback_buffer_.buffer,
+                        1,
+                        &touch_copy);
+    }
+    bufferMemoryBarrier({{lod_selection_readback_buffer_, TRANSFER_WRITE}},
+                        HOST_READ);
+    lod_selection_readback_pending_ = true;
+    lod_selection_readback_signal_ = VK_NULL_HANDLE;
+    lod_selection_readback_value_ = 0;
+    lod_selection_readback_capacity_ = rendered_capacity;
+    lod_selection_readback_chunk_count_ = copy_chunk_touch ? chunk_count : 0;
+}
+
 bool VulkanGSRenderer::invalidateReadbackBuffer(_VulkanBuffer& buffer, VkDeviceSize size) {
     if (buffer.allocation == VK_NULL_HANDLE)
         return false;
@@ -204,6 +357,7 @@ void VulkanGSRenderer::initializeExternal(const std::map<std::string, std::strin
                                           VmaAllocator external_allocator,
                                           VkPipelineCache external_pipeline_cache) {
     destroyVisibleCountReadback();
+    destroyLodSelectionReadback();
     VulkanGSPipeline::initializeExternal(
         external_instance,
         external_physical_device,
@@ -259,6 +413,115 @@ void VulkanGSRenderer::initializeExternal(const std::map<std::string, std::strin
     createComputePipeline(pipeline_prepare_visible_sort, spirv_paths.at("prepare_visible_sort"));
     createComputePipeline(pipeline_prepare_tile_sort, spirv_paths.at("prepare_tile_sort"));
     createComputePipeline(pipeline_compact_visible_primitives, spirv_paths.at("compact_visible_primitives"));
+    createComputePipeline(pipeline_lod_map_indices, spirv_paths.at("lod_map_indices"));
+    createComputePipeline(pipeline_lod_select_threshold, spirv_paths.at("lod_select_threshold"));
+}
+
+void VulkanGSRenderer::executeMapLodIndices(const std::uint32_t lod_count,
+                                            const std::uint32_t chunk_splats,
+                                            const std::uint32_t invalid_page,
+                                            VulkanGSPipelineBuffers& buffers,
+                                            const _VulkanBuffer& chunk_to_page) {
+    if (lod_count == 0 ||
+        buffers.lod_logical_indices.deviceBuffer.buffer == VK_NULL_HANDLE ||
+        chunk_to_page.buffer == VK_NULL_HANDLE) {
+        return;
+    }
+
+    struct Uniforms {
+        std::uint32_t lod_count;
+        std::uint32_t chunk_splats;
+        std::uint32_t invalid_page;
+        std::uint32_t pad0;
+    } map_uniforms{lod_count, chunk_splats, invalid_page, 0u};
+
+    auto& out_indices = resizeDeviceBuffer(buffers.lod_indices, lod_count);
+    bufferMemoryBarrier({
+                            {buffers.lod_logical_indices.deviceBuffer, TRANSFER_COMPUTE_SHADER_WRITE},
+                            {chunk_to_page, TRANSFER_COMPUTE_SHADER_WRITE},
+                            {out_indices, TRANSFER_COMPUTE_SHADER_WRITE},
+                        },
+                        COMPUTE_SHADER_READ_WRITE);
+
+    executeCompute(
+        {{lod_count, 64}},
+        &map_uniforms, sizeof(map_uniforms),
+        pipeline_lod_map_indices,
+        {
+            buffers.lod_logical_indices.deviceBuffer,
+            chunk_to_page,
+            out_indices,
+        });
+
+    bufferMemoryBarrier({{out_indices, COMPUTE_SHADER_WRITE}},
+                        COMPUTE_SHADER_READ);
+}
+
+void VulkanGSRenderer::executeSelectLodThreshold(const VulkanGSLodSelectUniforms& uniforms,
+                                                 VulkanGSPipelineBuffers& buffers,
+                                                 const _VulkanBuffer& node_bounds,
+                                                 const _VulkanBuffer& node_links,
+                                                 const _VulkanBuffer& chunk_to_page) {
+    if (uniforms.node_count == 0 ||
+        uniforms.physical_node_count == 0 ||
+        uniforms.output_capacity == 0 ||
+        node_bounds.buffer == VK_NULL_HANDLE ||
+        node_links.buffer == VK_NULL_HANDLE ||
+        chunk_to_page.buffer == VK_NULL_HANDLE) {
+        return;
+    }
+
+    auto& counts = clearDeviceBuffer(buffers.lod_gpu_counts, 2);
+    auto& out_indices = resizeDeviceBuffer(buffers.lod_gpu_indices, uniforms.output_capacity, true);
+    auto& out_logical_indices = resizeDeviceBuffer(buffers.lod_gpu_logical_indices,
+                                                   uniforms.output_capacity,
+                                                   true);
+    auto& out_weights = resizeDeviceBuffer(buffers.lod_gpu_weights, uniforms.output_capacity, true);
+    auto& out_levels = resizeDeviceBuffer(buffers.lod_gpu_levels, uniforms.output_capacity, true);
+    const size_t chunk_touch_count = std::max<size_t>(uniforms.logical_chunk_count, 1);
+    auto& chunk_touch = clearDeviceBuffer(buffers.lod_chunk_touch, chunk_touch_count);
+
+    // No sentinel fill of out_indices/out_logical_indices: projection gates on
+    // the appended count in lod_gpu_counts[0], so entries past the valid prefix
+    // are never read.
+    bufferMemoryBarrier({
+                            {node_bounds, TRANSFER_COMPUTE_SHADER_WRITE},
+                            {node_links, TRANSFER_COMPUTE_SHADER_WRITE},
+                            {chunk_to_page, TRANSFER_COMPUTE_SHADER_WRITE},
+                            {counts, TRANSFER_WRITE},
+                            {out_indices, TRANSFER_COMPUTE_SHADER_WRITE},
+                            {out_logical_indices, TRANSFER_COMPUTE_SHADER_WRITE},
+                            {out_weights, TRANSFER_COMPUTE_SHADER_WRITE},
+                            {chunk_touch, TRANSFER_WRITE},
+                            {out_levels, TRANSFER_COMPUTE_SHADER_WRITE},
+                        },
+                        COMPUTE_SHADER_READ_WRITE);
+
+    executeCompute(
+        {{uniforms.physical_node_count, 128}},
+        &uniforms, sizeof(uniforms),
+        pipeline_lod_select_threshold,
+        {
+            node_bounds,
+            node_links,
+            chunk_to_page,
+            counts,
+            out_indices,
+            out_logical_indices,
+            out_weights,
+            chunk_touch,
+            out_levels,
+        });
+
+    bufferMemoryBarrier({
+                            {counts, COMPUTE_SHADER_WRITE},
+                            {out_indices, COMPUTE_SHADER_WRITE},
+                            {out_logical_indices, COMPUTE_SHADER_WRITE},
+                            {out_weights, COMPUTE_SHADER_WRITE},
+                            {out_levels, COMPUTE_SHADER_WRITE},
+                        },
+                        COMPUTE_SHADER_READ);
+    recordLodSelectionReadback(buffers, uniforms.output_capacity, uniforms.logical_chunk_count);
 }
 
 void VulkanGSRenderer::executeProjectionForward(
@@ -272,7 +535,9 @@ void VulkanGSRenderer::executeProjectionForward(
     bool use_gut_projection,
     const _VulkanBuffer& lod_indices,
     const _VulkanBuffer& lod_logical_indices,
-    const _VulkanBuffer& lod_levels) {
+    const _VulkanBuffer& lod_levels,
+    const _VulkanBuffer& lod_weights,
+    const _VulkanBuffer& lod_counts) {
     PerfTimer::Timer<PerfTimer::ProjectionForward> timer(this);
     DEVICE_GUARD;
 
@@ -311,7 +576,8 @@ void VulkanGSRenderer::executeProjectionForward(
     // Ensure transfer writes to optional LOD buffers are visible to projection.
     if (lod_indices.buffer != VK_NULL_HANDLE ||
         lod_logical_indices.buffer != VK_NULL_HANDLE ||
-        lod_levels.buffer != VK_NULL_HANDLE) {
+        lod_levels.buffer != VK_NULL_HANDLE ||
+        lod_weights.buffer != VK_NULL_HANDLE) {
         std::vector<std::pair<_VulkanBuffer, BarrierMask>> barriers;
         if (lod_indices.buffer != VK_NULL_HANDLE) {
             barriers.push_back({lod_indices, TRANSFER_COMPUTE_SHADER_WRITE});
@@ -322,6 +588,9 @@ void VulkanGSRenderer::executeProjectionForward(
         if (lod_levels.buffer != VK_NULL_HANDLE) {
             barriers.push_back({lod_levels, TRANSFER_COMPUTE_SHADER_WRITE});
         }
+        if (lod_weights.buffer != VK_NULL_HANDLE) {
+            barriers.push_back({lod_weights, TRANSFER_COMPUTE_SHADER_WRITE});
+        }
         bufferMemoryBarrier(barriers, COMPUTE_SHADER_READ);
     }
 
@@ -331,6 +600,10 @@ void VulkanGSRenderer::executeProjectionForward(
         (lod_logical_indices.buffer != VK_NULL_HANDLE) ? lod_logical_indices : lod_indices_binding;
     const _VulkanBuffer lod_levels_binding =
         (lod_levels.buffer != VK_NULL_HANDLE) ? lod_levels : primitive_depth_keys;
+    const _VulkanBuffer lod_weights_binding =
+        (lod_weights.buffer != VK_NULL_HANDLE) ? lod_weights : primitive_depth_keys;
+    const _VulkanBuffer lod_counts_binding =
+        (lod_counts.buffer != VK_NULL_HANDLE) ? lod_counts : primitive_depth_keys;
 
     std::vector<_VulkanBuffer> projection_buffers = {
         // inputs
@@ -357,6 +630,8 @@ void VulkanGSRenderer::executeProjectionForward(
         lod_indices_binding,
         lod_logical_indices_binding,
         lod_levels_binding,
+        lod_weights_binding,
+        lod_counts_binding,
     };
 
     executeCompute(

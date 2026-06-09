@@ -268,6 +268,13 @@ void VulkanGSPipeline::cleanupBuffers(VulkanGSPipelineBuffers& buffers) {
     _(lod_indices)
     _(lod_logical_indices)
     _(lod_levels)
+    _(lod_weights)
+    _(lod_gpu_indices)
+    _(lod_gpu_logical_indices)
+    _(lod_gpu_weights)
+    _(lod_gpu_counts)
+    _(lod_chunk_touch)
+    _(lod_gpu_levels)
 #undef _
 }
 

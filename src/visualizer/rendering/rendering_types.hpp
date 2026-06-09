@@ -26,6 +26,9 @@ namespace lfs::vis {
     inline constexpr float DEFAULT_LOD_CONE_FOVEATION = 0.4f;
     inline constexpr float DEFAULT_LOD_CONE_INNER_DEGREES = 90.0f;
     inline constexpr float DEFAULT_LOD_CONE_OUTER_DEGREES = 120.0f;
+    inline constexpr float DEFAULT_LOD_OUTSIDE_VIEW_FOVEATION = 0.05f;
+    inline constexpr float DEFAULT_LOD_PREFETCH_PIXEL_SCALE_RATIO = 0.65f;
+    inline constexpr std::size_t DEFAULT_LOD_PAGE_POOL_SPLATS = 0; // 0 = auto (derived from lod_max_splats)
 
     enum class SplitViewMode {
         Disabled,
@@ -273,7 +276,8 @@ namespace lfs::vis {
         float lod_cone_foveation = DEFAULT_LOD_CONE_FOVEATION;
         float lod_cone_inner_degrees = DEFAULT_LOD_CONE_INNER_DEGREES;
         float lod_cone_outer_degrees = DEFAULT_LOD_CONE_OUTER_DEGREES;
-        bool lod_debug_colors = false; // Per-level color tinting
+        size_t lod_page_pool_splats = DEFAULT_LOD_PAGE_POOL_SPLATS; // VRAM page-pool budget for RAD streaming (0 = auto)
+        bool lod_debug_colors = false;                              // Per-level color tinting
     };
 
     inline void sanitizeDepthViewSettings(RenderSettings& settings) {

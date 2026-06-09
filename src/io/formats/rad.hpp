@@ -41,4 +41,9 @@ namespace lfs::io {
         int max_sh_degree,
         bool lod_opacity_encoded);
 
+    // True when a chunked RAD should keep its leaf tensors on the host and
+    // stream pages to the GPU instead of migrating everything to CUDA at load.
+    // LFS_LOD_PAGE_CAPACITY overrides the free-VRAM heuristic in both directions.
+    [[nodiscard]] bool rad_paged_load_recommended(const SplatData& data);
+
 } // namespace lfs::io

@@ -56,6 +56,12 @@ namespace lfs::vis {
         [[nodiscard]] bool fullyResident() const {
             return snapshot_.resident_chunks == snapshot_.logical_chunks;
         }
+        [[nodiscard]] bool hasOutstandingWork() const {
+            return !decode_jobs_.empty() || !pending_uploads_.empty();
+        }
+        [[nodiscard]] std::size_t outstandingWorkCount() const {
+            return decode_jobs_.size() + pending_uploads_.size();
+        }
 
     private:
         struct PageSlot {

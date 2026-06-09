@@ -11,6 +11,7 @@
 #include "io/atomic_output.hpp"
 #include "io/error.hpp"
 
+#include <cuda_runtime.h>
 #include <nlohmann/json.hpp>
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
@@ -22,6 +23,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -2757,6 +2759,25 @@ namespace lfs::io {
                     auto tree = std::make_unique<lfs::core::SplatLodTree>();
                     tree->child_count = std::move(all_child_count);
                     tree->child_start = std::move(all_child_start);
+                    // RAD files don't store node depths; derive them in one
+                    // forward pass (children always follow their parent in the
+                    // BFS-ordered layout).
+                    tree->lod_level.assign(N, 0);
+                    for (size_t i = 0; i < N; ++i) {
+                        const std::uint32_t count = tree->child_count[i];
+                        if (count == 0) {
+                            continue;
+                        }
+                        const std::uint32_t start = tree->child_start[i];
+                        const auto child_level = static_cast<std::uint8_t>(
+                            std::min<std::uint32_t>(tree->lod_level[i] + 1u, 255u));
+                        for (std::uint32_t c = 0; c < count; ++c) {
+                            const size_t child = static_cast<size_t>(start) + c;
+                            if (child > i && child < N) {
+                                tree->lod_level[child] = child_level;
+                            }
+                        }
+                    }
                     const size_t chunk_count =
                         (N + lfs::core::SplatLodTree::kChunkSplats - 1) /
                         lfs::core::SplatLodTree::kChunkSplats;
@@ -2781,7 +2802,7 @@ namespace lfs::io {
                         const float sx = all_scales_linear[i * 3 + 0];
                         const float sy = all_scales_linear[i * 3 + 1];
                         const float sz = all_scales_linear[i * 3 + 2];
-                        const float avg_scale = (sx + sy + sz) / 3.0f;
+                        const float max_scale = std::max({sx, sy, sz});
                         float expansion = 1.0f;
                         if (lod_opacity_encoded) {
                             const float lod_alpha = std::max(all_opacity[i], 0.0f);
@@ -2790,7 +2811,7 @@ namespace lfs::io {
                                 expansion = 1.0f + 0.7f * (spark_lod_opacity - 1.0f);
                             }
                         }
-                        const float size = 2.0f * expansion * avg_scale;
+                        const float size = 2.0f * expansion * max_scale;
                         tree->sizes.push_back(size);
                     }
                     tree->lod_opacity_encoded = lod_opacity_encoded;
@@ -2971,6 +2992,50 @@ namespace lfs::io {
                  elapsed.count());
 
         return {};
+    }
+
+    bool rad_paged_load_recommended(const SplatData& data) {
+        if (!data.lod_tree || !data.lod_tree->rad_source.valid()) {
+            return false;
+        }
+        const std::size_t logical_chunks = data.lod_tree->chunk_count();
+        if (logical_chunks <= 1) {
+            return false;
+        }
+        if (const char* const env = std::getenv("LFS_LOD_PAGE_CAPACITY");
+            env != nullptr && env[0] != '\0') {
+            try {
+                const std::size_t requested = static_cast<std::size_t>(std::stoull(env));
+                return std::clamp(requested, std::size_t{1}, logical_chunks) < logical_chunks;
+            } catch (...) {
+                return false;
+            }
+        }
+
+        std::size_t free_bytes = 0;
+        std::size_t total_bytes = 0;
+        if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess || free_bytes == 0) {
+            return false;
+        }
+        const auto tensor_bytes = [](const lfs::core::Tensor& t) -> std::size_t {
+            return t.is_valid() ? t.bytes() : 0;
+        };
+        const std::size_t model_bytes =
+            tensor_bytes(data.means_raw()) +
+            tensor_bytes(data.sh0_raw()) +
+            tensor_bytes(data.shN_raw()) +
+            tensor_bytes(data.scaling_raw()) +
+            tensor_bytes(data.rotation_raw()) +
+            tensor_bytes(data.opacity_raw());
+        // Stream when full residency would crowd the GPU: the renderer still
+        // needs sort scratch, tile buffers, and framebuffers on top.
+        const bool paged = model_bytes > free_bytes / 2;
+        if (paged) {
+            LOG_INFO("RAD paged load recommended: model={:.1f} MB, free VRAM={:.1f} MB",
+                     static_cast<double>(model_bytes) / (1024.0 * 1024.0),
+                     static_cast<double>(free_bytes) / (1024.0 * 1024.0));
+        }
+        return paged;
     }
 
 } // namespace lfs::io

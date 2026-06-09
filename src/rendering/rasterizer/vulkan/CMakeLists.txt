@@ -148,6 +148,8 @@ _vulkan_add_slang_shader(visible_flags             visible_flags.slang)
 _vulkan_add_slang_shader(prepare_visible_sort      prepare_visible_sort.slang)
 _vulkan_add_slang_shader(prepare_tile_sort         prepare_tile_sort.slang)
 _vulkan_add_slang_shader(compact_visible_primitives compact_visible_primitives.slang)
+_vulkan_add_slang_shader(lod_map_indices           lod_map_indices.slang)
+_vulkan_add_slang_shader(lod_select_threshold      lod_select_threshold.slang)
 
 # vertex_shader.slang → projection_forward variants
 _vulkan_add_slang_shader(projection_forward        vertex_shader.slang EXPORT_MODE=0)

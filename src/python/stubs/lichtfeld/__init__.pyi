@@ -400,6 +400,11 @@ def set_node_transform(name: str, matrix: Sequence[float]) -> None:
 def set_node_visualizer_world_transform(name: str, matrix: Sequence[float]) -> None:
     """Set node visualizer-world transform matrix (16 floats, column-major)"""
 
+def bake_selected_node_transforms() -> int:
+    """
+    Bake selected SPLAT, POINTCLOUD, and MESH node transforms into their payloads
+    """
+
 def capture_selection_transforms() -> dict:
     """Capture transforms of all selected nodes"""
 

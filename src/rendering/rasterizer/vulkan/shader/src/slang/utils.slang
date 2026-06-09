@@ -1124,7 +1124,7 @@ struct Uniforms {
     uint render_origin_y;
     uint camera_width;
     uint camera_height;
-    uint pad2;
+    uint model_num_splats;
     float fx;
     float fy;
     float cx;

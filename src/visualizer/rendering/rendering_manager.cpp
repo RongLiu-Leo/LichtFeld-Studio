@@ -216,6 +216,8 @@ namespace lfs::vis {
             stats = lod_controller_->stats();
         }
 
+        bool gpu_selection_eligible = false;
+        float render_scale_setting = 1.0f;
         {
             std::lock_guard<std::mutex> lock(settings_mutex_);
             stats.enabled = settings_.lod_enabled;
@@ -230,6 +232,44 @@ namespace lfs::vis {
             stats.cone_foveation = settings_.lod_cone_foveation;
             stats.cone_inner_degrees = settings_.lod_cone_inner_degrees;
             stats.cone_outer_degrees = settings_.lod_cone_outer_degrees;
+            gpu_selection_eligible = settings_.lod_enabled;
+            render_scale_setting = settings_.lod_render_scale;
+        }
+
+        if (gpu_selection_eligible && vksplat_viewport_renderer_) {
+            const auto gpu = vksplat_viewport_renderer_->gpuLodSelectionStatus();
+            if (gpu.active) {
+                // The CPU controller is frozen at its bootstrap cut in GPU
+                // mode; report the selector's live numbers instead.
+                stats.gpu_selection = true;
+                stats.selected_splats = gpu.selected;
+                stats.output_size = gpu.selected;
+                // Effective target = LOD Budget x Render Scale (Spark-style
+                // quality scaler); the overlay shows both when they differ.
+                stats.max_splats = std::max<size_t>(
+                    1,
+                    static_cast<size_t>(
+                        std::llround(static_cast<double>(stats.requested_max_splats) *
+                                     std::max(render_scale_setting, 0.1f))));
+                stats.budget_repair_active = false;
+                stats.budget_fill_active = false;
+                stats.budget_limited = gpu.overflow > 0;
+                stats.threshold_limited = gpu.overflow == 0;
+                stats.output_limited = false;
+                if (stats.pixel_scale_limit > 0.0f) {
+                    stats.pixel_scale_limit *= gpu.pixel_scale_feedback;
+                }
+                if (gpu.chunk_count > 0) {
+                    stats.chunk_count = gpu.chunk_count;
+                    stats.resident_chunks = gpu.resident_chunks;
+                    stats.touched_chunks = gpu.touched_chunks;
+                }
+                stats.gpu_output_capacity = gpu.capacity;
+                stats.gpu_overflow = gpu.overflow;
+                stats.gpu_pixel_scale_feedback = gpu.pixel_scale_feedback;
+                stats.pool_pages = gpu.pool_pages;
+                stats.streaming_jobs = gpu.streaming_jobs;
+            }
         }
 
         stats.available = lod_available_ || stats.has_tree;

@@ -25,24 +25,7 @@ namespace lfs::io {
 
     namespace {
         bool radPagedGpuUploadRequested(const SplatData& data) {
-            if (!data.lod_tree || !data.lod_tree->rad_source.valid()) {
-                return false;
-            }
-            const std::size_t logical_chunks = data.lod_tree->chunk_count();
-            if (logical_chunks <= 1) {
-                return false;
-            }
-            const char* const env = std::getenv("LFS_LOD_PAGE_CAPACITY");
-            if (env == nullptr || env[0] == '\0') {
-                return false;
-            }
-            try {
-                const std::size_t requested = static_cast<std::size_t>(std::stoull(env));
-                const std::size_t physical_pages = std::clamp(requested, std::size_t{1}, logical_chunks);
-                return physical_pages < logical_chunks;
-            } catch (...) {
-                return false;
-            }
+            return rad_paged_load_recommended(data);
         }
     } // namespace
 
@@ -109,10 +92,11 @@ namespace lfs::io {
 
         SplatData& data = *splat_result;
         if (radPagedGpuUploadRequested(data)) {
+            const char* const page_capacity_env = std::getenv("LFS_LOD_PAGE_CAPACITY");
             LOG_INFO("RAD paged LOD active: deferring full CUDA tensor migration "
                      "(chunks={}, requested_pages={})",
                      data.lod_tree->chunk_count(),
-                     std::getenv("LFS_LOD_PAGE_CAPACITY"));
+                     page_capacity_env != nullptr ? page_capacity_env : "auto");
         } else {
             // Move tensors to CUDA for Vulkan renderer compatibility.
             data.means_raw() = data.means_raw().to(Device::CUDA);

@@ -6,11 +6,33 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <limits>
 #include <numeric>
 #include <utility>
 
 namespace lfs::vis {
+namespace {
+
+    std::size_t pageRequestBudgetFor(const std::size_t physical_pages) {
+        if (physical_pages == 0) {
+            return 0;
+        }
+
+        if (const char* const env = std::getenv("LFS_LOD_PREFETCH_MAX_REQUESTS")) {
+            char* end = nullptr;
+            const auto parsed = std::strtoull(env, &end, 10);
+            if (end != env && parsed > 0) {
+                return std::min<std::size_t>(static_cast<std::size_t>(parsed), physical_pages);
+            }
+        }
+
+        const std::size_t lower = std::min<std::size_t>(8, physical_pages);
+        const std::size_t upper = std::min<std::size_t>(64, physical_pages);
+        return std::clamp<std::size_t>(physical_pages / 4, lower, upper);
+    }
+
+} // namespace
 
     void LodPageCache::reset() {
         pages_.clear();
@@ -91,6 +113,8 @@ namespace lfs::vis {
             return;
         }
         collectFinishedDecodes();
+        const std::size_t request_budget = pageRequestBudgetFor(pages_.size());
+        std::size_t new_requests = 0;
 
         std::vector<std::uint8_t> protected_pages;
         if (!protected_chunks.empty()) {
@@ -106,11 +130,31 @@ namespace lfs::vis {
             }
         }
 
+        const auto has_pending_upload = [&](const std::uint32_t chunk) {
+            return std::any_of(pending_uploads_.begin(), pending_uploads_.end(), [chunk](const PendingUpload& upload) {
+                return upload.chunk == chunk;
+            });
+        };
+
         for (const std::uint32_t chunk : chunks) {
             if (chunk >= snapshot_.logical_chunks) {
                 continue;
             }
+            const bool resident =
+                chunk < snapshot_.chunk_to_page.size() &&
+                snapshot_.chunk_to_page[chunk] != kInvalidPage;
+            const bool active_request = resident || decodeInFlight(chunk) || has_pending_upload(chunk);
+            if (!active_request) {
+                const std::size_t outstanding = decode_jobs_.size() + pending_uploads_.size();
+                if (new_requests >= request_budget || outstanding >= request_budget) {
+                    continue;
+                }
+            }
+            const std::size_t before = decode_jobs_.size() + pending_uploads_.size();
             requestResident(chunk, false, protected_pages);
+            if (!active_request && decode_jobs_.size() + pending_uploads_.size() > before) {
+                ++new_requests;
+            }
         }
     }
 
@@ -207,8 +251,6 @@ namespace lfs::vis {
     void LodPageCache::reserveUpload(const std::size_t page,
                                      const std::uint32_t chunk,
                                      const bool pin) {
-        invalidateResidentPage(page);
-
         auto& slot = pages_[page];
         slot.loading_chunk = chunk;
         slot.last_used = ++clock_;

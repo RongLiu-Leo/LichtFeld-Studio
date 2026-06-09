@@ -828,8 +828,11 @@ namespace lfs::python {
         add_float(&Proxy::lod_max_splats, "lod_max_splats", "LOD Budget",
                   "Maximum number of splats in the dynamic LOD cut",
                   static_cast<double>(vis::DEFAULT_LOD_MAX_SPLATS), 1.0, 10000000.0);
+        add_float(&Proxy::lod_page_pool_splats, "lod_page_pool_splats", "LOD Cache Budget",
+                  "VRAM page-pool budget in splats for streamed RAD scenes (0 = auto)",
+                  static_cast<double>(vis::DEFAULT_LOD_PAGE_POOL_SPLATS), 0.0, 100000000.0);
         add_float(&Proxy::lod_render_scale, "lod_render_scale", "Render Scale",
-                  "Resolution multiplier for LOD calculations", vis::DEFAULT_LOD_RENDER_SCALE, 0.1, 2.0);
+                  "Quality multiplier: effective splat target = LOD Budget x Render Scale", vis::DEFAULT_LOD_RENDER_SCALE, 0.1, 5.0);
         add_float(&Proxy::lod_cone_foveation, "lod_cone_foveation", "Cone Foveation",
                   "Peripheral LOD penalty factor (1.0 = no penalty)", vis::DEFAULT_LOD_CONE_FOVEATION, 0.1, 2.0);
         add_float(&Proxy::lod_cone_inner_degrees, "lod_cone_inner_degrees", "Cone Inner",
@@ -1291,6 +1294,7 @@ namespace lfs::python {
         result["selected"] = stats.selected_splats;
         result["budget"] = stats.max_splats;
         result["requested_budget"] = stats.requested_max_splats;
+        result["budget_repair_limit"] = stats.budget_repair_limit;
         result["generation"] = stats.generation;
         result["selection_hash"] = stats.selection_hash;
         result["model_splats"] = stats.model_splats;
@@ -1301,8 +1305,17 @@ namespace lfs::python {
         result["budget_limited"] = stats.budget_limited;
         result["threshold_limited"] = stats.threshold_limited;
         result["output_limited"] = stats.output_limited;
+        result["budget_fill_active"] = stats.budget_fill_active;
+        result["budget_repair_active"] = stats.budget_repair_active;
         result["full_quality_reference"] = stats.full_quality_reference;
+        result["transition_active"] = stats.transition_active;
+        result["outside_view_nodes"] = stats.outside_view_nodes;
+        result["behind_view_nodes"] = stats.behind_view_nodes;
+        result["viewport_throttled_nodes"] = stats.viewport_throttled_nodes;
+        result["touched_chunks"] = stats.touched_chunks;
+        result["resident_chunks"] = stats.resident_chunks;
         result["pixel_scale_limit"] = stats.pixel_scale_limit;
+        result["budget_fill_pixel_scale_limit"] = stats.budget_fill_pixel_scale_limit;
         result["min_pixel_scale"] = stats.min_pixel_scale;
         nb::list levels;
         for (const auto& [level, count] : stats.level_histogram) {
@@ -1638,7 +1651,8 @@ namespace lfs::python {
                     return static_cast<float>(self.height) / self.ortho_scale;
                 },
                 "Vertical view extent in world units (Blender-compatible orthographic scale). Larger when zoomed out, smaller when zoomed in.")
-            .def_prop_ro("position", [](const PyViewInfo& self) -> std::tuple<float, float, float> {
+            .def_prop_ro(
+                "position", [](const PyViewInfo& self) -> std::tuple<float, float, float> {
                     auto t = self.translation.tensor().cpu();
                     auto acc = t.accessor<float, 1>();
                     return {acc(0), acc(1), acc(2)}; }, "Camera position as (x, y, z) tuple");

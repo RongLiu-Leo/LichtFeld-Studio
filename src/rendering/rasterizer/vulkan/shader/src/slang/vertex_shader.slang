@@ -370,6 +370,26 @@ layout(binding=18) RWStructuredBuffer<uint32_t> out_primitive_depth_keys;
 layout(binding=19) StructuredBuffer<uint32_t> lod_indices;
 layout(binding=20) StructuredBuffer<uint32_t> lod_logical_indices;
 layout(binding=21) StructuredBuffer<uint32_t> lod_levels;
+layout(binding=22) StructuredBuffer<float> lod_weights;
+// GPU LoD selector append count; [0] = appended total (may exceed capacity).
+layout(binding=23) StructuredBuffer<uint32_t> lod_counts;
+
+[ForceInline]
+void clear_forward_projection_output(uint out_idx, uint overlay_flags) {
+    out_overlay_flags[out_idx] = overlay_flags;
+    out_radii[out_idx] = 0;
+    out_tiles_touched[out_idx] = 0;
+  #if USE_EMULATED_INT64
+    out_rect_tile_space[2*out_idx+0] = 0;
+    out_rect_tile_space[2*out_idx+1] = 0;
+  #else
+    out_rect_tile_space[out_idx] = int64_t(0);
+  #endif
+    out_xy_vs[out_idx] = float2(0.0);
+    out_depths[out_idx] = 0.0;
+    out_inv_cov_vs[out_idx] = float4(0.0);
+    write_t3_float3(float3(0.0), out_idx, out_rgb);
+}
 
 
 #elif EXPORT_MODE == EXPORT_MODE_VULKAN_BACKWARD
@@ -421,6 +441,7 @@ void main(
 
     uint g_idx = dispatchThreadID.x;
     uint render_idx = g_idx;
+    const uint out_idx = render_idx;
 
     if (g_idx >= uniforms.num_splats)
         return;
@@ -429,12 +450,26 @@ void main(
     const bool lod_active = (uniforms.lod_enabled & 1u) != 0u;
     uint logical_idx = g_idx;
     if (lod_active) {
+      #if EXPORT_MODE == EXPORT_MODE_VULKAN_FORWARD
+        if ((uniforms.lod_enabled & 32u) != 0u) {
+            const uint valid = min(lod_counts[0], uniforms.lod_count);
+            if (render_idx >= valid) {
+                clear_forward_projection_output(out_idx, 0u);
+                return;
+            }
+        }
+      #endif
         g_idx = lod_indices[render_idx];
+        if (g_idx == 0xffffffffu || g_idx >= uniforms.model_num_splats) {
+          #if EXPORT_MODE == EXPORT_MODE_VULKAN_FORWARD
+            clear_forward_projection_output(out_idx, 0u);
+          #endif
+            return;
+        }
         logical_idx = (uniforms.lod_enabled & 8u) != 0u
             ? lod_logical_indices[render_idx]
             : g_idx;
     }
-    const uint out_idx = render_idx;
 
   #if EXPORT_MODE == EXPORT_MODE_VULKAN_BACKWARD
     // no overlap
@@ -472,6 +507,9 @@ void main(
         active_sh,
         uniforms.shN_layout_slots
       );
+    if (lod_active && (uniforms.lod_enabled & 16u) != 0u) {
+        gauss.opacities *= clamp(lod_weights[render_idx], 0.0f, 1.0f);
+    }
   #else
     #if EXPORT_MODE == EXPORT_MODE_VULKAN_BACKWARD && !EARLY_RETURN_ON_ZERO_GRAD
     Gaussian_3D gauss = load_zero_gaussian();
@@ -582,15 +620,7 @@ void main(
     }
 
     if (!active) {
-        out_overlay_flags[out_idx] = overlay_flags;
-        out_radii[out_idx] = 0;
-        out_tiles_touched[out_idx] = 0;
-      #if USE_EMULATED_INT64
-        out_rect_tile_space[2*out_idx+0] = 0;
-        out_rect_tile_space[2*out_idx+1] = 0;
-      #else
-        out_rect_tile_space[out_idx] = int64_t(0);
-      #endif
+        clear_forward_projection_output(out_idx, overlay_flags);
         return;
     }
 #endif
@@ -652,15 +682,7 @@ void main(
         splat.det <= 0.0
     ) {
         #if EXPORT_MODE == EXPORT_MODE_VULKAN_FORWARD
-            out_overlay_flags[out_idx] = overlay_flags;
-            out_radii[out_idx] = 0;
-            out_tiles_touched[out_idx] = 0;
-          #if USE_EMULATED_INT64
-            out_rect_tile_space[2*out_idx+0] = 0;
-            out_rect_tile_space[2*out_idx+1] = 0;
-          #else
-            out_rect_tile_space[out_idx] = int64_t(0);
-          #endif
+            clear_forward_projection_output(out_idx, overlay_flags);
         #endif
         return;
     }
@@ -688,15 +710,7 @@ void main(
     int32_t n_tiles = int32_t(rect_tile_space.max_x - rect_tile_space.min_x) * int32_t(rect_tile_space.max_y - rect_tile_space.min_y);
     if (n_tiles == 0) {
         #if EXPORT_MODE == EXPORT_MODE_VULKAN_FORWARD
-            out_overlay_flags[out_idx] = overlay_flags;
-            out_radii[out_idx] = 0;
-            out_tiles_touched[out_idx] = 0;
-          #if USE_EMULATED_INT64
-            out_rect_tile_space[2*out_idx+0] = 0;
-            out_rect_tile_space[2*out_idx+1] = 0;
-          #else
-            out_rect_tile_space[out_idx] = int64_t(0);
-          #endif
+            clear_forward_projection_output(out_idx, overlay_flags);
         #endif
         return;
     }

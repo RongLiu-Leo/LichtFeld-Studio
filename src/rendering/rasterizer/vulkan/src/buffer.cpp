@@ -30,6 +30,13 @@ size_t VulkanGSPipelineBuffers::getTotalOwnedAllocSize() const {
     ADD_OWNED(lod_indices);
     ADD_OWNED(lod_logical_indices);
     ADD_OWNED(lod_levels);
+    ADD_OWNED(lod_weights);
+    ADD_OWNED(lod_gpu_indices);
+    ADD_OWNED(lod_gpu_logical_indices);
+    ADD_OWNED(lod_gpu_weights);
+    ADD_OWNED(lod_gpu_counts);
+    ADD_OWNED(lod_chunk_touch);
+    ADD_OWNED(lod_gpu_levels);
     ADD_OWNED(primitive_sort_indices);
     ADD_OWNED(tiles_touched_depth_ordered);
     ADD_OWNED(visible_flags);
@@ -90,6 +97,13 @@ std::map<std::string, size_t> VulkanGSPipelineBuffers::getOwnedVramBreakdown() c
     ADD_OWNED(lod_indices);
     ADD_OWNED(lod_logical_indices);
     ADD_OWNED(lod_levels);
+    ADD_OWNED(lod_weights);
+    ADD_OWNED(lod_gpu_indices);
+    ADD_OWNED(lod_gpu_logical_indices);
+    ADD_OWNED(lod_gpu_weights);
+    ADD_OWNED(lod_gpu_counts);
+    ADD_OWNED(lod_chunk_touch);
+    ADD_OWNED(lod_gpu_levels);
     ADD_OWNED(primitive_sort_indices);
     ADD_OWNED(tiles_touched_depth_ordered);
     ADD_OWNED(visible_flags);

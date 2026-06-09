@@ -44,6 +44,10 @@ namespace lfs::vis {
             bool flip_y = false;
             VkSemaphore completion_semaphore = VK_NULL_HANDLE;
             std::uint64_t completion_value = 0;
+            std::uint64_t lod_page_generation = 0;
+            // True while page decodes/uploads are still in flight; the caller
+            // should keep scheduling frames so streaming converges while idle.
+            bool lod_streaming_active = false;
         };
 
         struct ModelInputSnapshot {
@@ -153,6 +157,24 @@ namespace lfs::vis {
             const lfs::core::SplatData& splat_data);
         [[nodiscard]] std::optional<LodPageCache::Snapshot> lodPageCacheSnapshot(
             const lfs::core::SplatData& splat_data) const;
+        // VRAM page-pool budget in splats for RAD-backed LoD streaming; 0 = full residency.
+        void setLodPagePoolBudget(std::size_t splats) { lod_page_pool_splats_ = splats; }
+
+        // Snapshot of the GPU LoD selector for stats overlays; counts are from
+        // the deferred readback (one frame stale).
+        struct GpuLodSelectionStatus {
+            bool active = false;
+            std::size_t selected = 0;
+            std::size_t capacity = 0;
+            std::size_t overflow = 0;
+            float pixel_scale_feedback = 1.0f;
+            std::size_t resident_chunks = 0;
+            std::size_t chunk_count = 0;
+            std::size_t touched_chunks = 0;
+            std::size_t pool_pages = 0;
+            std::size_t streaming_jobs = 0;
+        };
+        [[nodiscard]] GpuLodSelectionStatus gpuLodSelectionStatus() const;
 
     private:
         struct ComposePipeline;
@@ -173,6 +195,8 @@ namespace lfs::vis {
             const lfs::core::SplatData& splat_data,
             std::size_t ring_slot,
             int upload_sh_degree);
+        [[nodiscard]] std::expected<void, std::string> ensureGpuLodTreeStorage(
+            const lfs::core::SplatData& splat_data);
         [[nodiscard]] std::expected<void, std::string> uploadLodPageInputs(
             const lfs::core::SplatData& splat_data,
             std::span<const LodPageCache::PendingUpload> uploads,
@@ -312,6 +336,7 @@ namespace lfs::vis {
                                       std::size_t num_pixels,
                                       std::size_t num_tiles);
         void releasePrivateScratchBuffers();
+        void releaseGpuLodTreeStorage();
         void detachSharedScratchBuffers();
         void releaseSharedScratchImportOnly();
         void releaseSharedScratchArena();
@@ -354,12 +379,45 @@ namespace lfs::vis {
         LodUploadSignature uploaded_lod_indices_{};
         LodUploadSignature uploaded_lod_logical_indices_{};
         LodUploadSignature uploaded_lod_levels_{};
+        LodUploadSignature uploaded_lod_weights_{};
         bool lod_indices_upload_pending_ = false;
         bool lod_logical_indices_upload_pending_ = false;
         bool lod_levels_upload_pending_ = false;
+        bool lod_weights_upload_pending_ = false;
+        float gpu_lod_pixel_scale_feedback_ = 1.0f;
+        std::size_t gpu_lod_last_candidate_count_ = 0;
+        std::size_t gpu_lod_last_overflow_count_ = 0;
+        // GPU traversal-touched chunks from the deferred selector readback,
+        // ordered for LodPageCache::submitTraversalPriority (protected chunks
+        // first for LRU refresh, then misses by descending priority).
+        std::vector<std::uint32_t> gpu_lod_prefetch_chunks_;
+        std::vector<std::uint32_t> gpu_lod_protected_chunks_;
+        bool gpu_lod_prefetch_valid_ = false;
+        bool gpu_lod_selection_active_ = false;
+        std::size_t gpu_lod_render_capacity_last_ = 0;
         const lfs::core::SplatData* lod_page_cache_model_ = nullptr;
         LodPageCache lod_page_cache_;
-        std::uint64_t lod_page_cache_prefetch_generation_ = 0;
+        std::size_t lod_page_pool_splats_ = 0;
+        struct GpuLodTreeStorage {
+            // Bounds layout: float4(center.xyz, size) per physical-page LoD node.
+            Buffer<float> node_bounds;
+            // Link layout: uint4(child_start, packed(child_count:16, level:8, flags:8),
+            //                    parent_logical, logical).
+            Buffer<std::uint32_t> node_links;
+            Buffer<std::uint32_t> page_to_chunk;
+            Buffer<std::uint32_t> chunk_to_page;
+            const lfs::core::SplatData* model = nullptr;
+            std::size_t node_count = 0;
+            std::size_t physical_node_capacity = 0;
+            std::size_t logical_chunks = 0;
+            std::size_t physical_pages = 0;
+            std::uint64_t tree_signature = 0;
+            std::uint64_t page_map_generation = 0;
+            std::vector<std::uint32_t> parent_indices;
+            std::vector<std::uint32_t> page_to_chunk_cpu;
+            bool valid = false;
+        };
+        GpuLodTreeStorage gpu_lod_tree_;
         struct LodPageInputStorage {
             VulkanContext::ExternalBuffer buffer{};
             lfs::rendering::CudaVulkanBufferInterop interop{};
