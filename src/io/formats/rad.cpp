@@ -2646,11 +2646,11 @@ namespace lfs::io {
                                 int coeff = std::stoi(prop.property.substr(first_underscore + 1, second_underscore - first_underscore - 1));
                                 int ch = prop.property.back() - '0';
                                 PropertyDecoder::decode_sh(prop_data.data(), comp_data.data(), 1, chunk_count,
-                                                            prop.encoding,
-                                                            prop.min_val.value_or(0.0f),
-                                                            prop.max_val.value_or(1.0f),
-                                                            prop.base.value_or(0.0f),
-                                                            prop.scale.value_or(1.0f));
+                                                           prop.encoding,
+                                                           prop.min_val.value_or(0.0f),
+                                                           prop.max_val.value_or(1.0f),
+                                                           prop.base.value_or(0.0f),
+                                                           prop.scale.value_or(1.0f));
                                 for (size_t i = 0; i < chunk_count; ++i) {
                                     chunk_shN[i * sh_coeffs * 3 + coeff * 3 + ch] = comp_data[i];
                                 }

@@ -160,7 +160,7 @@ namespace lfs::vis::gui {
         }
 
         [[nodiscard]] std::string formatLodPercent(const std::size_t numerator,
-                                                    const std::size_t denominator) {
+                                                   const std::size_t denominator) {
             if (denominator == 0)
                 return "";
             const double ratio =

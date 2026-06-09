@@ -28,11 +28,11 @@
 #endif
 #else
 #define LFS_LOCAL_SYMBOL __attribute__((visibility("hidden")))
-#define LFS_LOGGER_API __attribute__((visibility("default")))
-#define LFS_CORE_API   __attribute__((visibility("default")))
-#define LFS_IO_API     __attribute__((visibility("default")))
-#define LFS_VIS_API    __attribute__((visibility("default")))
-#define LFS_MCP_API    __attribute__((visibility("default")))
+#define LFS_LOGGER_API   __attribute__((visibility("default")))
+#define LFS_CORE_API     __attribute__((visibility("default")))
+#define LFS_IO_API       __attribute__((visibility("default")))
+#define LFS_VIS_API      __attribute__((visibility("default")))
+#define LFS_MCP_API      __attribute__((visibility("default")))
 #endif
 
 // For functions in CUDA static libs (lfs_core_cuda) that are resolved directly

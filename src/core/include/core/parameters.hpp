@@ -309,7 +309,7 @@ namespace lfs::core {
             OutputFormat format = OutputFormat::PLY;
             int sh_degree = 3; // 0-3, -1 = keep original
             int sog_iterations = 10;
-            bool overwrite = false;            // Skip overwrite prompts
+            bool overwrite = false; // Skip overwrite prompts
         };
 
         // Parameters for the mesh2splat command

@@ -30,7 +30,7 @@ PACK_STRUCT(struct VulkanGSRendererUniforms {
     float fy;
     float cx;
     float cy;
-    uint32_t pad3[2];          // align dist_coeffs to 16 bytes (match shader)
+    uint32_t pad3[2]; // align dist_coeffs to 16 bytes (match shader)
     float dist_coeffs[4];
     float world_view_transform[16];
 });

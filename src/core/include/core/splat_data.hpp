@@ -30,7 +30,7 @@ namespace lfs::core {
 
     struct SplatLodTree {
         static constexpr std::size_t kChunkSplats = 65'536;
-        static constexpr uint32_t    kInvalidPage = 0xFFFFFFFFu;
+        static constexpr uint32_t kInvalidPage = 0xFFFFFFFFu;
 
         struct ChunkFileRange {
             uint64_t file_offset = 0;
@@ -52,17 +52,17 @@ namespace lfs::core {
 
         std::vector<uint16_t> child_count;
         std::vector<uint32_t> child_start;
-        std::vector<uint8_t>  lod_level;
+        std::vector<uint8_t> lod_level;
         std::vector<glm::vec3> centers;
-        std::vector<float>     sizes;
+        std::vector<float> sizes;
         std::vector<uint32_t> page_to_chunk;
         std::vector<uint32_t> chunk_to_page;
-        RadSource             rad_source;
-        bool                   lod_opacity_encoded = false;
+        RadSource rad_source;
+        bool lod_opacity_encoded = false;
 
         size_t total_nodes() const { return child_count.size(); }
         size_t chunk_count() const { return (total_nodes() + kChunkSplats - 1) / kChunkSplats; }
-        bool   has_tree() const  { return !child_count.empty(); }
+        bool has_tree() const { return !child_count.empty(); }
     };
 
     using SplatTensorAllocator = std::function<Tensor(TensorShape shape,

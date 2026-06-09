@@ -20,7 +20,7 @@ namespace lfs::vis {
     class LodPageCache {
     public:
         static constexpr std::uint32_t kInvalidPage = lfs::core::SplatLodTree::kInvalidPage;
-        static constexpr std::size_t   kChunkSplats = lfs::core::SplatLodTree::kChunkSplats;
+        static constexpr std::size_t kChunkSplats = lfs::core::SplatLodTree::kChunkSplats;
 
         struct Snapshot {
             std::vector<std::uint32_t> page_to_chunk;
