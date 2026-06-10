@@ -184,6 +184,17 @@ namespace lfs::core {
         uint64_t begin_frame(cudaStream_t stream, bool from_rendering = false);
         std::optional<uint64_t> try_begin_frame(bool from_rendering = false) { return try_begin_frame(nullptr, from_rendering); }
         std::optional<uint64_t> try_begin_frame(cudaStream_t stream, bool from_rendering = false);
+
+        // Bounded wait: with a render pending (set_rendering_active), the trainer
+        // cannot START a new frame, so waiting out its current one takes ~one
+        // iteration. The timeout covers the refining-iteration case where the
+        // trainer holds the frame while blocked on the exclusive render lock the
+        // caller's shared lock prevents — give up there instead of deadlocking.
+        std::optional<uint64_t> try_begin_frame_for(uint32_t timeout_ms, bool from_rendering = false) {
+            return try_begin_frame_for(timeout_ms, nullptr, from_rendering);
+        }
+        std::optional<uint64_t> try_begin_frame_for(uint32_t timeout_ms, cudaStream_t stream,
+                                                    bool from_rendering = false);
         void end_frame(uint64_t frame_id, bool from_rendering = false) { end_frame(frame_id, nullptr, from_rendering); }
         void end_frame(uint64_t frame_id, cudaStream_t stream, bool from_rendering = false);
 
@@ -223,7 +234,9 @@ namespace lfs::core {
 
     private:
         Arena& get_or_create_arena(int device);
-        std::optional<uint64_t> begin_frame_impl(cudaStream_t stream, bool from_rendering, bool wait);
+        // wait_timeout: nullopt = non-blocking try; 0 = wait forever; else bounded.
+        std::optional<uint64_t> begin_frame_impl(cudaStream_t stream, bool from_rendering,
+                                                 std::optional<uint32_t> wait_timeout_ms);
         bool wait_for_previous_frame(cudaStream_t stream);
         bool install_external_backing_impl(ExternalBacking backing, bool wait);
         char* allocate_internal(Arena& arena, size_t size, uint64_t frame_id);

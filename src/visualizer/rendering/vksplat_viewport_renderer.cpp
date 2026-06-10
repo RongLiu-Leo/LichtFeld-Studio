@@ -143,7 +143,13 @@ namespace lfs::vis {
                 arena_->set_rendering_active(true);
                 render_pending_ = true;
                 try {
-                    auto frame_id = arena_->try_begin_frame(true);
+                    // The pending-render flag (set above) keeps the trainer from
+                    // STARTING a new frame, so this bounded wait is normally one
+                    // training iteration. It times out instead of deadlocking on
+                    // refining iterations, where the trainer holds the frame
+                    // while blocked on the exclusive render lock our caller's
+                    // shared lock excludes.
+                    auto frame_id = arena_->try_begin_frame_for(15, true);
                     if (!frame_id) {
                         throw std::runtime_error("rasterizer arena is busy");
                     }

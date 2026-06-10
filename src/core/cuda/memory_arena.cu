@@ -143,7 +143,7 @@ namespace lfs::core {
     }
 
     uint64_t RasterizerMemoryArena::begin_frame(cudaStream_t stream, bool from_rendering) {
-        auto frame_id = begin_frame_impl(stream, from_rendering, true);
+        auto frame_id = begin_frame_impl(stream, from_rendering, 0u);
         if (!frame_id) {
             throw std::runtime_error("RasterizerMemoryArena::begin_frame failed to acquire arena frame");
         }
@@ -151,7 +151,13 @@ namespace lfs::core {
     }
 
     std::optional<uint64_t> RasterizerMemoryArena::try_begin_frame(cudaStream_t stream, bool from_rendering) {
-        return begin_frame_impl(stream, from_rendering, false);
+        return begin_frame_impl(stream, from_rendering, std::nullopt);
+    }
+
+    std::optional<uint64_t> RasterizerMemoryArena::try_begin_frame_for(uint32_t timeout_ms,
+                                                                       cudaStream_t stream,
+                                                                       bool from_rendering) {
+        return begin_frame_impl(stream, from_rendering, timeout_ms);
     }
 
     void RasterizerMemoryArena::note_external_release(cudaExternalSemaphore_t semaphore, uint64_t value) {
@@ -210,15 +216,20 @@ namespace lfs::core {
         return cudaDeviceSynchronize() == cudaSuccess;
     }
 
-    std::optional<uint64_t> RasterizerMemoryArena::begin_frame_impl(cudaStream_t stream, bool from_rendering, bool wait) {
+    std::optional<uint64_t> RasterizerMemoryArena::begin_frame_impl(cudaStream_t stream, bool from_rendering,
+                                                                    std::optional<uint32_t> wait_timeout_ms) {
         {
             std::unique_lock<std::mutex> sync_lock(sync_mutex_);
             const auto can_begin = [this, from_rendering]() {
                 return active_frames_ == 0 && (from_rendering || pending_render_frames_ == 0);
             };
-            if (wait) {
+            if (!wait_timeout_ms.has_value()) {
+                if (!can_begin()) {
+                    return std::nullopt;
+                }
+            } else if (*wait_timeout_ms == 0u) {
                 sync_cv_.wait(sync_lock, can_begin);
-            } else if (!can_begin()) {
+            } else if (!sync_cv_.wait_for(sync_lock, std::chrono::milliseconds(*wait_timeout_ms), can_begin)) {
                 return std::nullopt;
             }
             ++active_frames_;
