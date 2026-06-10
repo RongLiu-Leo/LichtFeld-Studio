@@ -163,6 +163,23 @@ namespace lfs::training {
         // Allow viewer to lock for rendering
         std::shared_mutex& getRenderMutex() const { return render_mutex_; }
 
+        // GPU-side model-read handshake. Call both under a shared lock on
+        // getRenderMutex(), bracketing every GPU read of the live model enqueued
+        // on reader_stream: beginModelRead orders the reads after the last
+        // consistent parameter state; endModelRead records the reads so the next
+        // optimizer step waits for them (GPU-side, no CPU blocking).
+        void beginModelRead(cudaStream_t reader_stream);
+        void endModelRead(cudaStream_t reader_stream);
+
+        cudaStream_t trainingStream() const { return training_stream_; }
+
+        // Reverse edge for the zero-copy viewport: the viewer's render-complete
+        // timeline imported into CUDA, plus the latest timeline value covering
+        // submits that bound live training storage. The trainer waits the value
+        // on its stream before the next step's in-place writes.
+        void setViewerReleaseFence(cudaExternalSemaphore_t semaphore);
+        void publishViewerBorrow(uint64_t value);
+
         const lfs::core::param::TrainingParameters& getParams() const { return params_; }
         void setParams(const lfs::core::param::TrainingParameters& params);
         void setSplatTensorAllocator(lfs::core::SplatTensorAllocator allocator) {
@@ -495,6 +512,29 @@ namespace lfs::training {
         // thread's current stream in train()). LFS_TRAIN_STREAM_LEGACY=1 keeps
         // training on the legacy default stream.
         cudaStream_t training_stream_ = nullptr;
+
+        // Trainer↔viewer GPU handshake. Forward edge: params_ready_event_ marks
+        // a consistent end-of-step parameter state; readers wait on it before
+        // enqueuing reads (beginModelRead). Reverse edges: reader_done ring
+        // events plus the viewer's exported release fence gate the next step's
+        // in-place writes behind in-flight reads — GPU-side only, no CPU stall.
+        // Lock order: render_mutex_ → stream_sync_mutex_ (leaf; only CUDA
+        // record/wait calls under it).
+        static constexpr size_t READER_DONE_RING = 4;
+        cudaEvent_t params_ready_event_ = nullptr;
+        bool params_ready_recorded_ = false;
+        std::array<cudaEvent_t, READER_DONE_RING> reader_done_events_{};
+        uint32_t reader_done_head_ = 0;
+        uint32_t reader_done_pending_ = 0;
+        cudaExternalSemaphore_t viewer_release_semaphore_ = nullptr;
+        std::atomic<uint64_t> viewer_borrow_value_{0};
+        uint64_t viewer_borrow_waited_ = 0;
+        mutable std::mutex stream_sync_mutex_;
+
+        void createSyncPrimitives();
+        void destroySyncPrimitives();
+        void recordParamsReady();
+        void waitForModelReaders();
 
         // Python control scripts (file paths) to execute before training starts
         std::vector<std::filesystem::path> python_scripts_;

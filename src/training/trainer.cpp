@@ -1620,6 +1620,7 @@ namespace lfs::training {
         cudaStreamCreate(&training_stream_);
         nvtxNameCudaStreamA(training_stream_, "lfs.train");
         nvtxNameCudaStreamA(callback_stream_, "lfs.train.callback");
+        createSyncPrimitives();
 
         LOG_DEBUG("Trainer constructed with {} cameras", base_dataset_->get_cameras().size());
     }
@@ -1640,12 +1641,107 @@ namespace lfs::training {
         cudaStreamCreate(&training_stream_);
         nvtxNameCudaStreamA(training_stream_, "lfs.train");
         nvtxNameCudaStreamA(callback_stream_, "lfs.train.callback");
+        createSyncPrimitives();
 
         if (!scene.hasTrainingData()) {
             throw std::runtime_error("Scene has no cameras");
         }
 
         LOG_DEBUG("Trainer constructed from Scene with {} cameras", scene.getAllCameras().size());
+    }
+
+    void Trainer::createSyncPrimitives() {
+        cudaEventCreateWithFlags(&params_ready_event_, cudaEventDisableTiming);
+        for (auto& event : reader_done_events_) {
+            cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+        }
+    }
+
+    void Trainer::destroySyncPrimitives() {
+        std::lock_guard<std::mutex> lock(stream_sync_mutex_);
+        params_ready_recorded_ = false;
+        reader_done_pending_ = 0;
+        viewer_release_semaphore_ = nullptr;
+        if (params_ready_event_) {
+            cudaEventDestroy(params_ready_event_);
+            params_ready_event_ = nullptr;
+        }
+        for (auto& event : reader_done_events_) {
+            if (event) {
+                cudaEventDestroy(event);
+                event = nullptr;
+            }
+        }
+    }
+
+    void Trainer::beginModelRead(cudaStream_t reader_stream) {
+        std::lock_guard<std::mutex> lock(stream_sync_mutex_);
+        if (params_ready_event_ && params_ready_recorded_) {
+            cudaStreamWaitEvent(reader_stream, params_ready_event_, 0);
+        }
+    }
+
+    void Trainer::endModelRead(cudaStream_t reader_stream) {
+        std::lock_guard<std::mutex> lock(stream_sync_mutex_);
+        cudaEvent_t& slot = reader_done_events_[reader_done_head_];
+        if (!slot) {
+            return;
+        }
+        const uint32_t bit = 1u << reader_done_head_;
+        if (reader_done_pending_ & bit) {
+            // Ring full: the slot's previous record hasn't been consumed by a
+            // step yet. Drain it host-side before reuse — re-recording would
+            // drop the older reader's edge.
+            cudaEventSynchronize(slot);
+        }
+        if (cudaEventRecord(slot, reader_stream) == cudaSuccess) {
+            reader_done_pending_ |= bit;
+        }
+        reader_done_head_ = (reader_done_head_ + 1) % READER_DONE_RING;
+    }
+
+    void Trainer::setViewerReleaseFence(cudaExternalSemaphore_t semaphore) {
+        std::lock_guard<std::mutex> lock(stream_sync_mutex_);
+        viewer_release_semaphore_ = semaphore;
+        viewer_borrow_waited_ = 0;
+    }
+
+    void Trainer::publishViewerBorrow(uint64_t value) {
+        viewer_borrow_value_.store(value, std::memory_order_release);
+    }
+
+    void Trainer::recordParamsReady() {
+        std::lock_guard<std::mutex> lock(stream_sync_mutex_);
+        if (!params_ready_event_) {
+            return;
+        }
+        // training_stream_ is a blocking stream, so the record is also ordered
+        // after the legacy-stream rasterizer writes enqueued this step.
+        if (cudaEventRecord(params_ready_event_, training_stream_) == cudaSuccess) {
+            params_ready_recorded_ = true;
+        }
+    }
+
+    void Trainer::waitForModelReaders() {
+        std::lock_guard<std::mutex> lock(stream_sync_mutex_);
+        if (reader_done_pending_ != 0) {
+            for (size_t i = 0; i < READER_DONE_RING; ++i) {
+                if (reader_done_pending_ & (1u << i)) {
+                    cudaStreamWaitEvent(training_stream_, reader_done_events_[i], 0);
+                }
+            }
+            reader_done_pending_ = 0;
+        }
+
+        const uint64_t borrow = viewer_borrow_value_.load(std::memory_order_acquire);
+        if (viewer_release_semaphore_ && borrow > viewer_borrow_waited_) {
+            cudaExternalSemaphoreWaitParams wait_params{};
+            wait_params.params.fence.value = borrow;
+            if (cudaWaitExternalSemaphoresAsync(&viewer_release_semaphore_, &wait_params, 1,
+                                                training_stream_) == cudaSuccess) {
+                viewer_borrow_waited_ = borrow;
+            }
+        }
     }
 
     bool Trainer::fillCameraLossColors(
@@ -2384,6 +2480,8 @@ namespace lfs::training {
         lfs::core::Tensor rendered;
         {
             const std::shared_lock lock(render_mutex_);
+            const cudaStream_t reader_stream = lfs::core::getCurrentCUDAStream();
+            beginModelRead(reader_stream);
 
             auto& model = strategy_->get_model();
             auto& background = background_;
@@ -2404,6 +2502,7 @@ namespace lfs::training {
                     rendered, camera.uid(), appearance.overrides, appearance.use_controller);
             }
             rendered = rendered.clamp(0.0f, 1.0f);
+            endModelRead(reader_stream);
         }
 
         CameraMetricsSnapshot snapshot;
@@ -2478,6 +2577,7 @@ namespace lfs::training {
 
         if (training_stream_) {
             cudaStreamSynchronize(training_stream_);
+            destroySyncPrimitives();
             lfs::core::CudaMemoryPool::instance().release_stream(training_stream_);
             cudaStreamDestroy(training_stream_);
             training_stream_ = nullptr;
@@ -2799,6 +2899,11 @@ namespace lfs::training {
             if (on_iteration_start_)
                 on_iteration_start_();
 
+            // Gate this step's in-place parameter writes behind in-flight model
+            // reads (viewer packs, metric renders) — GPU-side waits, ~free once
+            // the reads have retired.
+            waitForModelReaders();
+
             // Python hook: iteration start (safe, pre-forward)
             {
                 lfs::training::HookContext ctx{
@@ -2985,6 +3090,11 @@ namespace lfs::training {
                 }
                 if (auto result = ensureModelTensorAllocatorStorage(model, "fastgs strategy post_backward"); !result) {
                     return std::unexpected(result.error());
+                }
+                // Readers can re-acquire the shared lock the moment the
+                // exclusive lock drops — re-mark consistency before that.
+                if (lock.owns_lock()) {
+                    recordParamsReady();
                 }
             }
 
@@ -3761,6 +3871,9 @@ namespace lfs::training {
                                                         fused_extra_gradients,
                                                         tile_grad_depth,
                                                         tile_grad_depth.is_valid() && tile_grad_depth.numel() > 0);
+                                if (model_write_lock.owns_lock()) {
+                                    recordParamsReady();
+                                }
                             } else {
                                 cleanup_tile_context();
                             }
@@ -3996,6 +4109,10 @@ namespace lfs::training {
                     if (auto result = ensureModelTensorAllocatorStorage(model, "strategy step"); !result) {
                         return std::unexpected(result.error());
                     }
+
+                    // End-of-step: parameters are consistent until the next
+                    // step's writes; readers wait on this point.
+                    recordParamsReady();
                 }
 
                 // Clean evaluation - let the evaluator handle everything
