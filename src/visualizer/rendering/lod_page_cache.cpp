@@ -243,6 +243,7 @@ namespace lfs::vis {
         frame_ = 0;
         page_payload_bytes_ = 0;
         deferred_requests_ = 0;
+        admitted_requests_ = 0;
         last_admission_log_frame_ = 0;
     }
 
@@ -332,6 +333,7 @@ namespace lfs::vis {
     void LodPageCache::beginFrame() {
         ++frame_;
         deferred_requests_ = 0;
+        admitted_requests_ = 0;
         ensureRootResidency();
     }
 
@@ -436,6 +438,7 @@ namespace lfs::vis {
                 switch (result) {
                 case AdmitResult::Admitted:
                     ++new_requests;
+                    ++admitted_requests_;
                     break;
                 case AdmitResult::NoSlot:
                     ++deferred_requests_;

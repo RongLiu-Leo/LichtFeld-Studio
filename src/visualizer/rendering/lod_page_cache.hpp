@@ -107,6 +107,10 @@ namespace lfs::vis {
         [[nodiscard]] bool hasOutstandingWork() const { return outstandingWorkCount() > 0; }
         [[nodiscard]] std::size_t outstandingWorkCount() const;
         [[nodiscard]] std::size_t deferredRequestCount() const { return deferred_requests_; }
+        // Requests admitted (reservation created) since the last beginFrame;
+        // deferred>0 with zero admissions and nothing in flight is a frozen
+        // pool — every resident page is in the live cut and unevictable.
+        [[nodiscard]] std::size_t admittedRequestCount() const { return admitted_requests_; }
         [[nodiscard]] std::uint64_t frameIndex() const { return frame_; }
 
     private:
@@ -171,6 +175,7 @@ namespace lfs::vis {
         std::size_t root_chunk_count_ = 0;
         std::size_t page_payload_bytes_ = 0;
         std::size_t deferred_requests_ = 0;
+        std::size_t admitted_requests_ = 0;
         std::uint64_t last_admission_log_frame_ = 0;
     };
 

@@ -97,6 +97,7 @@ namespace lfs::vis {
             size_t streaming_jobs = 0;
             size_t miss_chunks = 0;
             size_t deferred_requests = 0;
+            bool admission_frozen = false;
         };
 
         SparkLodController();

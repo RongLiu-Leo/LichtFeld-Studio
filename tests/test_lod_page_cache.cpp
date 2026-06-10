@@ -79,6 +79,7 @@ namespace {
         const std::vector<std::uint32_t> wanted{42, 43};
         cache.submitTraversalPriority(wanted);
         EXPECT_TRUE(cache.hasOutstandingWork());
+        EXPECT_EQ(cache.admittedRequestCount(), 2u);
         (void)drainAndComplete(cache);
 
         EXPECT_FALSE(cache.hasOutstandingWork());
@@ -249,7 +250,10 @@ namespace {
         // Deferral must be visible without creating work: the renderer keeps
         // the frame chain alive on deferredRequestCount() so decay and the
         // threshold controller can resolve the want on later frames.
+        // deferred>0 with admitted==0 and no outstanding work is the
+        // admission-freeze signal that halts the threshold descent.
         EXPECT_FALSE(cache.hasOutstandingWork());
+        EXPECT_EQ(cache.admittedRequestCount(), 0u);
     }
 
     TEST(LodPageCache, SteadyStateProducesNoWork) {

@@ -50,6 +50,12 @@ namespace lfs::vis {
         constexpr std::uint32_t kVkSplatProjectionModeShift = 8u;
         constexpr std::uint32_t kVkSplatProjectionModeGut = 1u;
 
+        // Readback frames of deferred-wants-with-zero-admissions before the
+        // pool counts as frozen: long enough to outlast the publish
+        // protection window (3) and the eviction freshness window (12), so
+        // only a genuinely unevictable pool qualifies.
+        constexpr std::uint32_t kLodAdmissionFrozenFrames = 30u;
+
         // Bytes one pool page occupies on the GPU: page-input regions for one
         // chunk of splats (mirrors ensureLodPageInputStorage's layout) plus
         // the per-node traversal metadata (bounds 16 B + links 16 B).
@@ -1556,6 +1562,7 @@ namespace lfs::vis {
         lod_levels_upload_pending_ = false;
         lod_weights_upload_pending_ = false;
         gpu_lod_pixel_scale_feedback_ = 1.0f;
+        gpu_lod_frozen_frames_ = 0;
         gpu_lod_last_candidate_count_ = 0;
         gpu_lod_last_overflow_count_ = 0;
         lod_page_cache_model_ = nullptr;
@@ -1701,6 +1708,7 @@ namespace lfs::vis {
         lod_levels_upload_pending_ = false;
         lod_weights_upload_pending_ = false;
         gpu_lod_pixel_scale_feedback_ = 1.0f;
+        gpu_lod_frozen_frames_ = 0;
         gpu_lod_last_candidate_count_ = 0;
         gpu_lod_last_overflow_count_ = 0;
         lod_page_cache_model_ = nullptr;
@@ -1735,6 +1743,7 @@ namespace lfs::vis {
         status.touched_chunks = gpu_lod_protected_chunks_.size() + gpu_lod_prefetch_requests_.size();
         status.miss_chunks = gpu_lod_last_miss_count_;
         status.deferred_requests = lod_page_cache_.deferredRequestCount();
+        status.admission_frozen = gpu_lod_frozen_frames_ >= kLodAdmissionFrozenFrames;
         return status;
     }
 
@@ -5936,6 +5945,16 @@ namespace lfs::vis {
             // rate clamp keeps the limit (and with it the global transition
             // band and the touch set) stable at rest.
             const float previous_feedback = gpu_lod_pixel_scale_feedback_;
+            // Admission freeze: wants deferred, zero admissions, nothing in
+            // flight — every resident page is part of the live cut and can
+            // never age out, so the deferred set is permanent at this
+            // threshold. Budget-deferral cannot false-positive (it always
+            // coexists with admissions or in-flight work).
+            const bool admission_frozen =
+                lod_page_cache_.deferredRequestCount() > 0 &&
+                lod_page_cache_.admittedRequestCount() == 0 &&
+                !lod_page_cache_.hasOutstandingWork();
+            gpu_lod_frozen_frames_ = admission_frozen ? gpu_lod_frozen_frames_ + 1 : 0;
             if (lod_stats->rendered_capacity > 0) {
                 const bool converging = miss_count > 0 || lod_page_cache_.hasOutstandingWork();
                 const double fill_ratio =
@@ -5945,7 +5964,8 @@ namespace lfs::vis {
                 if (overflowed) {
                     target *= static_cast<float>(
                         std::clamp(std::pow(std::max(fill_ratio / 0.97, 1.0), 0.85), 1.02, 1.15));
-                } else if (fill_ratio < 0.85) {
+                } else if (fill_ratio < 0.85 &&
+                           gpu_lod_frozen_frames_ < kLodAdmissionFrozenFrames) {
                     // While streaming converges, parents stand in for missing
                     // children and the candidate count runs low — recover
                     // GENTLY rather than freezing: a coarse cut always has
@@ -5957,6 +5977,11 @@ namespace lfs::vis {
                     // splat budget. Overcommit is the designed operating
                     // point — parents stand in for missing chunks and
                     // priority admission allocates pages toward the gaze.
+                    // The one exception is a sustained admission freeze:
+                    // descending further only grows a want set that can
+                    // never be served (budget ≈ pool pathologies dig to the
+                    // 0.05 floor and freeze whole level bands). Halt the
+                    // descent there — one-sided, never force-coarsen.
                     const double floor_rate = converging ? 0.98 : 0.90;
                     target *= static_cast<float>(
                         std::clamp(std::pow(std::max(fill_ratio / 0.85, 0.05), 0.5), floor_rate, 1.0));
@@ -6865,13 +6890,17 @@ namespace lfs::vis {
         // so priority decay can age out idle victims and admission can retry.
         // Otherwise the frame clock freezes with misses still wanted and the
         // region under the camera stays coarse until the next input event.
+        // A long-frozen pool is the exception — nothing can progress until
+        // the view changes, so sleeping is correct; input wakes the loop and
+        // any admission resets the counter.
         const bool lod_fades_active =
             lod_fade_frames_ > 0 &&
             lod_page_cache_.frameIndex() < gpu_lod_last_publish_frame_ + lod_fade_frames_;
         const bool lod_streaming_active =
             (lod_page_inputs_active &&
              (lod_page_cache_.hasOutstandingWork() ||
-              lod_page_cache_.deferredRequestCount() > 0 ||
+              (lod_page_cache_.deferredRequestCount() > 0 &&
+               gpu_lod_frozen_frames_ < kLodAdmissionFrozenFrames) ||
               !lod_upload_engine_.idle() ||
               lod_fades_active)) ||
             visible_clamp_pending_ || instance_clamp_pending_;

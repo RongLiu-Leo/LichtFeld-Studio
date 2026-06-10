@@ -263,6 +263,9 @@ namespace lfs::vis::gui {
                 if (stats.deferred_requests > 0) {
                     streaming += std::format(" | {} deferred", stats.deferred_requests);
                 }
+                if (stats.admission_frozen) {
+                    streaming += " | FROZEN";
+                }
                 state.cache_text = std::format("{}/{} pages | {} splat pool | {}",
                                                formatLodCount(std::min(stats.resident_chunks, stats.pool_pages)),
                                                formatLodCount(stats.pool_pages),

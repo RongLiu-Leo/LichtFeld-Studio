@@ -184,6 +184,7 @@ namespace lfs::vis {
             std::size_t touched_chunks = 0;
             std::size_t miss_chunks = 0;
             std::size_t deferred_requests = 0;
+            bool admission_frozen = false;
             std::size_t pool_pages = 0;
             std::size_t streaming_jobs = 0;
         };
@@ -405,6 +406,10 @@ namespace lfs::vis {
         bool lod_levels_upload_pending_ = false;
         bool lod_weights_upload_pending_ = false;
         float gpu_lod_pixel_scale_feedback_ = 1.0f;
+        // Consecutive readback frames with deferred wants but zero
+        // admissions and nothing in flight; gates the threshold descent and
+        // the keep-rendering liveness once it crosses the frozen window.
+        std::uint32_t gpu_lod_frozen_frames_ = 0;
         std::size_t gpu_lod_last_candidate_count_ = 0;
         std::size_t gpu_lod_last_overflow_count_ = 0;
         std::size_t gpu_lod_last_miss_count_ = 0;
