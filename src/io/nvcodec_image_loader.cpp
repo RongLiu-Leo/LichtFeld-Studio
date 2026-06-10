@@ -1040,7 +1040,15 @@ namespace lfs::io {
             }
         }
 
-        if (const cudaError_t err = cudaDeviceSynchronize(); err != cudaSuccess) {
+        // Materialize before handoff. With a caller stream, sync only it — a
+        // device-wide sync would couple image availability to in-flight
+        // training kernels on other streams.
+        if (cuda_stream) {
+            if (const cudaError_t err = cudaStreamSynchronize(static_cast<cudaStream_t>(cuda_stream));
+                err != cudaSuccess) {
+                throw std::runtime_error(std::string("CUDA sync failed: ") + cudaGetErrorString(err));
+            }
+        } else if (const cudaError_t err = cudaDeviceSynchronize(); err != cudaSuccess) {
             throw std::runtime_error(std::string("CUDA sync failed: ") + cudaGetErrorString(err));
         }
         uint8_tensor = Tensor();
