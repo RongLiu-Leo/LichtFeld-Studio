@@ -836,41 +836,6 @@ namespace lfs::training::mcmc {
      * 3. Finds the index where cumsum >= u
      * 4. Outputs the global index and directly gathers opacity/scales
      */
-    // Block-cooperative reduction of sampling_weights[alive_indices] via shared memory
-    __global__ void reduce_weights_kernel(
-        const float* __restrict__ sampling_weights,
-        const int64_t* __restrict__ alive_indices,
-        size_t n_alive,
-        float* __restrict__ partial_sums,
-        size_t N) {
-
-        extern __shared__ float sdata[];
-
-        const size_t tid = threadIdx.x;
-        const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-        float sum = 0.0f;
-        if (idx < n_alive) {
-            const int64_t global_i = alive_indices[idx];
-            if (global_i >= 0 && global_i < static_cast<int64_t>(N)) {
-                sum = sampling_weights[global_i];
-            }
-        }
-        sdata[tid] = sum;
-        __syncthreads();
-
-        for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-            if (tid < s) {
-                sdata[tid] += sdata[tid + s];
-            }
-            __syncthreads();
-        }
-
-        if (tid == 0) {
-            partial_sums[blockIdx.x] = sdata[0];
-        }
-    }
-
     __global__ void multinomial_sample_and_gather_kernel(
         const float* __restrict__ opacities,
         const float* __restrict__ scaling_raw, // raw scaling, exp() applied inline
@@ -878,7 +843,6 @@ namespace lfs::training::mcmc {
         const float* __restrict__ cumsum,
         size_t n_alive,
         size_t n_samples,
-        float prob_sum,
         uint64_t seed,
         int64_t* __restrict__ sampled_global_indices,
         float* __restrict__ sampled_opacities,
@@ -888,6 +852,18 @@ namespace lfs::training::mcmc {
         const size_t idx = threadIdx.x + blockIdx.x * blockDim.x;
         if (idx >= n_samples)
             return;
+
+        // The inclusive cumsum's last element is the total probability mass —
+        // no separate reduction or host readback needed.
+        const float prob_sum = cumsum[n_alive - 1];
+        if (prob_sum <= 0.0f) {
+            sampled_global_indices[idx] = 0;
+            sampled_opacities[idx] = 0.0f;
+            sampled_scales[idx * 3 + 0] = 0.0f;
+            sampled_scales[idx * 3 + 1] = 0.0f;
+            sampled_scales[idx * 3 + 2] = 0.0f;
+            return;
+        }
 
         curandState state;
         curand_init(seed, idx, 0, &state);
@@ -936,38 +912,6 @@ namespace lfs::training::mcmc {
 
         const cudaStream_t cuda_stream = resolve_stream(stream);
 
-        const int threads = 256;
-        const int blocks = (n_alive + threads - 1) / threads;
-        const size_t shared_mem_size = threads * sizeof(float);
-
-        float* d_partial_sums = nullptr;
-        cudaMallocAsync(&d_partial_sums, blocks * sizeof(float), cuda_stream);
-
-        // Launch block-level reduction
-        reduce_weights_kernel<<<blocks, threads, shared_mem_size, cuda_stream>>>(
-            sampling_weights, alive_indices, n_alive, d_partial_sums, N);
-
-        // Final reduction on CPU (small array)
-        std::vector<float> h_partial_sums(blocks);
-        cudaMemcpyAsync(h_partial_sums.data(), d_partial_sums, blocks * sizeof(float), cudaMemcpyDeviceToHost, cuda_stream);
-        cudaStreamSynchronize(cuda_stream); // Wait for copy to complete
-
-        float prob_sum = 0.0f;
-        for (int i = 0; i < blocks; ++i) {
-            prob_sum += h_partial_sums[i];
-        }
-
-        // Free temp buffer
-        cudaFreeAsync(d_partial_sums, cuda_stream);
-
-        if (prob_sum <= 0.0f) {
-            // All zero probabilities - just sample uniformly
-            cudaMemsetAsync(sampled_global_indices, 0, n_samples * sizeof(int64_t), cuda_stream);
-            cudaMemsetAsync(sampled_opacities, 0, n_samples * sizeof(float), cuda_stream);
-            cudaMemsetAsync(sampled_scales, 0, n_samples * 3 * sizeof(float), cuda_stream);
-            return;
-        }
-
         auto alive_probs = lfs::core::Tensor::empty({n_alive}, lfs::core::Device::CUDA, lfs::core::DataType::Float32);
         auto cumsum_buf = lfs::core::Tensor::empty({n_alive}, lfs::core::Device::CUDA, lfs::core::DataType::Float32);
 
@@ -995,7 +939,6 @@ namespace lfs::training::mcmc {
             cumsum_buf.ptr<float>(),
             n_alive,
             n_samples,
-            prob_sum,
             seed,
             sampled_global_indices,
             sampled_opacities,
@@ -1012,7 +955,6 @@ namespace lfs::training::mcmc {
         const float* __restrict__ cumsum,
         size_t N,
         size_t n_samples,
-        float prob_sum,
         uint64_t seed,
         int64_t* __restrict__ sampled_indices,
         float* __restrict__ sampled_opacities,
@@ -1021,6 +963,16 @@ namespace lfs::training::mcmc {
         const size_t idx = threadIdx.x + blockIdx.x * blockDim.x;
         if (idx >= n_samples)
             return;
+
+        const float prob_sum = cumsum[N - 1];
+        if (prob_sum <= 0.0f) {
+            sampled_indices[idx] = 0;
+            sampled_opacities[idx] = 0.0f;
+            sampled_scales[idx * 3 + 0] = 0.0f;
+            sampled_scales[idx * 3 + 1] = 0.0f;
+            sampled_scales[idx * 3 + 2] = 0.0f;
+            return;
+        }
 
         curandState state;
         curand_init(seed, idx, 0, &state);
@@ -1048,36 +1000,6 @@ namespace lfs::training::mcmc {
         sampled_scales[idx * 3 + 2] = expf(scaling_raw[selected_idx * 3 + 2]);
     }
 
-    // Block-cooperative reduction of all sampling weights via shared memory
-    __global__ void reduce_all_weights_kernel(
-        const float* __restrict__ sampling_weights,
-        size_t N,
-        float* __restrict__ partial_sums) {
-
-        extern __shared__ float sdata[];
-
-        const size_t tid = threadIdx.x;
-        const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-        float sum = 0.0f;
-        if (idx < N) {
-            sum = sampling_weights[idx];
-        }
-        sdata[tid] = sum;
-        __syncthreads();
-
-        for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-            if (tid < s) {
-                sdata[tid] += sdata[tid + s];
-            }
-            __syncthreads();
-        }
-
-        if (tid == 0) {
-            partial_sums[blockIdx.x] = sdata[0];
-        }
-    }
-
     void launch_multinomial_sample_all(
         const float* sampling_weights,
         const float* opacities,
@@ -1094,38 +1016,6 @@ namespace lfs::training::mcmc {
             return;
 
         const cudaStream_t cuda_stream = resolve_stream(stream);
-
-        const int threads = 256;
-        const int blocks = (N + threads - 1) / threads;
-        const size_t shared_mem_size = threads * sizeof(float);
-
-        float* d_partial_sums = nullptr;
-        cudaMallocAsync(&d_partial_sums, blocks * sizeof(float), cuda_stream);
-
-        // Launch block-level reduction
-        reduce_all_weights_kernel<<<blocks, threads, shared_mem_size, cuda_stream>>>(
-            sampling_weights, N, d_partial_sums);
-
-        // Final reduction on CPU (small array)
-        std::vector<float> h_partial_sums(blocks);
-        cudaMemcpyAsync(h_partial_sums.data(), d_partial_sums, blocks * sizeof(float), cudaMemcpyDeviceToHost, cuda_stream);
-        cudaStreamSynchronize(cuda_stream); // Wait for copy to complete
-
-        float prob_sum = 0.0f;
-        for (int i = 0; i < blocks; ++i) {
-            prob_sum += h_partial_sums[i];
-        }
-
-        // Free temp buffer
-        cudaFreeAsync(d_partial_sums, cuda_stream);
-
-        if (prob_sum <= 0.0f) {
-            // All zero probabilities - return zeros
-            cudaMemsetAsync(sampled_indices, 0, n_samples * sizeof(int64_t), cuda_stream);
-            cudaMemsetAsync(sampled_opacities, 0, n_samples * sizeof(float), cuda_stream);
-            cudaMemsetAsync(sampled_scales, 0, n_samples * 3 * sizeof(float), cuda_stream);
-            return;
-        }
 
         auto cumsum_buf = lfs::core::Tensor::empty({N}, lfs::core::Device::CUDA, lfs::core::DataType::Float32);
 
@@ -1146,7 +1036,6 @@ namespace lfs::training::mcmc {
             cumsum_buf.ptr<float>(),
             N,
             n_samples,
-            prob_sum,
             seed,
             sampled_indices,
             sampled_opacities,

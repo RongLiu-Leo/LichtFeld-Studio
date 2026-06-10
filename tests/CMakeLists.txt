@@ -295,6 +295,7 @@ set(TEST_FILES
     test_tensor_stream.cpp
     test_cuda_event_pool.cpp
     test_tensor_multistream.cpp
+    test_mcmc_multinomial.cpp
     test_tensor_memory_planner.cpp
     test_vram_profiler_metrics.cpp
 )
