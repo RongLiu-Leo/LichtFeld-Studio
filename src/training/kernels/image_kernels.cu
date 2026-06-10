@@ -12,6 +12,8 @@
 #include <device_launch_parameters.h>
 #include <type_traits>
 
+#include "kernel_stream.hpp"
+
 namespace lfs::filters {
 
     // Adapted from spirulae-splat Densify.cu canny_edge_filter_kernel
@@ -172,6 +174,7 @@ namespace lfs::training::kernels {
         const int height,
         const int width,
         cudaStream_t stream) {
+        stream = resolve_stream(stream);
         dim3 blockDim(32, 32, 1);
         dim3 gridDim((width + blockDim.x - 1) / blockDim.x,
                      (height + blockDim.y - 1) / blockDim.y);
@@ -186,6 +189,7 @@ namespace lfs::training::kernels {
         const int height,
         const int width,
         cudaStream_t stream) {
+        stream = resolve_stream(stream);
         launch_fused_canny_edge_filter_chw_impl(d_input_chw, d_output_hw, height, width, stream);
     }
 
@@ -195,6 +199,7 @@ namespace lfs::training::kernels {
         const int height,
         const int width,
         cudaStream_t stream) {
+        stream = resolve_stream(stream);
         launch_fused_canny_edge_filter_chw_impl(d_input_chw, d_output_hw, height, width, stream);
     }
 
@@ -203,6 +208,7 @@ namespace lfs::training::kernels {
         const std::size_t n,
         const float* d_scalar,
         cudaStream_t stream) {
+        stream = resolve_stream(stream);
         if (n == 0) {
             return;
         }

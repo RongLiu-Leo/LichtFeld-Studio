@@ -7,6 +7,7 @@
 #include "core/image_io.hpp"
 #include "core/image_loader.hpp"
 #include "core/logger.hpp"
+#include "core/tensor/internal/memory_pool.hpp"
 #include <cassert>
 #include <cuda_runtime.h>
 
@@ -114,13 +115,14 @@ namespace lfs::core {
         _FoVx = focal2fov(_focal_x, _camera_width);
         _FoVy = focal2fov(_focal_y, _camera_height);
 
-        // Create CUDA stream for async image loading (like reference implementation)
-        cudaStreamCreate(&_stream);
+        // Non-blocking so image loading doesn't serialize with the legacy stream
+        cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking);
     }
 
     Camera::~Camera() {
         // Destroy CUDA stream if it was created
         if (_stream) {
+            CudaMemoryPool::instance().release_stream(_stream);
             cudaStreamDestroy(_stream);
             _stream = nullptr;
         }
@@ -171,6 +173,7 @@ namespace lfs::core {
         if (this != &other) {
             // Destroy our current stream
             if (_stream) {
+                CudaMemoryPool::instance().release_stream(_stream);
                 cudaStreamDestroy(_stream);
             }
 
@@ -244,8 +247,8 @@ namespace lfs::core {
           _FoVy(other._FoVy) {
         _world_view_transform = transform;
 
-        // Create CUDA stream for async image loading
-        cudaStreamCreate(&_stream);
+        // Non-blocking so image loading doesn't serialize with the legacy stream
+        cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking);
     }
     Tensor Camera::K() const {
         // Create [1, 3, 3] zero matrix on same device as world_view_transform

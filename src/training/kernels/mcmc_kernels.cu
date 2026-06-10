@@ -17,6 +17,8 @@
 #include <thrust/sequence.h>
 #include <thrust/sort.h>
 
+#include "kernel_stream.hpp"
+
 namespace lfs::training::mcmc {
 
     // GLM type aliases for CUDA (matching gsplat)
@@ -109,7 +111,7 @@ namespace lfs::training::mcmc {
         dim3 threads(256);
         dim3 grid((N + threads.x - 1) / threads.x);
 
-        cudaStream_t cuda_stream = stream ? static_cast<cudaStream_t>(stream) : nullptr;
+        cudaStream_t cuda_stream = resolve_stream(stream);
 
         relocation_kernel<<<grid, threads, 0, cuda_stream>>>(
             opacities,
@@ -210,7 +212,7 @@ namespace lfs::training::mcmc {
         dim3 threads(256);
         dim3 grid((N + threads.x - 1) / threads.x);
 
-        cudaStream_t cuda_stream = stream ? static_cast<cudaStream_t>(stream) : nullptr;
+        cudaStream_t cuda_stream = resolve_stream(stream);
 
         add_noise_kernel<<<grid, threads, 0, cuda_stream>>>(
             raw_opacities,
@@ -317,7 +319,7 @@ namespace lfs::training::mcmc {
         dim3 threads(256);
         dim3 grid((n_samples + threads.x - 1) / threads.x);
 
-        cudaStream_t cuda_stream = stream ? static_cast<cudaStream_t>(stream) : nullptr;
+        cudaStream_t cuda_stream = resolve_stream(stream);
 
         gather_gaussian_params_kernel<<<grid, threads, 0, cuda_stream>>>(
             indices,
@@ -422,7 +424,7 @@ namespace lfs::training::mcmc {
         dim3 threads(256);
         dim3 grid((n + threads.x - 1) / threads.x);
 
-        cudaStream_t cuda_stream = stream ? static_cast<cudaStream_t>(stream) : nullptr;
+        cudaStream_t cuda_stream = resolve_stream(stream);
 
         compute_raw_values_kernel<<<grid, threads, 0, cuda_stream>>>(
             opacities,
@@ -452,7 +454,7 @@ namespace lfs::training::mcmc {
         dim3 threads(256);
         dim3 grid((n_indices + threads.x - 1) / threads.x);
 
-        cudaStream_t cuda_stream = stream ? static_cast<cudaStream_t>(stream) : nullptr;
+        cudaStream_t cuda_stream = resolve_stream(stream);
 
         update_scaling_opacity_kernel<<<grid, threads, 0, cuda_stream>>>(
             indices,
@@ -549,7 +551,7 @@ namespace lfs::training::mcmc {
         dim3 threads(256);
         dim3 grid((n_copy + threads.x - 1) / threads.x);
 
-        cudaStream_t cuda_stream = stream ? static_cast<cudaStream_t>(stream) : nullptr;
+        cudaStream_t cuda_stream = resolve_stream(stream);
 
         copy_gaussian_params_kernel<<<grid, threads, 0, cuda_stream>>>(
             src_indices,
@@ -599,7 +601,7 @@ namespace lfs::training::mcmc {
 
         dim3 threads(256);
         dim3 grid((n_samples + threads.x - 1) / threads.x);
-        cudaStream_t cuda_stream = stream ? static_cast<cudaStream_t>(stream) : nullptr;
+        cudaStream_t cuda_stream = resolve_stream(stream);
 
         histogram_kernel<<<grid, threads, 0, cuda_stream>>>(
             indices, counts, n_samples, N);
@@ -666,7 +668,7 @@ namespace lfs::training::mcmc {
         if (n_samples == 0)
             return;
 
-        cudaStream_t cuda_stream = stream ? static_cast<cudaStream_t>(stream) : nullptr;
+        cudaStream_t cuda_stream = resolve_stream(stream);
 
         // Algorithm: Sort indices, then use adjacent_difference to find run boundaries,
         // then use inclusive_scan to count run lengths, then scatter back to original positions
@@ -804,7 +806,7 @@ namespace lfs::training::mcmc {
 
         dim3 threads(256);
         dim3 grid((n_samples + threads.x - 1) / threads.x);
-        cudaStream_t cuda_stream = stream ? static_cast<cudaStream_t>(stream) : nullptr;
+        cudaStream_t cuda_stream = resolve_stream(stream);
 
         gather_2tensors_kernel<<<grid, threads, 0, cuda_stream>>>(
             indices,
@@ -932,7 +934,7 @@ namespace lfs::training::mcmc {
         if (n_samples == 0 || n_alive == 0)
             return;
 
-        const cudaStream_t cuda_stream = stream ? static_cast<cudaStream_t>(stream) : nullptr;
+        const cudaStream_t cuda_stream = resolve_stream(stream);
 
         const int threads = 256;
         const int blocks = (n_alive + threads - 1) / threads;
@@ -1091,7 +1093,7 @@ namespace lfs::training::mcmc {
         if (n_samples == 0 || N == 0)
             return;
 
-        const cudaStream_t cuda_stream = stream ? static_cast<cudaStream_t>(stream) : nullptr;
+        const cudaStream_t cuda_stream = resolve_stream(stream);
 
         const int threads = 256;
         const int blocks = (N + threads - 1) / threads;
@@ -1182,7 +1184,7 @@ namespace lfs::training::mcmc {
         dim3 threads(256);
         dim3 grid((N + threads.x - 1) / threads.x);
 
-        cudaStream_t cuda_stream = stream ? static_cast<cudaStream_t>(stream) : nullptr;
+        cudaStream_t cuda_stream = resolve_stream(stream);
 
         compute_rotation_mag_sq_kernel<<<grid, threads, 0, cuda_stream>>>(
             rotations,
@@ -1214,7 +1216,7 @@ namespace lfs::training::mcmc {
         dim3 threads(256);
         dim3 grid((N + threads.x - 1) / threads.x);
 
-        cudaStream_t cuda_stream = stream ? static_cast<cudaStream_t>(stream) : nullptr;
+        cudaStream_t cuda_stream = resolve_stream(stream);
 
         elementwise_max_inplace_kernel<<<grid, threads, 0, cuda_stream>>>(a, b, N);
     }
