@@ -5,6 +5,7 @@
 #include "core/path_utils.hpp"
 #include "core/pinned_memory_allocator.hpp"
 #include "core/tensor_trace.hpp"
+#include "internal/cuda_event_pool.hpp"
 #include "internal/cuda_stream_context.hpp"
 #include "internal/lazy_executor.hpp"
 #include "internal/memory_pool.hpp"
@@ -611,7 +612,7 @@ namespace lfs::core {
         if (execution_stream == home) {
             return;
         }
-        waitForCUDAStream(execution_stream, home);
+        bridgeStreams(home, execution_stream);
         record_stream(execution_stream);
     }
 
