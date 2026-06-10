@@ -6,16 +6,19 @@
 #include "allocation_profiler.hpp"
 #include "core/export.hpp"
 #include "core/logger.hpp"
+#include "cuda_event_pool.hpp"
 #include "deferred_free_queue.hpp"
 #include "diagnostics/vram_profiler.hpp"
 #include "gpu_slab_allocator.hpp"
 #include "size_bucketed_pool.hpp"
+#include <algorithm>
 #include <cuda_runtime.h>
 #include <iomanip>
 #include <memory>
 #include <mutex>
 #include <sstream>
 #include <unordered_map>
+#include <vector>
 
 namespace lfs::core {
 
@@ -71,11 +74,11 @@ namespace lfs::core {
             void* ptr = nullptr;
 
             if (bytes <= SLAB_ALLOC_THRESHOLD && slab_enabled_) {
-                ptr = GPUSlabAllocator::instance().allocate(bytes);
+                ptr = GPUSlabAllocator::instance().allocate(bytes, stream);
                 if (ptr) {
                     stats_.slab_allocs.fetch_add(1, std::memory_order_relaxed);
                     stats_.slab_bytes.fetch_add(bytes, std::memory_order_relaxed);
-                    track_allocation(ptr, bytes, AllocMethod::Slab);
+                    track_allocation(ptr, bytes, AllocMethod::Slab, stream);
 
                     if constexpr (ENABLE_ALLOCATION_PROFILING) {
                         AllocationProfiler::instance().record_allocation(bytes, 3);
@@ -85,11 +88,11 @@ namespace lfs::core {
             }
 
             if (bytes <= BUCKET_ALLOC_THRESHOLD) {
-                ptr = SizeBucketedPool::instance().try_allocate_cached(bytes);
+                ptr = SizeBucketedPool::instance().try_allocate_cached(bytes, stream);
                 if (ptr) {
                     stats_.bucket_cache_hits.fetch_add(1, std::memory_order_relaxed);
                     stats_.bucket_bytes.fetch_add(bytes, std::memory_order_relaxed);
-                    track_allocation(ptr, bytes, AllocMethod::Bucketed);
+                    track_allocation(ptr, bytes, AllocMethod::Bucketed, stream);
                     if constexpr (ENABLE_ALLOCATION_PROFILING) {
                         AllocationProfiler::instance().record_allocation(bytes, 3);
                     }
@@ -104,7 +107,7 @@ namespace lfs::core {
                     stats_.bucket_allocs.fetch_add(1, std::memory_order_relaxed);
                     stats_.bucket_bytes.fetch_add(bytes, std::memory_order_relaxed);
                     stats_.bucket_waste.fetch_add(bucket_size - bytes, std::memory_order_relaxed);
-                    track_allocation(ptr, bytes, AllocMethod::Bucketed);
+                    track_allocation(ptr, bytes, AllocMethod::Bucketed, stream);
                     if constexpr (ENABLE_ALLOCATION_PROFILING) {
                         AllocationProfiler::instance().record_allocation(bytes, 3);
                     }
@@ -127,7 +130,7 @@ namespace lfs::core {
                 if (err == cudaSuccess) {
                     stats_.async_allocs.fetch_add(1, std::memory_order_relaxed);
                     stats_.async_bytes.fetch_add(bytes, std::memory_order_relaxed);
-                    track_allocation(ptr, bytes, AllocMethod::Async);
+                    track_allocation(ptr, bytes, AllocMethod::Async, stream);
                     if constexpr (ENABLE_ALLOCATION_PROFILING) {
                         AllocationProfiler::instance().record_allocation(bytes, 3);
                     }
@@ -137,6 +140,44 @@ namespace lfs::core {
 #endif
 
             return allocate_direct(bytes);
+        }
+
+        // Marks `ptr` as used by `stream` beyond its home stream. The free will
+        // bridge that use back into the home stream before the block is recycled.
+        void record_stream(void* ptr, cudaStream_t stream) {
+            if (!ptr)
+                return;
+            std::lock_guard<std::mutex> lock(map_mutex_);
+            auto it = allocation_map_.find(ptr);
+            if (it == allocation_map_.end())
+                return;
+            AllocationInfo& info = it->second;
+            if (stream == info.home_stream)
+                return;
+            if (std::find(info.extra_streams.begin(), info.extra_streams.end(), stream) ==
+                info.extra_streams.end()) {
+                info.extra_streams.push_back(stream);
+            }
+        }
+
+        // Moves `ptr`'s home to `stream` (declarative re-homing for tensors whose
+        // future writes happen there). The old home becomes a recorded use.
+        void rehome_stream(void* ptr, cudaStream_t stream) {
+            if (!ptr)
+                return;
+            std::lock_guard<std::mutex> lock(map_mutex_);
+            auto it = allocation_map_.find(ptr);
+            if (it == allocation_map_.end())
+                return;
+            AllocationInfo& info = it->second;
+            if (stream == info.home_stream)
+                return;
+            if (std::find(info.extra_streams.begin(), info.extra_streams.end(), info.home_stream) ==
+                info.extra_streams.end()) {
+                info.extra_streams.push_back(info.home_stream);
+            }
+            std::erase(info.extra_streams, stream);
+            info.home_stream = stream;
         }
 
         void deallocate(void* ptr, cudaStream_t stream = nullptr) {
@@ -149,25 +190,10 @@ namespace lfs::core {
                 AllocationProfiler::instance().record_deallocation(ptr);
             }
 
-            AllocMethod method;
-            size_t size;
-            if (lookup_allocation(ptr, method, size)) {
-                untrack_allocation(ptr);
-
-                switch (method) {
-                case AllocMethod::Slab:
-                    GPUSlabAllocator::instance().deallocate(ptr, size);
-                    return;
-                case AllocMethod::Bucketed:
-                    SizeBucketedPool::instance().cache_free(ptr, size, stream);
-                    return;
-                case AllocMethod::Direct:
-                    cudaFree(ptr);
-                    direct_alloc_count_.fetch_sub(1, std::memory_order_release);
-                    return;
-                case AllocMethod::Async:
-                    break;
-                }
+            AllocationInfo info;
+            if (take_allocation(ptr, info)) {
+                free_routed(ptr, info);
+                return;
             }
 
 #if CUDART_VERSION >= 12080
@@ -177,54 +203,8 @@ namespace lfs::core {
 #endif
         }
 
-        void deallocate(void* ptr, size_t bytes, cudaStream_t stream = nullptr) {
-            if (!ptr)
-                return;
-            if (shutdown_.load(std::memory_order_acquire))
-                return;
-
-            if constexpr (ENABLE_ALLOCATION_PROFILING) {
-                AllocationProfiler::instance().record_deallocation(ptr);
-            }
-
-            // Fast path for slab allocations
-            if (bytes <= SLAB_ALLOC_THRESHOLD && slab_enabled_) {
-                if (GPUSlabAllocator::instance().owns_pointer(ptr)) {
-                    GPUSlabAllocator::instance().deallocate(ptr, bytes);
-                    untrack_allocation(ptr);
-                    return;
-                }
-            }
-
-            // Fast path for bucketed allocations - cache for reuse
-            if (bytes > SLAB_ALLOC_THRESHOLD && bytes <= BUCKET_ALLOC_THRESHOLD) {
-                AllocMethod method;
-                size_t size;
-                if (lookup_allocation(ptr, method, size) && method == AllocMethod::Bucketed) {
-                    untrack_allocation(ptr);
-                    SizeBucketedPool::instance().cache_free(ptr, size, stream);
-                    return;
-                }
-            }
-
-            // Check for direct allocation
-            AllocMethod method;
-            size_t size;
-            if (lookup_allocation(ptr, method, size)) {
-                untrack_allocation(ptr);
-                if (method == AllocMethod::Direct) {
-                    cudaFree(ptr);
-                    direct_alloc_count_.fetch_sub(1, std::memory_order_release);
-                    return;
-                }
-            }
-
-            // Async allocation
-#if CUDART_VERSION >= 12080
-            cudaFreeAsync(ptr, stream);
-#else
-            cudaFree(ptr);
-#endif
+        void deallocate(void* ptr, size_t /*bytes*/, cudaStream_t stream = nullptr) {
+            deallocate(ptr, stream);
         }
 
         void set_iteration(int iteration) {
@@ -352,8 +332,10 @@ namespace lfs::core {
         };
 
         struct AllocationInfo {
-            size_t size;
-            AllocMethod method;
+            size_t size = 0;
+            AllocMethod method = AllocMethod::Direct;
+            cudaStream_t home_stream = nullptr;
+            std::vector<cudaStream_t> extra_streams;
         };
 
         CudaMemoryPool() {
@@ -400,9 +382,9 @@ namespace lfs::core {
             return ptr;
         }
 
-        void track_allocation(void* ptr, size_t size, AllocMethod method) {
+        void track_allocation(void* ptr, size_t size, AllocMethod method, cudaStream_t stream = nullptr) {
             std::lock_guard<std::mutex> lock(map_mutex_);
-            allocation_map_[ptr] = {size, method};
+            allocation_map_[ptr] = {size, method, stream, {}};
             try {
                 lfs::diagnostics::VramProfiler::instance().recordAllocation(
                     ptr, size, to_vram_method(method), current_label());
@@ -411,25 +393,49 @@ namespace lfs::core {
             }
         }
 
-        void untrack_allocation(void* ptr) {
+        bool take_allocation(void* ptr, AllocationInfo& info) {
             std::lock_guard<std::mutex> lock(map_mutex_);
-            allocation_map_.erase(ptr);
+            auto it = allocation_map_.find(ptr);
+            if (it == allocation_map_.end())
+                return false;
+            info = std::move(it->second);
+            allocation_map_.erase(it);
             try {
                 lfs::diagnostics::VramProfiler::instance().recordDeallocation(ptr);
             } catch (...) {
                 // Diagnostics must never make CUDA deallocation fail.
             }
+            return true;
         }
 
-        bool lookup_allocation(void* ptr, AllocMethod& method, size_t& size) {
-            std::lock_guard<std::mutex> lock(map_mutex_);
-            auto it = allocation_map_.find(ptr);
-            if (it != allocation_map_.end()) {
-                method = it->second.method;
-                size = it->second.size;
-                return true;
+        // Bridges every recorded cross-stream use into the home stream, then frees
+        // stream-ordered on home. The block is reusable the moment the GPU passes
+        // the edges — no host sync, no deferred retention.
+        void free_routed(void* ptr, const AllocationInfo& info) {
+            for (cudaStream_t extra : info.extra_streams) {
+                bridgeStreams(extra, info.home_stream);
             }
-            return false;
+
+            switch (info.method) {
+            case AllocMethod::Slab:
+                GPUSlabAllocator::instance().deallocate(ptr, info.size, info.home_stream);
+                return;
+            case AllocMethod::Bucketed:
+                SizeBucketedPool::instance().deallocate(ptr, info.size, info.home_stream);
+                return;
+            case AllocMethod::Direct:
+                cudaFree(ptr);
+                direct_alloc_count_.fetch_sub(1, std::memory_order_release);
+                return;
+            case AllocMethod::Async:
+                break;
+            }
+
+#if CUDART_VERSION >= 12080
+            cudaFreeAsync(ptr, info.home_stream);
+#else
+            cudaFree(ptr);
+#endif
         }
 
         static lfs::diagnostics::VramAllocationMethod to_vram_method(AllocMethod method) {

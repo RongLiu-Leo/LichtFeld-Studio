@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "internal/cuda_event_pool.hpp"
+#include "core/logger.hpp"
 
 namespace lfs::core {
 
@@ -55,6 +56,29 @@ namespace lfs::core {
 
     CudaEventPool::~CudaEventPool() {
         shutdown();
+    }
+
+    void bridgeStreams(cudaStream_t from, cudaStream_t to) {
+        if (from == to) {
+            return;
+        }
+
+        if (cudaEvent_t edge = CudaEventPool::instance().acquire()) {
+            const bool bridged =
+                cudaEventRecord(edge, from) == cudaSuccess &&
+                cudaStreamWaitEvent(to, edge, 0) == cudaSuccess;
+            CudaEventPool::instance().release(edge);
+            if (bridged) {
+                return;
+            }
+        }
+
+        const cudaError_t sync_status = cudaStreamSynchronize(from);
+        if (sync_status != cudaSuccess) {
+            LOG_WARN("bridgeStreams: event edge and fallback sync both failed ({}); "
+                     "stream may have been destroyed with pending work",
+                     cudaGetErrorString(sync_status));
+        }
     }
 
 } // namespace lfs::core

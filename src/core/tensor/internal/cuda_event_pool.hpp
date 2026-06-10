@@ -55,4 +55,10 @@ namespace lfs::core {
         Stats stats_;
     };
 
+    // Orders all work currently enqueued on `from` before future work on `to`
+    // (pooled event edge, host-sync fallback). Unlike waitForCUDAStream, a
+    // nullptr `from` (legacy default stream) is still bridged — allocator
+    // reuse must order against legacy-stream work too.
+    LFS_CORE_API void bridgeStreams(cudaStream_t from, cudaStream_t to);
+
 } // namespace lfs::core
