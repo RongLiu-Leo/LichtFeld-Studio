@@ -61,7 +61,10 @@ PACK_STRUCT(struct VulkanGSLodSelectUniforms {
     uint32_t orthographic;
     uint32_t physical_node_count;
     uint32_t logical_chunk_count;
-    uint32_t pad4[3];
+    // Frame clock + fade window for newly streamed pages (0 disables fading).
+    uint32_t current_frame;
+    uint32_t fade_frames;
+    uint32_t pad4;
 });
 static_assert(sizeof(VulkanGSLodSelectUniforms) == 144);
 
@@ -159,7 +162,8 @@ public:
                                    VulkanGSPipelineBuffers& buffers,
                                    const _VulkanBuffer& node_bounds,
                                    const _VulkanBuffer& node_links,
-                                   const _VulkanBuffer& chunk_to_page);
+                                   const _VulkanBuffer& chunk_to_page,
+                                   const _VulkanBuffer& page_age);
     void executeGenerateKeys(const VulkanGSRendererUniforms& uniforms, VulkanGSPipelineBuffers& buffers);
     void executeComputeTileRanges(const VulkanGSRendererUniforms& uniforms, VulkanGSPipelineBuffers& buffers);
     void executeRasterizeForward(const VulkanGSRendererUniforms& uniforms,
@@ -249,7 +253,7 @@ protected:
     _ComputePipeline pipeline_prepare_tile_sort = _ComputePipeline(3);
     _ComputePipeline pipeline_compact_visible_primitives = _ComputePipeline(5);
     _ComputePipeline pipeline_lod_map_indices = _ComputePipeline(3);
-    _ComputePipeline pipeline_lod_select_threshold = _ComputePipeline(9);
+    _ComputePipeline pipeline_lod_select_threshold = _ComputePipeline(10);
     // 3 bindings: sorted_keys, out_tile_ranges, index_buffer_offset (for num_isects).
     _ComputePipeline pipeline_compute_tile_ranges[2] = {
         _ComputePipeline(3),

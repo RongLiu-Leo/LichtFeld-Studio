@@ -158,7 +158,17 @@ namespace lfs::vis {
         [[nodiscard]] std::optional<LodPageCache::Snapshot> lodPageCacheSnapshot(
             const lfs::core::SplatData& splat_data) const;
         // VRAM page-pool budget in splats for RAD-backed LoD streaming; 0 = full residency.
-        void setLodPagePoolBudget(std::size_t splats) { lod_page_pool_splats_ = splats; }
+        void setLodPagePoolBudget(std::size_t splats) {
+            lod_pool_sizing_dirty_ = lod_pool_sizing_dirty_ || lod_page_pool_splats_ != splats;
+            lod_page_pool_splats_ = splats;
+        }
+        // Fraction of free VRAM granted to the out-of-core page pool.
+        void setLodPoolVramFraction(float fraction) {
+            lod_pool_sizing_dirty_ = lod_pool_sizing_dirty_ || lod_pool_vram_fraction_ != fraction;
+            lod_pool_vram_fraction_ = fraction;
+        }
+        // Frames a newly streamed page fades in over; 0 disables fading.
+        void setLodFadeFrames(std::uint32_t frames) { lod_fade_frames_ = frames; }
 
         // Snapshot of the GPU LoD selector for stats overlays; counts are from
         // the deferred readback (one frame stale).
@@ -171,6 +181,8 @@ namespace lfs::vis {
             std::size_t resident_chunks = 0;
             std::size_t chunk_count = 0;
             std::size_t touched_chunks = 0;
+            std::size_t miss_chunks = 0;
+            std::size_t deferred_requests = 0;
             std::size_t pool_pages = 0;
             std::size_t streaming_jobs = 0;
         };
@@ -387,10 +399,10 @@ namespace lfs::vis {
         float gpu_lod_pixel_scale_feedback_ = 1.0f;
         std::size_t gpu_lod_last_candidate_count_ = 0;
         std::size_t gpu_lod_last_overflow_count_ = 0;
-        // GPU traversal-touched chunks from the deferred selector readback,
-        // ordered for LodPageCache::submitTraversalPriority (protected chunks
-        // first for LRU refresh, then misses by descending priority).
-        std::vector<std::uint32_t> gpu_lod_prefetch_chunks_;
+        std::size_t gpu_lod_last_miss_count_ = 0;
+        // GPU traversal misses from the deferred selector readback, sorted by
+        // descending pixel-scale priority for LodPageCache decode scheduling.
+        std::vector<LodPageCache::ChunkRequest> gpu_lod_prefetch_requests_;
         std::vector<std::uint32_t> gpu_lod_protected_chunks_;
         bool gpu_lod_prefetch_valid_ = false;
         bool gpu_lod_selection_active_ = false;
@@ -398,6 +410,11 @@ namespace lfs::vis {
         const lfs::core::SplatData* lod_page_cache_model_ = nullptr;
         LodPageCache lod_page_cache_;
         std::size_t lod_page_pool_splats_ = 0;
+        float lod_pool_vram_fraction_ = 0.5f;
+        bool lod_pool_sizing_dirty_ = false;
+        std::uint32_t lod_fade_frames_ = 12;
+        std::uint64_t gpu_lod_last_page_generation_ = 0;
+        std::uint64_t gpu_lod_last_publish_frame_ = 0;
         struct GpuLodTreeStorage {
             // Bounds layout: float4(center.xyz, size) per physical-page LoD node.
             Buffer<float> node_bounds;
@@ -406,6 +423,8 @@ namespace lfs::vis {
             Buffer<std::uint32_t> node_links;
             Buffer<std::uint32_t> page_to_chunk;
             Buffer<std::uint32_t> chunk_to_page;
+            // Per-page publish frame stamps driving selector fade-in.
+            Buffer<std::uint32_t> page_age;
             const lfs::core::SplatData* model = nullptr;
             std::size_t node_count = 0;
             std::size_t physical_node_capacity = 0;

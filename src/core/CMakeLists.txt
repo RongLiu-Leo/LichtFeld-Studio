@@ -53,6 +53,7 @@ set(CORE_SOURCES
         image_loader.cpp
         cuda_version.cpp
         image_io.cpp
+        mapped_file.cpp
         parameters.cpp
         property_registry.cpp
         reactive_store.cpp

@@ -5,6 +5,7 @@
 #include "io/ply_to_rad_lod.hpp"
 #include "core/bhatt_lod.hpp"
 #include "core/logger.hpp"
+#include "core/mapped_file.hpp"
 #include "core/path_utils.hpp"
 #include "core/splat_data.hpp"
 #include "core/tensor.hpp"
@@ -66,100 +67,7 @@ namespace lfs::io {
         constexpr std::size_t kCellsPerAxis = std::size_t{1} << kCellBitsPerAxis;
         constexpr std::size_t kCellCount = kCellsPerAxis * kCellsPerAxis * kCellsPerAxis;
 
-        // ====================================================================
-        // Memory-mapped input
-        // ====================================================================
-
-        class MappedFile {
-        public:
-            ~MappedFile() { close(); }
-
-            [[nodiscard]] bool open(const std::filesystem::path& path) {
-#ifdef _WIN32
-                file_ = CreateFileW(path.wstring().c_str(), GENERIC_READ, FILE_SHARE_READ,
-                                    nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-                if (file_ == INVALID_HANDLE_VALUE) {
-                    return false;
-                }
-                LARGE_INTEGER file_size{};
-                if (!GetFileSizeEx(file_, &file_size) || file_size.QuadPart <= 0) {
-                    close();
-                    return false;
-                }
-                size_ = static_cast<std::size_t>(file_size.QuadPart);
-                mapping_ = CreateFileMappingW(file_, nullptr, PAGE_READONLY, 0, 0, nullptr);
-                if (mapping_ == nullptr) {
-                    close();
-                    return false;
-                }
-                data_ = static_cast<const std::uint8_t*>(
-                    MapViewOfFile(mapping_, FILE_MAP_READ, 0, 0, 0));
-                if (data_ == nullptr) {
-                    close();
-                    return false;
-                }
-#else
-                fd_ = ::open(path.c_str(), O_RDONLY);
-                if (fd_ < 0) {
-                    return false;
-                }
-                struct stat st {};
-                if (fstat(fd_, &st) != 0 || st.st_size <= 0) {
-                    close();
-                    return false;
-                }
-                size_ = static_cast<std::size_t>(st.st_size);
-                void* mapped = mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd_, 0);
-                if (mapped == MAP_FAILED) {
-                    close();
-                    return false;
-                }
-                data_ = static_cast<const std::uint8_t*>(mapped);
-                madvise(mapped, size_, MADV_SEQUENTIAL);
-#endif
-                return true;
-            }
-
-            void close() {
-#ifdef _WIN32
-                if (data_ != nullptr) {
-                    UnmapViewOfFile(data_);
-                    data_ = nullptr;
-                }
-                if (mapping_ != nullptr) {
-                    CloseHandle(mapping_);
-                    mapping_ = nullptr;
-                }
-                if (file_ != INVALID_HANDLE_VALUE) {
-                    CloseHandle(file_);
-                    file_ = INVALID_HANDLE_VALUE;
-                }
-#else
-                if (data_ != nullptr) {
-                    munmap(const_cast<std::uint8_t*>(data_), size_);
-                    data_ = nullptr;
-                }
-                if (fd_ >= 0) {
-                    ::close(fd_);
-                    fd_ = -1;
-                }
-#endif
-                size_ = 0;
-            }
-
-            [[nodiscard]] const std::uint8_t* data() const { return data_; }
-            [[nodiscard]] std::size_t size() const { return size_; }
-
-        private:
-            const std::uint8_t* data_ = nullptr;
-            std::size_t size_ = 0;
-#ifdef _WIN32
-            HANDLE file_ = INVALID_HANDLE_VALUE;
-            HANDLE mapping_ = nullptr;
-#else
-            int fd_ = -1;
-#endif
-        };
+        using lfs::core::MappedFile;
 
         // ====================================================================
         // PLY header

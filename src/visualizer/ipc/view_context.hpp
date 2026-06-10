@@ -142,6 +142,8 @@ namespace lfs::vis {
         bool lod_debug_colors = false;
         float lod_max_splats = static_cast<float>(DEFAULT_LOD_MAX_SPLATS);
         float lod_page_pool_splats = static_cast<float>(DEFAULT_LOD_PAGE_POOL_SPLATS);
+        float lod_pool_vram_fraction = DEFAULT_LOD_POOL_VRAM_FRACTION;
+        float lod_fade_frames = static_cast<float>(DEFAULT_LOD_FADE_FRAMES);
         float lod_render_scale = DEFAULT_LOD_RENDER_SCALE;
         float lod_cone_foveation = DEFAULT_LOD_CONE_FOVEATION;
         float lod_cone_inner_degrees = DEFAULT_LOD_CONE_INNER_DEGREES;

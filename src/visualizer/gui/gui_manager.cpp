@@ -255,11 +255,14 @@ namespace lfs::vis::gui {
                                     : "--";
             if (stats.pool_pages > 0 && stats.chunk_splats > 0) {
                 const std::size_t pool_splats = stats.pool_pages * stats.chunk_splats;
-                const std::string streaming =
+                std::string streaming =
                     stats.streaming_jobs > 0
                         ? std::format("{} pages loading", stats.streaming_jobs)
                         : (stats.resident_chunks >= stats.chunk_count ? "fully resident"
                                                                       : "idle");
+                if (stats.deferred_requests > 0) {
+                    streaming += std::format(" | {} deferred", stats.deferred_requests);
+                }
                 state.cache_text = std::format("{}/{} pages | {} splat pool | {}",
                                                formatLodCount(std::min(stats.resident_chunks, stats.pool_pages)),
                                                formatLodCount(stats.pool_pages),

@@ -42,11 +42,39 @@ namespace lfs::io {
         const lfs::core::SplatLodTree::ChunkFileRange& range,
         int max_sh_degree,
         bool lod_opacity_encoded);
+    // Reuses an already-open stream; for callers issuing many chunk reads
+    // (streaming page caches) where per-chunk open/close costs add up.
+    std::expected<RadDecodedChunk, std::string> load_rad_chunk(
+        std::istream& in,
+        const std::filesystem::path& filepath_for_errors,
+        const lfs::core::SplatLodTree::ChunkFileRange& range,
+        int max_sh_degree,
+        bool lod_opacity_encoded);
 
     // True when a chunked RAD should keep its leaf tensors on the host and
     // stream pages to the GPU instead of migrating everything to CUDA at load.
     // LFS_LOD_PAGE_CAPACITY overrides the free-VRAM heuristic in both directions.
     [[nodiscard]] bool rad_paged_load_recommended(const SplatData& data);
+
+    // ------------------------------------------------------------------------
+    // Node-metadata sidecar (<file>.rad.meta) — a derived cache, NOT part of
+    // the RAD format. Holds per-node bounds/links in the exact GPU layouts so
+    // out-of-core opens keep tree metadata on disk (mmap) instead of in RAM,
+    // and cached re-opens skip decoding every chunk.
+    // ------------------------------------------------------------------------
+    [[nodiscard]] std::filesystem::path rad_meta_sidecar_path(const std::filesystem::path& rad_path);
+    // Validates magic/version/completeness and that the sidecar matches the
+    // RAD file (size + mtime fast check, header hash authoritative).
+    [[nodiscard]] std::expected<lfs::core::SplatLodTree::NodeMetaView, std::string>
+    open_rad_meta_sidecar(const std::filesystem::path& rad_path);
+    [[nodiscard]] Result<void> build_rad_meta_sidecar(
+        const std::filesystem::path& rad_path,
+        const ExportProgressCallback& progress = nullptr);
+    // Exposed for tests: scatter-derive parent/level over a BFS level-ordered,
+    // children-contiguous links plane. child_start may be non-monotone across
+    // parents within a level (multi-bucket converter layouts).
+    [[nodiscard]] std::expected<std::uint64_t, std::string> derive_rad_meta_parents_levels(
+        std::span<lfs::core::NodeLinksRecord> links);
 
     // One chunk of pack-domain splat arrays for streaming RAD export.
     // All values use the on-disk RAD domains: display alpha (lodOpacity),

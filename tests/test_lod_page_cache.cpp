@@ -142,4 +142,156 @@ namespace {
         EXPECT_NE(cache.snapshot().chunk_to_page[20], kInvalid);
     }
 
+    std::vector<LodPageCache::ChunkRequest> makeRequests(std::initializer_list<std::uint32_t> chunks,
+                                                         const std::uint32_t priority = 100) {
+        std::vector<LodPageCache::ChunkRequest> requests;
+        for (const std::uint32_t chunk : chunks) {
+            requests.push_back({.chunk = chunk, .priority = priority});
+        }
+        return requests;
+    }
+
+    TEST(LodPageCache, ProtectionWindowBlocksEvictionAcrossFrames) {
+        LodPageCache cache;
+        cache.configure(100, 4, 1);
+        (void)drainAndComplete(cache);
+
+        cache.beginFrame();
+        const auto fill = makeRequests({10, 11, 12});
+        const std::vector<std::uint32_t> protect{10, 11, 12};
+        cache.submitTraversalPriority(std::span<const LodPageCache::ChunkRequest>(fill), protect);
+        (void)drainAndComplete(cache);
+        ASSERT_NE(cache.snapshot().chunk_to_page[12], kInvalid);
+
+        // Within the protection window the protected chunks survive pressure
+        // even when later frames stop listing them.
+        for (int frame = 0; frame < 2; ++frame) {
+            cache.beginFrame();
+            const auto want = makeRequests({20u + static_cast<std::uint32_t>(frame)});
+            cache.submitTraversalPriority(std::span<const LodPageCache::ChunkRequest>(want),
+                                          std::span<const std::uint32_t>{});
+            (void)drainAndComplete(cache);
+            EXPECT_NE(cache.snapshot().chunk_to_page[10], kInvalid);
+            EXPECT_NE(cache.snapshot().chunk_to_page[11], kInvalid);
+            EXPECT_NE(cache.snapshot().chunk_to_page[12], kInvalid);
+        }
+
+        // Past the window they become evictable again.
+        for (int frame = 0; frame < 4; ++frame) {
+            cache.beginFrame();
+        }
+        const auto want = makeRequests({30});
+        cache.submitTraversalPriority(std::span<const LodPageCache::ChunkRequest>(want),
+                                      std::span<const std::uint32_t>{});
+        (void)drainAndComplete(cache);
+        EXPECT_NE(cache.snapshot().chunk_to_page[30], kInvalid);
+    }
+
+    TEST(LodPageCache, NoEvictableSlotDefersRequestWithoutEviction) {
+        LodPageCache cache;
+        cache.configure(100, 3, 1);
+        (void)drainAndComplete(cache);
+
+        cache.beginFrame();
+        const auto fill = makeRequests({10, 11});
+        const std::vector<std::uint32_t> protect{10, 11};
+        cache.submitTraversalPriority(std::span<const LodPageCache::ChunkRequest>(fill), protect);
+        (void)drainAndComplete(cache);
+
+        const std::uint64_t generation_before = cache.snapshot().generation;
+        cache.beginFrame();
+        const auto want = makeRequests({20, 21});
+        cache.submitTraversalPriority(std::span<const LodPageCache::ChunkRequest>(want), protect);
+        const auto uploads = cache.drainPendingUploads();
+
+        EXPECT_TRUE(uploads.empty()) << "deferred requests must not enqueue work";
+        EXPECT_EQ(cache.snapshot().generation, generation_before);
+        EXPECT_NE(cache.snapshot().chunk_to_page[10], kInvalid);
+        EXPECT_NE(cache.snapshot().chunk_to_page[11], kInvalid);
+        EXPECT_EQ(cache.deferredRequestCount(), 2u);
+    }
+
+    TEST(LodPageCache, SteadyStateProducesNoWork) {
+        LodPageCache cache;
+        cache.configure(100, 8, 1);
+        (void)drainAndComplete(cache);
+
+        cache.beginFrame();
+        const auto cut = makeRequests({10, 11, 12, 13});
+        const std::vector<std::uint32_t> protect{10, 11, 12, 13};
+        cache.submitTraversalPriority(std::span<const LodPageCache::ChunkRequest>(cut), protect);
+        (void)drainAndComplete(cache);
+        const std::uint64_t generation = cache.snapshot().generation;
+
+        for (int frame = 0; frame < 10; ++frame) {
+            cache.beginFrame();
+            cache.submitTraversalPriority(std::span<const LodPageCache::ChunkRequest>(cut), protect);
+            const auto uploads = cache.drainPendingUploads();
+            EXPECT_TRUE(uploads.empty()) << "converged cut must not produce uploads";
+            EXPECT_EQ(cache.snapshot().generation, generation) << "no residency churn at rest";
+            EXPECT_FALSE(cache.hasOutstandingWork());
+        }
+    }
+
+    TEST(LodPageCache, RequestsHonorPriorityOrderViaLegacyOverload) {
+        LodPageCache cache;
+        cache.configure(100, 10, 1);
+        (void)drainAndComplete(cache);
+
+        // Legacy span overload synthesizes descending priority from order.
+        std::vector<std::uint32_t> wanted{50, 40, 30};
+        cache.submitTraversalPriority(wanted);
+        const auto uploads = cache.drainPendingUploads();
+        ASSERT_EQ(uploads.size(), 3u);
+        EXPECT_EQ(uploads[0].chunk, 50u);
+        EXPECT_EQ(uploads[1].chunk, 40u);
+        EXPECT_EQ(uploads[2].chunk, 30u);
+    }
+
+    TEST(LodPageCache, UploadDrainHonorsByteBudget) {
+        LodPageCache cache;
+        constexpr std::size_t kPageBytes = 1024;
+        // 80 pages -> request budget clamp(80/16, 4, 16) = 5 admits all wants.
+        cache.configure(100, 80, 1, kPageBytes);
+        (void)drainAndComplete(cache);
+
+        cache.beginFrame();
+        const auto want = makeRequests({10, 11, 12, 13, 14});
+        cache.submitTraversalPriority(std::span<const LodPageCache::ChunkRequest>(want),
+                                      std::span<const std::uint32_t>{});
+
+        auto first = cache.drainPendingUploads(3 * kPageBytes);
+        EXPECT_EQ(first.size(), 3u);
+        EXPECT_TRUE(cache.hasOutstandingWork()) << "remainder stays pending";
+        cache.completeUploads(first);
+
+        auto second = cache.drainPendingUploads(0);
+        EXPECT_EQ(second.size(), 2u);
+        cache.completeUploads(second);
+        EXPECT_FALSE(cache.hasOutstandingWork());
+    }
+
+    TEST(LodPageCache, ResidentSinceFrameStampsPublishOrder) {
+        LodPageCache cache;
+        cache.configure(100, 10, 1);
+        (void)drainAndComplete(cache);
+
+        for (int frame = 0; frame < 5; ++frame) {
+            cache.beginFrame();
+        }
+        const auto want = makeRequests({42});
+        cache.submitTraversalPriority(std::span<const LodPageCache::ChunkRequest>(want),
+                                      std::span<const std::uint32_t>{});
+        auto uploads = cache.drainPendingUploads();
+        ASSERT_EQ(uploads.size(), 1u);
+        const std::uint32_t page = uploads[0].page;
+        const std::uint32_t stamp_before = cache.snapshot().page_resident_frame[page];
+
+        cache.beginFrame();
+        cache.completeUploads(uploads);
+        EXPECT_EQ(cache.snapshot().page_resident_frame[page], 6u)
+            << "stamp must be set at publish, not at reserve";
+        EXPECT_NE(cache.snapshot().page_resident_frame[page], stamp_before);
+    }
+
 } // namespace

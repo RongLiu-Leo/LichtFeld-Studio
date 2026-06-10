@@ -831,6 +831,12 @@ namespace lfs::python {
         add_float(&Proxy::lod_page_pool_splats, "lod_page_pool_splats", "LOD Cache Budget",
                   "VRAM page-pool budget in splats for streamed RAD scenes (0 = auto)",
                   static_cast<double>(vis::DEFAULT_LOD_PAGE_POOL_SPLATS), 0.0, 100000000.0);
+        add_float(&Proxy::lod_pool_vram_fraction, "lod_pool_vram_fraction", "LOD Pool VRAM Fraction",
+                  "Share of free VRAM granted to the out-of-core LOD page pool",
+                  static_cast<double>(vis::DEFAULT_LOD_POOL_VRAM_FRACTION), 0.05, 0.9);
+        add_float(&Proxy::lod_fade_frames, "lod_fade_frames", "LOD Fade Frames",
+                  "Frames a newly streamed LOD page fades in over (0 = instant)",
+                  static_cast<double>(vis::DEFAULT_LOD_FADE_FRAMES), 0.0, 240.0);
         add_float(&Proxy::lod_render_scale, "lod_render_scale", "Render Scale",
                   "Quality multiplier: effective splat target = LOD Budget x Render Scale", vis::DEFAULT_LOD_RENDER_SCALE, 0.1, 5.0);
         add_float(&Proxy::lod_cone_foveation, "lod_cone_foveation", "Cone Foveation",
@@ -1651,7 +1657,8 @@ namespace lfs::python {
                     return static_cast<float>(self.height) / self.ortho_scale;
                 },
                 "Vertical view extent in world units (Blender-compatible orthographic scale). Larger when zoomed out, smaller when zoomed in.")
-            .def_prop_ro("position", [](const PyViewInfo& self) -> std::tuple<float, float, float> {
+            .def_prop_ro(
+                "position", [](const PyViewInfo& self) -> std::tuple<float, float, float> {
                     auto t = self.translation.tensor().cpu();
                     auto acc = t.accessor<float, 1>();
                     return {acc(0), acc(1), acc(2)}; }, "Camera position as (x, y, z) tuple");

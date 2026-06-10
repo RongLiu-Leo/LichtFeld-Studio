@@ -5,6 +5,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/mapped_file.hpp"
 #include "core/point_cloud.hpp"
 #include "core/tensor.hpp"
 
@@ -14,6 +15,7 @@
 #include <filesystem>
 #include <functional>
 #include <glm/glm.hpp>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -27,6 +29,24 @@ namespace lfs::core {
     namespace param {
         struct TrainingParameters;
     }
+
+    // Per-node tree metadata in the exact layouts the GPU traversal consumes;
+    // also the on-disk record layouts of the .rad.meta sidecar cache.
+    struct NodeBoundsRecord {
+        float x = 0.0f, y = 0.0f, z = 0.0f, size = 0.0f;
+    };
+    struct NodeLinksRecord {
+        uint32_t child_start = 0;
+        // child_count:16 | level:8 | flags:8 (bit0 leaf, bit1 root, bit2 lodOpacity)
+        uint32_t packed = 0;
+        uint32_t parent = 0xFFFFFFFFu;
+        uint32_t logical = 0xFFFFFFFFu;
+
+        [[nodiscard]] uint32_t childCount() const { return packed & 0xffffu; }
+        [[nodiscard]] uint32_t level() const { return (packed >> 16u) & 0xffu; }
+    };
+    static_assert(sizeof(NodeBoundsRecord) == 16);
+    static_assert(sizeof(NodeLinksRecord) == 16);
 
     struct SplatLodTree {
         static constexpr std::size_t kChunkSplats = 65'536;
@@ -50,6 +70,21 @@ namespace lfs::core {
             [[nodiscard]] bool valid() const { return !path.empty() && !chunks.empty(); }
         };
 
+        // Memory-mapped per-node metadata from a .rad.meta sidecar; replaces
+        // the in-RAM vectors for out-of-core models (23 B/node does not scale
+        // to billions of nodes). Copies share the mapping.
+        struct NodeMetaView {
+            std::shared_ptr<MappedFile> file;
+            const NodeBoundsRecord* bounds = nullptr;
+            const NodeLinksRecord* links = nullptr;
+            std::size_t node_count = 0;
+            std::size_t leaf_count = 0;
+
+            [[nodiscard]] bool valid() const {
+                return file != nullptr && bounds != nullptr && links != nullptr && node_count > 0;
+            }
+        };
+
         std::vector<uint16_t> child_count;
         std::vector<uint32_t> child_start;
         std::vector<uint8_t> lod_level;
@@ -58,11 +93,39 @@ namespace lfs::core {
         std::vector<uint32_t> page_to_chunk;
         std::vector<uint32_t> chunk_to_page;
         RadSource rad_source;
+        NodeMetaView meta_view;
         bool lod_opacity_encoded = false;
 
-        size_t total_nodes() const { return child_count.size(); }
+        size_t total_nodes() const {
+            return meta_view.valid() ? meta_view.node_count : child_count.size();
+        }
         size_t chunk_count() const { return (total_nodes() + kChunkSplats - 1) / kChunkSplats; }
-        bool has_tree() const { return !child_count.empty(); }
+        bool has_tree() const { return total_nodes() > 0; }
+        // True when the per-node vectors are materialized in RAM (legacy and
+        // in-core models); false when only the sidecar view backs the tree.
+        bool nodes_in_memory() const { return !child_count.empty(); }
+
+        [[nodiscard]] uint32_t child_start_at(const std::size_t i) const {
+            return meta_view.valid() ? meta_view.links[i].child_start : child_start[i];
+        }
+        [[nodiscard]] uint16_t child_count_at(const std::size_t i) const {
+            return meta_view.valid() ? static_cast<uint16_t>(meta_view.links[i].childCount())
+                                     : child_count[i];
+        }
+        [[nodiscard]] uint8_t level_at(const std::size_t i) const {
+            return meta_view.valid() ? static_cast<uint8_t>(meta_view.links[i].level())
+                                     : (i < lod_level.size() ? lod_level[i] : 0);
+        }
+        [[nodiscard]] glm::vec3 center_at(const std::size_t i) const {
+            if (meta_view.valid()) {
+                const auto& b = meta_view.bounds[i];
+                return {b.x, b.y, b.z};
+            }
+            return centers[i];
+        }
+        [[nodiscard]] float size_at(const std::size_t i) const {
+            return meta_view.valid() ? meta_view.bounds[i].size : sizes[i];
+        }
     };
 
     using SplatTensorAllocator = std::function<Tensor(TensorShape shape,

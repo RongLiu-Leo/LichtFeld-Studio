@@ -277,21 +277,42 @@ TEST(PlyToRadLod, OutOfCoreLoadKeepsTreeAndStreamsChunks) {
     ASSERT_TRUE(partial.has_value()) << partial.error();
 
     // Tree metadata covers all nodes; payload tensors hold the coarse prefix.
+    // Out-of-core loads back the metadata with the mmap'd sidecar instead of
+    // in-RAM vectors; the accessors must agree bit-exactly with the full load.
     ASSERT_TRUE(partial->lod_tree && partial->lod_tree->has_tree());
     EXPECT_EQ(partial->lod_tree->total_nodes(), total_nodes);
     EXPECT_EQ(static_cast<std::size_t>(partial->size()), 131072u);
     EXPECT_LT(static_cast<std::size_t>(partial->size()), total_nodes);
     EXPECT_TRUE(lfs::io::rad_paged_load_recommended(*partial));
+    EXPECT_TRUE(partial->lod_tree->meta_view.valid()) << "sidecar must back OOC tree metadata";
+    EXPECT_FALSE(partial->lod_tree->nodes_in_memory());
+    EXPECT_TRUE(std::filesystem::exists(lfs::io::rad_meta_sidecar_path(rad_path)));
 
-    EXPECT_EQ(partial->lod_tree->centers.size(), total_nodes);
-    EXPECT_EQ(partial->lod_tree->sizes.size(), total_nodes);
     for (std::size_t i = 0; i < total_nodes; ++i) {
-        EXPECT_EQ(partial->lod_tree->centers[i].x, full->lod_tree->centers[i].x);
-        EXPECT_EQ(partial->lod_tree->sizes[i], full->lod_tree->sizes[i]);
-        EXPECT_EQ(partial->lod_tree->child_start[i], full->lod_tree->child_start[i]);
-        EXPECT_EQ(partial->lod_tree->child_count[i], full->lod_tree->child_count[i]);
+        EXPECT_EQ(partial->lod_tree->center_at(i).x, full->lod_tree->center_at(i).x);
+        EXPECT_EQ(partial->lod_tree->size_at(i), full->lod_tree->size_at(i));
+        EXPECT_EQ(partial->lod_tree->child_start_at(i), full->lod_tree->child_start_at(i));
+        EXPECT_EQ(partial->lod_tree->child_count_at(i), full->lod_tree->child_count_at(i));
+        EXPECT_EQ(partial->lod_tree->level_at(i), full->lod_tree->level_at(i));
         if (HasFailure()) {
             FAIL() << "tree mismatch at node " << i;
+        }
+    }
+
+    // Parent links in the sidecar must agree with a reference forward scatter
+    // over the full in-RAM tree.
+    {
+        std::vector<std::uint32_t> reference_parent(total_nodes, 0xFFFFFFFFu);
+        for (std::size_t p = 0; p < total_nodes; ++p) {
+            const std::uint32_t cc = full->lod_tree->child_count_at(p);
+            const std::uint32_t cs = full->lod_tree->child_start_at(p);
+            for (std::uint32_t c = 0; c < cc; ++c) {
+                reference_parent[cs + c] = static_cast<std::uint32_t>(p);
+            }
+        }
+        for (std::size_t i = 0; i < total_nodes; ++i) {
+            ASSERT_EQ(partial->lod_tree->meta_view.links[i].parent, reference_parent[i])
+                << "sidecar parent mismatch at node " << i;
         }
     }
 
@@ -343,8 +364,8 @@ TEST(PlyToRadLod, ValidateExternalRad) {
     std::vector<std::uint8_t> parent_count(n, 0);
     std::size_t leaf_count = 0;
     for (std::size_t i = 0; i < n; ++i) {
-        const std::uint32_t cc = tree.child_count[i];
-        const std::uint32_t cs = tree.child_start[i];
+        const std::uint32_t cc = tree.child_count_at(i);
+        const std::uint32_t cs = tree.child_start_at(i);
         if (cc == 0) {
             ++leaf_count;
             continue;
@@ -376,7 +397,7 @@ TEST(PlyToRadLod, ValidateExternalRad) {
         ASSERT_EQ(chunk->count, range.count);
         for (std::size_t i = 0; i < chunk->count; ++i) {
             const std::size_t node = chunk->base + i;
-            ASSERT_EQ(chunk->means[i * 3 + 0], tree.centers[node].x)
+            ASSERT_EQ(chunk->means[i * 3 + 0], tree.center_at(node).x)
                 << "chunk/tree center mismatch at node " << node;
         }
     }

@@ -50,9 +50,40 @@ namespace lfs::vis {
         constexpr std::uint32_t kVkSplatProjectionModeShift = 8u;
         constexpr std::uint32_t kVkSplatProjectionModeGut = 1u;
 
+        // Bytes one pool page occupies on the GPU: page-input regions for one
+        // chunk of splats (mirrors ensureLodPageInputStorage's layout) plus
+        // the per-node traversal metadata (bounds 16 B + links 16 B).
+        std::size_t lodPageDeviceBytes(const lfs::core::SplatData& splat_data) {
+            const std::size_t page_splats = LodPageCache::kChunkSplats;
+            const std::uint32_t layout_rest =
+                static_cast<std::uint32_t>(splat_data.max_sh_coeffs_rest());
+            std::size_t bytes = page_splats * (3u + 3u + 4u + 3u + 1u) * sizeof(float);
+            bytes += layout_rest == 0u
+                         ? 4u * sizeof(float)
+                         : lfs::core::sh_swizzled_byte_count(page_splats, layout_rest);
+            bytes += page_splats * 32u;
+            return bytes;
+        }
+
+        // Per-frame cap on LOD page uploads; bounds transfer spikes right
+        // after teleports without starving convergence.
+        std::size_t lodUploadByteBudget(const lfs::core::SplatData& splat_data) {
+            if (const char* const env = std::getenv("LFS_LOD_UPLOAD_MAX_BYTES")) {
+                char* end = nullptr;
+                const auto parsed = std::strtoull(env, &end, 10);
+                if (end != env && parsed > 0) {
+                    return static_cast<std::size_t>(parsed);
+                }
+            }
+            const std::size_t page_bytes = lodPageDeviceBytes(splat_data);
+            return std::clamp<std::size_t>(page_bytes * 8, std::size_t{32} << 20, std::size_t{128} << 20);
+        }
+
         std::size_t requestedLodPhysicalPages(const std::size_t logical_chunks,
                                               const lfs::core::SplatData& splat_data,
-                                              const std::size_t pool_budget_splats) {
+                                              const std::size_t pool_budget_splats,
+                                              const float pool_vram_fraction,
+                                              const std::size_t current_pool_pages) {
             if (logical_chunks == 0 || splat_data.has_deleted_mask()) {
                 return logical_chunks;
             }
@@ -71,14 +102,32 @@ namespace lfs::vis {
             const bool out_of_core =
                 rad_backed &&
                 splat_data.lod_tree->total_nodes() > static_cast<std::size_t>(splat_data.size());
-            if (!host_resident_leaves || pool_budget_splats == 0) {
-                if (out_of_core) {
-                    // Only a coarse LOD prefix is host-resident; full page
-                    // residency cannot fit, so keep the pool bounded even with
-                    // LOD disabled.
-                    constexpr std::size_t kOutOfCoreFallbackPages = 256;
-                    return std::min(kOutOfCoreFallbackPages, logical_chunks);
+            if (out_of_core) {
+                // Only a coarse LOD prefix is host-resident, so the pool must
+                // hold the cut's whole working set or streaming thrashes. Size
+                // it from VRAM headroom; the splat-count budget setting was
+                // tuned for host-resident streaming and is far too small here.
+                constexpr std::size_t kMinPoolPages = 64;
+                const std::size_t page_bytes = std::max<std::size_t>(lodPageDeviceBytes(splat_data), 1);
+                std::size_t free_bytes = 0;
+                std::size_t total_bytes = 0;
+                if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess && free_bytes > 0) {
+                    // The current pool's own allocation counts as available to
+                    // its replacement, otherwise resizing feeds back on itself.
+                    const double budget_bytes =
+                        (static_cast<double>(free_bytes) +
+                         static_cast<double>(current_pool_pages) * static_cast<double>(page_bytes)) *
+                        std::clamp(pool_vram_fraction, 0.05f, 0.9f);
+                    const auto budget_pages =
+                        static_cast<std::size_t>(budget_bytes / static_cast<double>(page_bytes));
+                    return std::clamp(budget_pages,
+                                      std::min(kMinPoolPages, logical_chunks),
+                                      logical_chunks);
                 }
+                constexpr std::size_t kOutOfCoreFallbackPages = 256;
+                return std::min(kOutOfCoreFallbackPages, logical_chunks);
+            }
+            if (!host_resident_leaves || pool_budget_splats == 0) {
                 // Models whose tensors already live in VRAM (non-RAD, or RAD
                 // fully migrated at load) gain nothing from a bounded pool —
                 // streaming would only add double residency. Budget 0 = full.
@@ -211,6 +260,32 @@ namespace lfs::vis {
             }
         }
 
+        // GPU-side constant fill; orders of magnitude cheaper than streaming
+        // host data through 64 KB vkCmdUpdateBuffer chunks for sentinel init.
+        void recordFillBuffer(
+            VkCommandBuffer command_buffer,
+            const _VulkanBuffer& dst,
+            const std::uint32_t value) {
+            if (command_buffer == VK_NULL_HANDLE || dst.buffer == VK_NULL_HANDLE || dst.size == 0) {
+                return;
+            }
+            vkCmdFillBuffer(command_buffer, dst.buffer, dst.offset, dst.size, value);
+            VkBufferMemoryBarrier barrier{
+                .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .buffer = dst.buffer,
+                .offset = dst.offset,
+                .size = dst.size,
+            };
+            vkCmdPipelineBarrier(command_buffer,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 0, 0, nullptr, 1, &barrier, 0, nullptr);
+        }
+
         [[nodiscard]] std::uint32_t vksplatBaseCameraModel(
             const lfs::rendering::FrameView& frame_view,
             const bool equirectangular) {
@@ -301,6 +376,9 @@ namespace lfs::vis {
             mix_ptr(tree.lod_level.data());
             mix_ptr(tree.centers.data());
             mix_ptr(tree.sizes.data());
+            mix_size(tree.meta_view.node_count);
+            mix_ptr(tree.meta_view.bounds);
+            mix_ptr(tree.meta_view.links);
             signature = mixLodSignature(signature, tree.lod_opacity_encoded ? 1ull : 0ull);
             return signature;
         }
@@ -1313,7 +1391,9 @@ namespace lfs::vis {
             const lfs::rendering::GaussianLodGpuTraversalState& state,
             const std::size_t output_capacity,
             const std::size_t physical_node_count,
-            const std::size_t logical_chunk_count) {
+            const std::size_t logical_chunk_count,
+            const std::uint32_t current_frame,
+            const std::uint32_t fade_frames) {
             constexpr float kDegreesToRadians = 3.14159265358979323846f / 180.0f;
             const float inner_degrees = std::clamp(state.cone_inner_degrees, 0.0f, 180.0f);
             const float outer_degrees = std::clamp(state.cone_outer_degrees, 0.0f, 180.0f);
@@ -1366,6 +1446,8 @@ namespace lfs::vis {
                 std::min<std::size_t>(physical_node_count, std::numeric_limits<std::uint32_t>::max()));
             uniforms.logical_chunk_count = static_cast<std::uint32_t>(
                 std::min<std::size_t>(logical_chunk_count, std::numeric_limits<std::uint32_t>::max()));
+            uniforms.current_frame = current_frame;
+            uniforms.fade_frames = fade_frames;
             return uniforms;
         }
 
@@ -1685,7 +1767,9 @@ namespace lfs::vis {
             status.pool_pages = lod_page_cache_.snapshot().physical_pages;
             status.streaming_jobs = lod_page_cache_.outstandingWorkCount();
         }
-        status.touched_chunks = gpu_lod_prefetch_chunks_.size();
+        status.touched_chunks = gpu_lod_protected_chunks_.size() + gpu_lod_prefetch_requests_.size();
+        status.miss_chunks = gpu_lod_last_miss_count_;
+        status.deferred_requests = lod_page_cache_.deferredRequestCount();
         return status;
     }
 
@@ -1697,16 +1781,33 @@ namespace lfs::vis {
             return std::nullopt;
         }
 
-        const std::size_t physical_pages =
-            requestedLodPhysicalPages(logical_chunks, splat_data, lod_page_pool_splats_);
+        const bool same_model =
+            lod_page_cache_model_ == &splat_data &&
+            lod_page_cache_.configured() &&
+            lod_page_cache_.snapshot().logical_chunks == logical_chunks &&
+            !lod_pool_sizing_dirty_;
+        // The VRAM-derived size is computed once per model attach and then
+        // sticks: free VRAM keeps moving as the pool's own buffers allocate,
+        // and reconfiguring resets the whole cache. The pool budget setting or
+        // VRAM fraction changing re-arms the computation.
+        std::size_t physical_pages;
+        if (same_model) {
+            physical_pages = lod_page_cache_.snapshot().physical_pages;
+        } else {
+            physical_pages = requestedLodPhysicalPages(
+                logical_chunks,
+                splat_data,
+                lod_page_pool_splats_,
+                lod_pool_vram_fraction_,
+                lod_page_inputs_.model == &splat_data ? lod_page_inputs_.physical_pages : 0);
+            lod_pool_sizing_dirty_ = false;
+        }
         const bool needs_configure =
-            lod_page_cache_model_ != &splat_data ||
-            !lod_page_cache_.configured() ||
-            lod_page_cache_.snapshot().logical_chunks != logical_chunks ||
+            !same_model ||
             lod_page_cache_.snapshot().physical_pages != physical_pages;
         if (needs_configure) {
             lod_page_cache_model_ = &splat_data;
-            lod_page_cache_.configure(logical_chunks, physical_pages, 1);
+            lod_page_cache_.configure(logical_chunks, physical_pages, 1, lodPageDeviceBytes(splat_data));
             LOG_INFO("LOD page cache configured: logical_chunks={} physical_pages={} partial={} rad_source={}",
                      logical_chunks,
                      physical_pages,
@@ -1716,21 +1817,6 @@ namespace lfs::vis {
         lod_page_cache_.setRadSource(splat_data.lod_tree ? &splat_data.lod_tree->rad_source : nullptr,
                                      splat_data.get_max_sh_degree(),
                                      splat_data.lod_tree ? splat_data.lod_tree->lod_opacity_encoded : false);
-        if (needs_configure &&
-            physical_pages < logical_chunks &&
-            splat_data.lod_tree &&
-            splat_data.lod_tree->rad_source.valid()) {
-            const std::size_t warm_chunk_count = std::min(logical_chunks, physical_pages);
-            std::vector<std::uint32_t> warm_chunks;
-            warm_chunks.reserve(warm_chunk_count);
-            for (std::uint32_t chunk = 0; chunk < warm_chunk_count; ++chunk) {
-                warm_chunks.push_back(chunk);
-            }
-            lod_page_cache_.submitTraversalPriority(warm_chunks);
-            LOG_INFO("LOD page cache warm prefetch queued: chunks={} physical_pages={}",
-                     warm_chunks.size(),
-                     physical_pages);
-        }
         const bool rad_page_inputs =
             splat_data.lod_tree &&
             splat_data.lod_tree->rad_source.valid();
@@ -1760,9 +1846,11 @@ namespace lfs::vis {
 
         const auto& tree = *splat_data.lod_tree;
         const std::size_t node_count = tree.total_nodes();
+        const bool tree_view_backed = tree.meta_view.valid();
         if (node_count == 0 ||
-            tree.child_start.size() < node_count ||
-            tree.child_count.size() < node_count) {
+            (!tree_view_backed &&
+             (tree.child_start.size() < node_count ||
+              tree.child_count.size() < node_count))) {
             releaseGpuLodTreeStorage();
             return {};
         }
@@ -1807,43 +1895,34 @@ namespace lfs::vis {
             gpu_lod_tree_.physical_pages != page_snapshot->physical_pages ||
             gpu_lod_tree_.page_map_generation != page_snapshot->generation;
 
-        std::vector<float> node_bounds_upload;
-        std::vector<std::uint32_t> node_links_upload;
         std::vector<std::uint32_t> changed_physical_pages;
         std::vector<std::uint32_t> rebuilt_parent_indices;
         std::vector<std::uint32_t> page_to_chunk_upload;
         std::vector<std::uint32_t> chunk_to_page_upload;
+        std::vector<std::uint32_t> page_age_upload;
 
         if (tree_changed || page_maps_changed) {
-            const bool has_cached_centers = tree.centers.size() >= node_count;
-            const bool has_cached_sizes = tree.sizes.size() >= node_count;
-            const float* means_ptr = nullptr;
-            const float* scales_ptr = nullptr;
-            lfs::core::Tensor means_cpu;
-            lfs::core::Tensor scaling_cpu;
-
-            if (!has_cached_centers) {
-                if (node_count > static_cast<std::size_t>(splat_data.size())) {
-                    releaseGpuLodTreeStorage();
-                    return std::unexpected(
-                        "VkSplat GPU LOD tree storage requires RAD node centers for out-of-core models");
-                }
-                means_cpu = splat_data.means().cpu();
-                means_ptr = means_cpu.ptr<float>();
+            const bool has_cached_centers =
+                tree_view_backed || tree.centers.size() >= node_count;
+            const bool has_cached_sizes =
+                tree_view_backed || tree.sizes.size() >= node_count;
+            const bool out_of_core_nodes = node_count > static_cast<std::size_t>(splat_data.size());
+            if (!has_cached_centers && out_of_core_nodes) {
+                releaseGpuLodTreeStorage();
+                return std::unexpected(
+                    "VkSplat GPU LOD tree storage requires RAD node centers for out-of-core models");
             }
-            if (!has_cached_sizes) {
-                if (node_count > static_cast<std::size_t>(splat_data.size())) {
-                    releaseGpuLodTreeStorage();
-                    return std::unexpected(
-                        "VkSplat GPU LOD tree storage requires RAD node sizes for out-of-core models");
-                }
-                scaling_cpu = splat_data.scaling_raw().cpu();
-                scales_ptr = scaling_cpu.ptr<float>();
+            if (!has_cached_sizes && out_of_core_nodes) {
+                releaseGpuLodTreeStorage();
+                return std::unexpected(
+                    "VkSplat GPU LOD tree storage requires RAD node sizes for out-of-core models");
             }
 
-            const std::vector<std::uint32_t>* parent_indices = &gpu_lod_tree_.parent_indices;
-            if (tree_changed ||
-                gpu_lod_tree_.parent_indices.size() != node_count) {
+            // Sidecar-backed trees carry parent links in their links plane;
+            // the full-tree parent vector (4 B/node) is only for in-RAM trees.
+            if (!tree_view_backed &&
+                (tree_changed ||
+                 gpu_lod_tree_.parent_indices.size() != node_count)) {
                 rebuilt_parent_indices.assign(node_count, lfs::core::SplatLodTree::kInvalidPage);
                 for (std::size_t parent = 0; parent < node_count; ++parent) {
                     const std::uint32_t child_start = tree.child_start[parent];
@@ -1855,89 +1934,17 @@ namespace lfs::vis {
                         }
                     }
                 }
-                parent_indices = &rebuilt_parent_indices;
             }
-
-            const auto write_node = [&](const std::size_t logical_node_index,
-                                        const std::size_t physical_node_index,
-                                        std::vector<float>& bounds,
-                                        std::vector<std::uint32_t>& links) {
-                glm::vec3 center{};
-                if (has_cached_centers) {
-                    center = tree.centers[logical_node_index];
-                } else {
-                    center = glm::vec3(
-                        means_ptr[logical_node_index * 3u + 0u],
-                        means_ptr[logical_node_index * 3u + 1u],
-                        means_ptr[logical_node_index * 3u + 2u]);
-                }
-
-                float size = 0.0f;
-                if (has_cached_sizes) {
-                    size = tree.sizes[logical_node_index];
-                } else {
-                    const float sx = std::exp(scales_ptr[logical_node_index * 3u + 0u]);
-                    const float sy = std::exp(scales_ptr[logical_node_index * 3u + 1u]);
-                    const float sz = std::exp(scales_ptr[logical_node_index * 3u + 2u]);
-                    size = 2.0f * std::max({sx, sy, sz});
-                }
-
-                const std::size_t bounds_offset = physical_node_index * 4u;
-                bounds[bounds_offset + 0u] = center.x;
-                bounds[bounds_offset + 1u] = center.y;
-                bounds[bounds_offset + 2u] = center.z;
-                bounds[bounds_offset + 3u] = size;
-
-                const std::uint32_t child_count = tree.child_count[logical_node_index];
-                const std::uint32_t level =
-                    logical_node_index < tree.lod_level.size()
-                        ? static_cast<std::uint32_t>(tree.lod_level[logical_node_index])
-                        : 0u;
-                std::uint32_t flags = 0u;
-                if (child_count == 0u) {
-                    flags |= 1u;
-                }
-                if (logical_node_index == 0u) {
-                    flags |= 2u;
-                }
-                if (tree.lod_opacity_encoded) {
-                    flags |= 4u;
-                }
-
-                const std::size_t links_offset = physical_node_index * 4u;
-                links[links_offset + 0u] = tree.child_start[logical_node_index];
-                links[links_offset + 1u] =
-                    (child_count & 0xffffu) |
-                    ((level & 0xffu) << 16u) |
-                    ((flags & 0xffu) << 24u);
-                links[links_offset + 2u] = (*parent_indices)[logical_node_index];
-                links[links_offset + 3u] = static_cast<std::uint32_t>(logical_node_index);
-            };
 
             const std::size_t physical_page_count =
                 std::min(page_snapshot->physical_pages, page_snapshot->page_to_chunk.size());
             if (tree_changed) {
-                node_bounds_upload.assign(physical_node_capacity * 4u, 0.0f);
-                node_links_upload.assign(physical_node_capacity * 4u, lfs::core::SplatLodTree::kInvalidPage);
+                // Resident pages upload per page below; the rest of the pool
+                // gets a GPU-side sentinel fill instead of streaming gigabytes
+                // of host-built invalid entries through the command buffer.
                 for (std::size_t page = 0; page < physical_page_count; ++page) {
-                    const std::uint32_t chunk = page_snapshot->page_to_chunk[page];
-                    if (chunk == lfs::core::SplatLodTree::kInvalidPage ||
-                        static_cast<std::size_t>(chunk) >= page_snapshot->logical_chunks ||
-                        static_cast<std::size_t>(chunk) > std::numeric_limits<std::size_t>::max() / kLodChunkSplats) {
-                        continue;
-                    }
-                    const std::size_t logical_start = static_cast<std::size_t>(chunk) * kLodChunkSplats;
-                    if (logical_start >= node_count) {
-                        continue;
-                    }
-                    const std::size_t node_run =
-                        std::min(kLodChunkSplats, node_count - logical_start);
-                    const std::size_t physical_start = page * kLodChunkSplats;
-                    for (std::size_t offset = 0; offset < node_run; ++offset) {
-                        write_node(logical_start + offset,
-                                   physical_start + offset,
-                                   node_bounds_upload,
-                                   node_links_upload);
+                    if (page_snapshot->page_to_chunk[page] != lfs::core::SplatLodTree::kInvalidPage) {
+                        changed_physical_pages.push_back(static_cast<std::uint32_t>(page));
                     }
                 }
             } else if (page_maps_changed) {
@@ -1956,6 +1963,7 @@ namespace lfs::vis {
         if (page_maps_changed) {
             page_to_chunk_upload = page_snapshot->page_to_chunk;
             chunk_to_page_upload = page_snapshot->chunk_to_page;
+            page_age_upload = page_snapshot->page_resident_frame;
         }
 
         const auto resize_buffer = [&](auto& buffer, const std::size_t element_count) {
@@ -1966,28 +1974,21 @@ namespace lfs::vis {
         };
 
         try {
-            resize_buffer(gpu_lod_tree_.node_bounds, node_bounds_upload.size());
-            resize_buffer(gpu_lod_tree_.node_links, node_links_upload.size());
+            resize_buffer(gpu_lod_tree_.node_bounds, physical_node_capacity * 4u);
+            resize_buffer(gpu_lod_tree_.node_links, physical_node_capacity * 4u);
             resize_buffer(gpu_lod_tree_.page_to_chunk, page_to_chunk_upload.size());
             resize_buffer(gpu_lod_tree_.chunk_to_page, chunk_to_page_upload.size());
+            resize_buffer(gpu_lod_tree_.page_age, page_age_upload.size());
 
-            if (!node_bounds_upload.empty() ||
-                !node_links_upload.empty() ||
+            if (tree_changed ||
                 !changed_physical_pages.empty() ||
                 !page_to_chunk_upload.empty() ||
                 !chunk_to_page_upload.empty()) {
                 auto batch = DeviceGuard(&renderer_);
-                if (!node_bounds_upload.empty()) {
-                    recordUpdateBufferChunks(renderer_.activeCommandBuffer(),
-                                             gpu_lod_tree_.node_bounds.deviceBuffer,
-                                             node_bounds_upload.data(),
-                                             node_bounds_upload.size() * sizeof(float));
-                }
-                if (!node_links_upload.empty()) {
-                    recordUpdateBufferChunks(renderer_.activeCommandBuffer(),
-                                             gpu_lod_tree_.node_links.deviceBuffer,
-                                             node_links_upload.data(),
-                                             node_links_upload.size() * sizeof(std::uint32_t));
+                if (tree_changed) {
+                    recordFillBuffer(renderer_.activeCommandBuffer(),
+                                     gpu_lod_tree_.node_links.deviceBuffer,
+                                     lfs::core::SplatLodTree::kInvalidPage);
                 }
                 if (!changed_physical_pages.empty()) {
                     std::vector<float> page_bounds(kLodChunkSplats * 4u, 0.0f);
@@ -1995,8 +1996,10 @@ namespace lfs::vis {
                                                           lfs::core::SplatLodTree::kInvalidPage);
                     const std::vector<std::uint32_t>* parent_indices =
                         rebuilt_parent_indices.empty() ? &gpu_lod_tree_.parent_indices : &rebuilt_parent_indices;
-                    const bool has_cached_centers = tree.centers.size() >= node_count;
-                    const bool has_cached_sizes = tree.sizes.size() >= node_count;
+                    const bool has_cached_centers =
+                        tree_view_backed || tree.centers.size() >= node_count;
+                    const bool has_cached_sizes =
+                        tree_view_backed || tree.sizes.size() >= node_count;
                     const float* means_ptr = nullptr;
                     const float* scales_ptr = nullptr;
                     lfs::core::Tensor means_cpu;
@@ -2077,8 +2080,19 @@ namespace lfs::vis {
                                 if (logical_start < node_count) {
                                     const std::size_t node_run =
                                         std::min(kLodChunkSplats, node_count - logical_start);
-                                    for (std::size_t offset = 0; offset < node_run; ++offset) {
-                                        write_page_node(logical_start + offset, offset);
+                                    if (tree_view_backed) {
+                                        // Sidecar planes use the exact GPU
+                                        // layouts; staging is a straight copy.
+                                        std::memcpy(page_bounds.data(),
+                                                    tree.meta_view.bounds + logical_start,
+                                                    node_run * sizeof(lfs::core::NodeBoundsRecord));
+                                        std::memcpy(page_links.data(),
+                                                    tree.meta_view.links + logical_start,
+                                                    node_run * sizeof(lfs::core::NodeLinksRecord));
+                                    } else {
+                                        for (std::size_t offset = 0; offset < node_run; ++offset) {
+                                            write_page_node(logical_start + offset, offset);
+                                        }
                                     }
                                 }
                             }
@@ -2106,6 +2120,12 @@ namespace lfs::vis {
                                              gpu_lod_tree_.chunk_to_page.deviceBuffer,
                                              chunk_to_page_upload.data(),
                                              chunk_to_page_upload.size() * sizeof(std::uint32_t));
+                }
+                if (!page_age_upload.empty()) {
+                    recordUpdateBufferChunks(renderer_.activeCommandBuffer(),
+                                             gpu_lod_tree_.page_age.deviceBuffer,
+                                             page_age_upload.data(),
+                                             page_age_upload.size() * sizeof(std::uint32_t));
                 }
             }
         } catch (const std::exception& e) {
@@ -5819,38 +5839,12 @@ namespace lfs::vis {
             const bool overflowed =
                 lod_stats->overflow_count > 0 ||
                 lod_stats->candidate_count > lod_stats->rendered_capacity;
-            const float previous_feedback = gpu_lod_pixel_scale_feedback_;
-            if (lod_stats->rendered_capacity > 0) {
-                const double fill_ratio =
-                    static_cast<double>(lod_stats->candidate_count) /
-                    static_cast<double>(lod_stats->rendered_capacity);
-                if (overflowed) {
-                    const float factor = static_cast<float>(
-                        std::clamp(std::pow(std::max(fill_ratio / 0.97, 1.0), 0.85), 1.01, 1.25));
-                    gpu_lod_pixel_scale_feedback_ =
-                        std::clamp(gpu_lod_pixel_scale_feedback_ * factor, 0.05f, 64.0f);
-                } else if (fill_ratio < 0.90) {
-                    const float factor = static_cast<float>(
-                        std::clamp(std::pow(std::max(fill_ratio / 0.90, 0.05), 0.70), 0.50, 0.995));
-                    gpu_lod_pixel_scale_feedback_ =
-                        std::clamp(gpu_lod_pixel_scale_feedback_ * factor, 0.05f, 64.0f);
-                } else if (fill_ratio > 0.98) {
-                    gpu_lod_pixel_scale_feedback_ =
-                        std::clamp(gpu_lod_pixel_scale_feedback_ * 1.005f, 0.05f, 64.0f);
-                }
-            }
-            if (overflowed || std::abs(gpu_lod_pixel_scale_feedback_ - previous_feedback) > 0.01f) {
-                LOG_PERF(
-                    "vksplat.lod_gpu_selection candidates={} capacity={} overflow={} feedback={:.3f}",
-                    lod_stats->candidate_count,
-                    lod_stats->rendered_capacity,
-                    lod_stats->overflow_count,
-                    gpu_lod_pixel_scale_feedback_);
-            }
+
+            std::size_t miss_count = 0;
             if (!lod_stats->chunk_touch.empty()) {
                 constexpr std::uint32_t kChunkTouchProtected = 0xffffffffu;
                 gpu_lod_protected_chunks_.clear();
-                gpu_lod_prefetch_chunks_.clear();
+                gpu_lod_prefetch_requests_.clear();
                 std::vector<std::pair<std::uint32_t, std::uint32_t>> miss_candidates;
                 for (std::uint32_t chunk = 0;
                      chunk < static_cast<std::uint32_t>(lod_stats->chunk_touch.size());
@@ -5868,14 +5862,11 @@ namespace lfs::vis {
                 std::sort(miss_candidates.begin(),
                           miss_candidates.end(),
                           [](const auto& a, const auto& b) { return a.first > b.first; });
-                // Protected (rendered-from) chunks first: submitTraversalPriority
-                // bumps their LRU clocks without consuming request budget; the
-                // prioritized misses then fill the decode budget in order.
-                gpu_lod_prefetch_chunks_ = gpu_lod_protected_chunks_;
-                gpu_lod_prefetch_chunks_.reserve(gpu_lod_prefetch_chunks_.size() + miss_candidates.size());
+                gpu_lod_prefetch_requests_.reserve(miss_candidates.size());
                 for (const auto& [priority, chunk] : miss_candidates) {
-                    gpu_lod_prefetch_chunks_.push_back(chunk);
+                    gpu_lod_prefetch_requests_.push_back({.chunk = chunk, .priority = priority});
                 }
+                miss_count = miss_candidates.size();
                 gpu_lod_prefetch_valid_ = true;
                 static std::uint32_t gpu_lod_prefetch_log_counter = 0;
                 const std::uint32_t prefetch_log_counter = ++gpu_lod_prefetch_log_counter;
@@ -5885,6 +5876,51 @@ namespace lfs::vis {
                              gpu_lod_protected_chunks_.size(),
                              miss_candidates.size());
                 }
+            }
+            gpu_lod_last_miss_count_ = miss_count;
+
+            // Damped threshold controller with a wide deadband; the per-frame
+            // rate clamp keeps the limit (and with it the global transition
+            // band and the touch set) stable at rest.
+            const float previous_feedback = gpu_lod_pixel_scale_feedback_;
+            if (lod_stats->rendered_capacity > 0) {
+                const bool converging = miss_count > 0 || lod_page_cache_.hasOutstandingWork();
+                const double fill_ratio =
+                    static_cast<double>(lod_stats->candidate_count) /
+                    static_cast<double>(lod_stats->rendered_capacity);
+                float target = gpu_lod_pixel_scale_feedback_;
+                if (overflowed) {
+                    target *= static_cast<float>(
+                        std::clamp(std::pow(std::max(fill_ratio / 0.97, 1.0), 0.85), 1.02, 1.15));
+                } else if (fill_ratio < 0.85) {
+                    // While streaming converges, parents stand in for missing
+                    // children and the candidate count runs low — recover
+                    // GENTLY rather than freezing: a coarse cut always has
+                    // misses in flight, so a freeze would let one transient
+                    // overflow ratchet the limit up with no path back down.
+                    const double floor_rate = converging ? 0.98 : 0.90;
+                    target *= static_cast<float>(
+                        std::clamp(std::pow(std::max(fill_ratio / 0.85, 0.05), 0.5), floor_rate, 1.0));
+                }
+                // The ceiling must accommodate tight budgets on km-scale
+                // scenes: close-up views legitimately need the limit dozens of
+                // times coarser to fit the cut, or capacity-clamp truncation
+                // punches holes in the image. Recovery handles coming back.
+                constexpr float kMaxRatePerFrame = 1.03f;
+                gpu_lod_pixel_scale_feedback_ = std::clamp(
+                    std::clamp(target,
+                               gpu_lod_pixel_scale_feedback_ / kMaxRatePerFrame,
+                               gpu_lod_pixel_scale_feedback_ * kMaxRatePerFrame),
+                    0.05f,
+                    64.0f);
+            }
+            if (overflowed || std::abs(gpu_lod_pixel_scale_feedback_ - previous_feedback) > 0.01f) {
+                LOG_PERF(
+                    "vksplat.lod_gpu_selection candidates={} capacity={} overflow={} feedback={:.3f}",
+                    lod_stats->candidate_count,
+                    lod_stats->rendered_capacity,
+                    lod_stats->overflow_count,
+                    gpu_lod_pixel_scale_feedback_);
             }
         }
 
@@ -5926,10 +5962,12 @@ namespace lfs::vis {
                  (request.lod_touched_chunks != nullptr &&
                   request.lod_touched_chunk_count > 0));
             if (lod_page_inputs_active) {
+                lod_page_cache_.beginFrame();
                 if (queue_lod_prefetch_after_render) {
                     if (gpu_lod_prefetch_source) {
-                        lod_page_cache_.submitTraversalPriority(gpu_lod_prefetch_chunks_,
-                                                                gpu_lod_protected_chunks_);
+                        lod_page_cache_.submitTraversalPriority(
+                            std::span<const LodPageCache::ChunkRequest>(gpu_lod_prefetch_requests_),
+                            gpu_lod_protected_chunks_);
                     } else {
                         protected_lod_chunks =
                             collectProtectedLodChunks(request,
@@ -5941,7 +5979,7 @@ namespace lfs::vis {
                             protected_lod_chunks);
                     }
                 }
-                lod_page_uploads = lod_page_cache_.drainPendingUploads();
+                lod_page_uploads = lod_page_cache_.drainPendingUploads(lodUploadByteBudget(splat_data));
             }
         }
 
@@ -6418,13 +6456,16 @@ namespace lfs::vis {
                             makeGpuLodSelectUniforms(gpu_lod_traversal,
                                                      gpu_lod_select_capacity,
                                                      gpu_lod_tree_.physical_node_capacity,
-                                                     gpu_lod_tree_.logical_chunks);
+                                                     gpu_lod_tree_.logical_chunks,
+                                                     static_cast<std::uint32_t>(lod_page_cache_.frameIndex()),
+                                                     partial_lod_page_inputs ? lod_fade_frames_ : 0u);
                         renderer_.executeSelectLodThreshold(
                             lod_select_uniforms,
                             buffers_,
                             gpu_lod_tree_.node_bounds.deviceBuffer,
                             gpu_lod_tree_.node_links.deviceBuffer,
-                            gpu_lod_tree_.chunk_to_page.deviceBuffer);
+                            gpu_lod_tree_.chunk_to_page.deviceBuffer,
+                            gpu_lod_tree_.page_age.deviceBuffer);
                         static std::uint32_t gpu_lod_select_log_counter = 0;
                         const std::uint32_t gpu_lod_log_counter = ++gpu_lod_select_log_counter;
                         if (gpu_lod_log_counter <= 5u || (gpu_lod_log_counter % 120u) == 0u) {
@@ -6595,26 +6636,29 @@ namespace lfs::vis {
         renderer_.tagDeferredVisibleCountReadback(render_complete_timeline_, completion_value);
         renderer_.tagDeferredLodSelectionReadback(render_complete_timeline_, completion_value);
         ring_completion_values_[ring_slot] = completion_value;
-        if (queue_lod_prefetch_after_render) {
-            if (gpu_lod_prefetch_source) {
-                lod_page_cache_.submitTraversalPriority(gpu_lod_prefetch_chunks_,
-                                                        gpu_lod_protected_chunks_);
-            } else {
-                lod_page_cache_.submitTraversalPriority(
-                    std::span<const std::uint32_t>(
-                        request.lod_touched_chunks,
-                        request.lod_touched_chunk_count),
-                    protected_lod_chunks);
-            }
-        }
+        // The pre-render submit already requested this frame's chunks and
+        // refreshed protection stamps; a second submit here would only burn
+        // another request budget on identical data.
+        (void)queue_lod_prefetch_after_render;
+        (void)protected_lod_chunks;
 
         const auto& output = output_slots_[outputSlotIndex(output_slot)][ring_slot];
         const std::uint64_t lod_page_generation =
             lod_request_active && lod_page_cache_.configured()
                 ? lod_page_cache_.snapshot().generation
                 : 0u;
+        if (lod_page_generation != gpu_lod_last_page_generation_) {
+            gpu_lod_last_page_generation_ = lod_page_generation;
+            gpu_lod_last_publish_frame_ = lod_page_cache_.frameIndex();
+        }
+        // Keep frames coming until fade-ins of freshly published pages finish,
+        // not just until the decode queue drains.
+        const bool lod_fades_active =
+            lod_fade_frames_ > 0 &&
+            lod_page_cache_.frameIndex() < gpu_lod_last_publish_frame_ + lod_fade_frames_;
         const bool lod_streaming_active =
-            lod_page_inputs_active && lod_page_cache_.hasOutstandingWork();
+            lod_page_inputs_active &&
+            (lod_page_cache_.hasOutstandingWork() || lod_fades_active);
         return RenderResult{
             .image = output.image.image,
             .image_view = output.image.view,

@@ -147,7 +147,32 @@ namespace lfs::vis {
         const auto& tree = *data.lod_tree;
         const size_t n = tree.total_nodes();
         if (n == 0 || n > static_cast<size_t>(data.size())) {
-            detach();
+            // Out-of-core model: the GPU selector drives the cut and CPU
+            // traversal stays detached, but the model/tree stats are still
+            // this controller's to report.
+            if (n > 0 && (tree.meta_view.valid() || tree.child_count.size() >= n)) {
+                size_t leaf_count = 0;
+                if (tree.meta_view.valid()) {
+                    leaf_count = tree.meta_view.leaf_count;
+                } else {
+                    for (size_t i = 0; i < n; ++i) {
+                        leaf_count += tree.child_count[i] == 0 ? 1 : 0;
+                    }
+                }
+                Stats stats{};
+                stats.available = true;
+                stats.has_tree = true;
+                stats.lod_opacity_encoded = tree.lod_opacity_encoded;
+                stats.model_splats = leaf_count;
+                stats.tree_nodes = n;
+                stats.non_leaf_nodes = n - leaf_count;
+                stats.full_quality_splats = leaf_count;
+                stats.chunk_splats = kSparkLodChunkSplats;
+                stats.chunk_count = tree.chunk_count();
+                base_stats_ = stats;
+                std::scoped_lock lock(mutex_);
+                current_stats_ = stats;
+            }
             return;
         }
         if (tree.child_start.size() < n || tree.child_count.size() < n) {
@@ -844,7 +869,10 @@ namespace lfs::vis {
         }
         const std::uint32_t page = page_maps.chunk_to_page[chunk];
         if (page == kSparkInvalidPage) {
-            return node_index;
+            // Evicted chunk: the raw node index would address the pool tensor
+            // out of range and render an unrelated splat. The projection
+            // shader skips the invalid sentinel cleanly.
+            return kSparkInvalidPage;
         }
         return page * static_cast<std::uint32_t>(kSparkLodChunkSplats) +
                (node_index & static_cast<std::uint32_t>(kSparkLodChunkSplats - 1));
