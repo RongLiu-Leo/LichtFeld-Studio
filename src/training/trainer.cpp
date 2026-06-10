@@ -1782,6 +1782,9 @@ namespace lfs::training {
 
     void Trainer::setViewerReleaseFence(cudaExternalSemaphore_t semaphore) {
         std::lock_guard<std::mutex> lock(stream_sync_mutex_);
+        if (viewer_release_semaphore_ == semaphore) {
+            return;
+        }
         viewer_release_semaphore_ = semaphore;
         viewer_borrow_waited_ = 0;
     }

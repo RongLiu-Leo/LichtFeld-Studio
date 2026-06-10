@@ -1434,7 +1434,11 @@ namespace lfs::vis {
         }
     };
 
-    VksplatViewportRenderer::VksplatViewportRenderer() = default;
+    VksplatViewportRenderer::VksplatViewportRenderer() {
+        // Created here (not in ensureInitialized) so the trainer↔viewer
+        // handshake can target the render stream from the very first frame.
+        cudaStreamCreateWithFlags(&render_stream_, cudaStreamNonBlocking);
+    }
 
     VksplatViewportRenderer::~VksplatViewportRenderer() {
         reset();
@@ -4286,15 +4290,10 @@ namespace lfs::vis {
                     return std::unexpected(ok.error());
                 }
             }
-            if (synchronize_upload) {
-                LOG_TIMER("prepareInputs.stream_sync");
-                if (const cudaError_t status = cudaStreamSynchronize(stream); status != cudaSuccess) {
-                    return std::unexpected(std::format("VkSplat CUDA input stream sync failed: {} ({})",
-                                                       cudaGetErrorName(status),
-                                                       cudaGetErrorString(status)));
-                }
-            }
-
+            // No CPU sync for live training models anymore: the upload-timeline
+            // signal below is enqueued on the render stream after the copies, so
+            // Vulkan's wait covers them; trainer writes are ordered by the
+            // beginModelRead/publishViewerBorrow handshake.
             {
                 LOG_TIMER("prepareInputs.cuda_signal");
                 auto& timeline = upload_timelines_[ring_slot];
@@ -5819,10 +5818,16 @@ namespace lfs::vis {
 
         std::expected<void, std::string> compose_status;
         const std::uint64_t completion_value = ++render_complete_value_;
+        // This pass re-reads the storages bound by the previous prepareInputs;
+        // extend their retirement to cover this submit.
+        if (!retired_input_storages_.empty()) {
+            retired_input_storages_.back().first =
+                std::max(retired_input_storages_.back().first, completion_value);
+        }
         try {
             LOG_TIMER("vksplat.selection_overlay.batch_total");
             auto batch = DeviceGuard(&renderer_,
-                                     synchronize_input_read,
+                                     /*use_fence=*/false,
                                      render_complete_timeline_,
                                      completion_value);
             {
@@ -6554,8 +6559,11 @@ namespace lfs::vis {
             // tensors. Otherwise CUDA training can mutate scales/opacities for
             // the next iteration while this frame is still in flight.
             LOG_TIMER("vksplat.render.batch_total");
+            // No CPU fence spin: live-model lifetime is covered by the storage
+            // retire-list + the trainer's release-fence wait, and the LOD page
+            // buffer self-hazard waits GPU-side on the imported timeline.
             auto batch = DeviceGuard(&renderer_,
-                                     synchronize_input_upload || lod_page_inputs_active,
+                                     /*use_fence=*/false,
                                      render_complete_timeline_,
                                      completion_value);
             {

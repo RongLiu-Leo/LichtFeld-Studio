@@ -707,6 +707,13 @@ namespace lfs::vis {
             vulkan_viewport_image_size_ = {0, 0};
             vulkan_viewport_image_flip_y_ = false;
             if (vksplat_viewport_renderer_) {
+                // The trainer must drop the fence handle before reset destroys
+                // the CUDA import it points at.
+                if (trainer_manager) {
+                    if (auto* trainer = trainer_manager->getTrainer()) {
+                        trainer->setViewerReleaseFence(nullptr);
+                    }
+                }
                 vksplat_viewport_renderer_->reset();
             }
             viewport_artifact_service_.clearViewportOutput();
@@ -720,6 +727,32 @@ namespace lfs::vis {
             training_dirty) {
             markDirty(training_dirty);
         }
+
+        // Trainer↔viewer GPU handshake, forward edge: order this frame's model
+        // reads (render-stream packing and Vulkan zero-copy) after the
+        // trainer's last consistent parameter state. The reverse edge — the
+        // trainer waiting on this frame's completion before its next in-place
+        // writes — is published after the frame's submits.
+        lfs::training::Trainer* live_trainer = nullptr;
+        if (is_training && trainer_manager && vksplat_viewport_renderer_ &&
+            vksplat_viewport_renderer_->renderStream()) {
+            live_trainer = trainer_manager->getTrainer();
+        }
+        if (live_trainer) {
+            live_trainer->setViewerReleaseFence(vksplat_viewport_renderer_->renderCompleteFence());
+            live_trainer->beginModelRead(vksplat_viewport_renderer_->renderStream());
+        }
+        // Publishes the frame's final completion value at scope exit (all
+        // return paths), while the shared render lock is still held.
+        struct ViewerBorrowPublisher {
+            lfs::training::Trainer* trainer;
+            VksplatViewportRenderer* renderer;
+            ~ViewerBorrowPublisher() {
+                if (trainer && renderer) {
+                    trainer->publishViewerBorrow(renderer->renderCompleteValue());
+                }
+            }
+        } viewer_borrow_publisher{live_trainer, vksplat_viewport_renderer_.get()};
 
         const bool has_cached_gpu_only_frame = [&]() {
             if (vulkan_viewport_image_size_.x <= 0 || vulkan_viewport_image_size_.y <= 0) {
