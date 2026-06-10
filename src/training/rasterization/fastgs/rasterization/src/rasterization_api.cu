@@ -27,14 +27,15 @@ namespace fast_lfs::rasterization {
         thread_local std::string last_forward_error;
         thread_local std::string last_backward_error;
 
-        void free_sorted_primitive_indices(void* ptr) noexcept {
+        void free_sorted_primitive_indices(void* ptr, cudaStream_t stream) noexcept {
             if (!ptr) {
                 return;
             }
             lfs::diagnostics::VramProfiler::instance().recordDeallocation(ptr);
 #if CUDART_VERSION >= 11020
-            cudaFreeAsync(ptr, nullptr);
+            cudaFreeAsync(ptr, stream);
 #else
+            (void)stream;
             cudaFree(ptr);
 #endif
         }
@@ -202,7 +203,12 @@ namespace fast_lfs::rasterization {
         float center_y,
         float near_plane,
         float far_plane,
-        bool mip_filter) {
+        bool mip_filter,
+        cudaStream_t stream) {
+
+        if (stream == nullptr) {
+            stream = lfs::core::getCurrentCUDAStream();
+        }
 
         lfs::core::RasterizerMemoryArena* arena = nullptr;
         uint64_t frame_id = 0;
@@ -239,7 +245,7 @@ namespace fast_lfs::rasterization {
             // synchronizes prior arena users, so asynchronous CUDA failures are
             // attributed before the CUB workspace query below.
             arena = &lfs::core::GlobalArenaManager::instance().get_arena();
-            frame_id = arena->begin_frame(lfs::core::getCurrentCUDAStream());
+            frame_id = arena->begin_frame(stream);
             frame_started = true;
 
             validate_fastgs_forward_cuda_preflight(
@@ -324,7 +330,8 @@ namespace fast_lfs::rasterization {
                                                    center_y,
                                                    near_plane,
                                                    far_plane,
-                                                   mip_filter);
+                                                   mip_filter,
+                                                   stream);
 
             // Verify allocations happened
             if (forward_result.n_instances > 0 && !forward_result.sorted_primitive_indices) {
@@ -343,6 +350,7 @@ namespace fast_lfs::rasterization {
             ctx.n_instances = forward_result.n_instances;
             ctx.sh_layout_bases = sh_layout_bases;
             ctx.frame_id = frame_id;
+            ctx.stream = stream;
             ctx.grad_mean2d_helper = grad_mean2d_helper;
             ctx.grad_conic_helper = grad_conic_helper;
             ctx.grad_depth_helper = grad_depth_helper;
@@ -372,9 +380,11 @@ namespace fast_lfs::rasterization {
         if (!forward_ctx.success) {
             return;
         }
-        free_sorted_primitive_indices(forward_ctx.sorted_primitive_indices);
+        // Release on the context's stream, not the caller's current one —
+        // robust against unwind paths on threads whose guard already popped.
+        free_sorted_primitive_indices(forward_ctx.sorted_primitive_indices, forward_ctx.stream);
         auto& arena = lfs::core::GlobalArenaManager::instance().get_arena();
-        arena.end_frame(forward_ctx.frame_id, lfs::core::getCurrentCUDAStream());
+        arena.end_frame(forward_ctx.frame_id, forward_ctx.stream);
     }
 
     BackwardOutputs backward_raw(
