@@ -56,6 +56,7 @@ namespace lfs::core {
             DeferredFreeQueue::instance().shutdown();
             SizeBucketedPool::instance().shutdown();
             GPUSlabAllocator::instance().shutdown();
+            CudaEventPool::instance().shutdown();
         }
 
         void* allocate(size_t bytes, cudaStream_t stream = nullptr) {
