@@ -1667,12 +1667,18 @@ namespace lfs::vis {
             if (compose_) {
                 compose_->destroy(context_->device());
             }
-            if (render_complete_timeline_ != VK_NULL_HANDLE) {
+            render_complete_cuda_.reset();
+            if (render_complete_external_.semaphore != VK_NULL_HANDLE) {
+                context_->destroyExternalSemaphore(render_complete_external_);
+            } else if (render_complete_timeline_ != VK_NULL_HANDLE) {
                 vkDestroySemaphore(context_->device(), render_complete_timeline_, nullptr);
             }
         }
+        render_complete_external_ = {};
         render_complete_timeline_ = VK_NULL_HANDLE;
         render_complete_value_ = 0;
+        last_lod_page_borrow_value_ = 0;
+        retired_input_storages_.clear();
         latest_output_ring_slot_ = {};
         output_generations_ = {};
         ring_completion_values_ = {};
@@ -2321,6 +2327,17 @@ namespace lfs::vis {
             lod_page_inputs_.physical_pages == 0 ||
             lod_page_inputs_.splat_capacity == 0) {
             return std::unexpected("VkSplat LOD page upload requires initialized page input storage");
+        }
+
+        // lod_page_inputs_ is a single persistent buffer (not per-ring): order
+        // this frame's page uploads after the last frame that read it, GPU-side
+        // via the imported render-complete timeline.
+        if (last_lod_page_borrow_value_ != 0 && render_complete_cuda_.valid()) {
+            if (!render_complete_cuda_.cudaWait(last_lod_page_borrow_value_, render_stream_)) {
+                return std::unexpected(std::format(
+                    "VkSplat LOD page upload fence wait failed: {}",
+                    render_complete_cuda_.lastError()));
+            }
         }
 
         auto* const base = static_cast<std::uint8_t*>(lod_page_inputs_.interop.devicePointer());
@@ -3373,7 +3390,8 @@ namespace lfs::vis {
     }
 
     void VksplatViewportRenderer::drainRetiredScratchBuffers(bool force) {
-        if (context_ == nullptr || retired_scratch_buffers_.empty()) {
+        if (context_ == nullptr ||
+            (retired_scratch_buffers_.empty() && retired_input_storages_.empty())) {
             return;
         }
         auto retired = [&](std::uint64_t value) {
@@ -3393,6 +3411,14 @@ namespace lfs::vis {
                 it = retired_scratch_buffers_.erase(it);
             } else {
                 ++it;
+            }
+        }
+        auto storage_it = retired_input_storages_.begin();
+        while (storage_it != retired_input_storages_.end()) {
+            if (retired(storage_it->first)) {
+                storage_it = retired_input_storages_.erase(storage_it);
+            } else {
+                ++storage_it;
             }
         }
     }
@@ -3824,19 +3850,30 @@ namespace lfs::vis {
                 }
             });
 
-            VkSemaphoreTypeCreateInfo timeline_info{};
-            timeline_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
-            timeline_info.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
-            timeline_info.initialValue = 0;
-            VkSemaphoreCreateInfo semaphore_info{};
-            semaphore_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-            semaphore_info.pNext = &timeline_info;
-            const VkResult semaphore_result =
-                vkCreateSemaphore(context.device(), &semaphore_info, nullptr, &render_complete_timeline_);
-            if (semaphore_result != VK_SUCCESS) {
+            // Exportable so CUDA (the trainer's release-fence wait) can consume
+            // the same monotonic counter Vulkan signals at batch completion.
+            if (!context.createExternalTimelineSemaphore(0, render_complete_external_)) {
                 return std::unexpected(std::format(
                     "VkSplat render completion timeline creation failed: {}",
-                    vkError("vkCreateSemaphore", semaphore_result)));
+                    context.lastError()));
+            }
+            render_complete_timeline_ = render_complete_external_.semaphore;
+            const auto completion_handle =
+                context.releaseExternalSemaphoreNativeHandle(render_complete_external_);
+            if (!VulkanContext::externalNativeHandleValid(completion_handle)) {
+                context.destroyExternalSemaphore(render_complete_external_);
+                render_complete_timeline_ = VK_NULL_HANDLE;
+                return std::unexpected("VkSplat render completion timeline export failed");
+            }
+            lfs::rendering::CudaVulkanExternalSemaphoreImport completion_import{};
+            completion_import.semaphore_handle = completion_handle;
+            completion_import.initial_value = render_complete_external_.initial_value;
+            if (!render_complete_cuda_.init(completion_import)) {
+                std::string err = render_complete_cuda_.lastError();
+                context.destroyExternalSemaphore(render_complete_external_);
+                render_complete_timeline_ = VK_NULL_HANDLE;
+                return std::unexpected(std::format(
+                    "VkSplat render completion timeline CUDA import failed: {}", err));
             }
             context.setDebugObjectName(VK_OBJECT_TYPE_SEMAPHORE,
                                        render_complete_timeline_,
@@ -4221,6 +4258,15 @@ namespace lfs::vis {
                 buffers_.scales_opacs.deviceBuffer = {};
                 buffers_.sh_coeffs.deviceBuffer = {};
                 update_input_metadata(input_snapshot_changed);
+
+                // Keep the borrowed storages alive until the frame that binds
+                // them retires: a trainer topology reallocation may drop its
+                // references while this frame's batch is still in flight.
+                retired_input_storages_.emplace_back(
+                    render_complete_value_ + 1,
+                    std::vector<std::shared_ptr<void>>{
+                        means_storage, sh0_storage, shN_storage,
+                        rotations_storage, scaling_storage, opacity_storage});
             }
 
             const cudaStream_t stream = render_stream_;
@@ -6821,6 +6867,9 @@ namespace lfs::vis {
         renderer_.tagDeferredLodSelectionReadback(render_complete_timeline_, completion_value);
         renderer_.tagDeferredInstanceCountReadback(render_complete_timeline_, completion_value);
         ring_completion_values_[ring_slot] = completion_value;
+        if (lod_page_inputs_active) {
+            last_lod_page_borrow_value_ = completion_value;
+        }
         if (queue_lod_prefetch_after_render) {
             if (gpu_lod_prefetch_source) {
                 lod_page_cache_.submitTraversalPriority(gpu_lod_prefetch_chunks_,

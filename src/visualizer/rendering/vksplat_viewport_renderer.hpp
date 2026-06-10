@@ -127,6 +127,15 @@ namespace lfs::vis {
         // it so Vulkan's waits cover the packing.
         [[nodiscard]] cudaStream_t renderStream() const { return render_stream_; }
 
+        // Reverse edge of the trainer↔viewer handshake: the render-complete
+        // timeline imported into CUDA, and the latest completion value covering
+        // submits that bound live training storage. The trainer enqueues
+        // "wait fence >= value" on its stream before in-place writes.
+        [[nodiscard]] cudaExternalSemaphore_t renderCompleteFence() const {
+            return render_complete_cuda_.handle();
+        }
+        [[nodiscard]] std::uint64_t renderCompleteValue() const { return render_complete_value_; }
+
         [[nodiscard]] bool nextOutputImagesNeedResize(
             glm::ivec2 size,
             OutputSlot output_slot = OutputSlot::Main) const;
@@ -511,6 +520,23 @@ namespace lfs::vis {
         UploadTimeline selection_query_timeline_{};
 
         cudaStream_t render_stream_ = nullptr;
+
+        // CUDA import of the render-complete timeline: the reverse edge of the
+        // trainer↔viewer handshake. The trainer waits "render_complete >=
+        // borrow value" GPU-side before its next in-place parameter writes.
+        VulkanContext::ExternalSemaphore render_complete_external_{};
+        lfs::rendering::CudaTimelineSemaphore render_complete_cuda_{};
+
+        // The last completion value whose frame read the persistent (non-ring)
+        // lod_page_inputs_ buffer; next-frame page uploads wait on it GPU-side.
+        std::uint64_t last_lod_page_borrow_value_ = 0;
+
+        // Zero-copy input storages bound to in-flight frames, keyed by the
+        // completion value at which the GPU is done reading them. Keeps
+        // VkBuffer + external memory + CUDA allocation alive across trainer
+        // topology reallocations.
+        std::vector<std::pair<std::uint64_t, std::vector<std::shared_ptr<void>>>>
+            retired_input_storages_;
     };
 
 } // namespace lfs::vis
