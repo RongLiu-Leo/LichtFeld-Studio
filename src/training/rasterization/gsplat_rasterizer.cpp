@@ -93,7 +93,13 @@ namespace lfs::training {
                 }
             }
 
-            const cudaStream_t fwd_stream = means.stream();
+            // Current-stream-first (the caller's guard), tensor stream as
+            // fallback — matches the lib-wide rule and the begin_frame stream,
+            // so a metrics-thread render lands its kernels and consumers on the
+            // same stream as the arena frame.
+            const cudaStream_t fwd_stream = core::getCurrentCUDAStream()
+                                                ? core::getCurrentCUDAStream()
+                                                : means.stream();
 
             // Keep K tensor cached and update values in-place to avoid per-call allocations.
             thread_local core::Tensor cached_K_tensor;
@@ -492,6 +498,7 @@ namespace lfs::training {
             ctx.render_mode = render_mode;
             ctx.camera_model = camera_model;
             ctx.frame_id = frame_id;
+            ctx.stream = fwd_stream;
             ctx.render_tile_x_offset = tile_x_offset;
             ctx.render_tile_y_offset = tile_y_offset;
             ctx.render_tile_width = tile_width;
@@ -521,6 +528,11 @@ namespace lfs::training {
         // Get arena for temporary allocations
         auto& arena = core::GlobalArenaManager::instance().get_arena();
         auto arena_allocator = arena.get_allocator(ctx.frame_id);
+        // The stream the backward work + arena frame release run on (also needed
+        // by the catch handler), hoisted above the try.
+        const cudaStream_t stream = core::getCurrentCUDAStream()
+                                        ? core::getCurrentCUDAStream()
+                                        : ctx.means.stream();
         try {
 
             const uint32_t N = ctx.N;
@@ -528,7 +540,6 @@ namespace lfs::training {
             const uint32_t H = ctx.image_height;
             const uint32_t W = ctx.image_width;
             const uint32_t channels = ctx.channels;
-            const cudaStream_t stream = ctx.means.stream();
 
             // Calculate sizes for arena allocation
             auto align = [](size_t size, size_t alignment = 128) {
@@ -792,22 +803,24 @@ namespace lfs::training {
 
             // Free internally allocated buffers from forward
             if (ctx.isect_ids_ptr != nullptr) {
-                cudaFree(ctx.isect_ids_ptr);
+                cudaFreeAsync(ctx.isect_ids_ptr, stream);
             }
             if (ctx.flatten_ids_ptr != nullptr) {
-                cudaFree(ctx.flatten_ids_ptr);
+                cudaFreeAsync(ctx.flatten_ids_ptr, stream);
             }
 
-            // End arena frame to release memory from forward pass
-            arena.end_frame(ctx.frame_id, core::getCurrentCUDAStream());
+            // End arena frame to release memory from forward pass — on the
+            // backward's stream (where its kernels ran), not the re-derived
+            // current stream.
+            arena.end_frame(ctx.frame_id, stream);
         } catch (...) {
             if (ctx.isect_ids_ptr != nullptr) {
-                cudaFree(ctx.isect_ids_ptr);
+                cudaFreeAsync(ctx.isect_ids_ptr, stream);
             }
             if (ctx.flatten_ids_ptr != nullptr) {
-                cudaFree(ctx.flatten_ids_ptr);
+                cudaFreeAsync(ctx.flatten_ids_ptr, stream);
             }
-            arena.end_frame(ctx.frame_id);
+            arena.end_frame(ctx.frame_id, stream);
             throw;
         }
     }
