@@ -491,6 +491,11 @@ namespace lfs::training {
         std::atomic<bool> callback_busy_{false};
         cudaStream_t callback_stream_ = nullptr;
 
+        // Dedicated stream for all training-thread GPU work (installed as the
+        // thread's current stream in train()). LFS_TRAIN_STREAM_LEGACY=1 keeps
+        // training on the legacy default stream.
+        cudaStream_t training_stream_ = nullptr;
+
         // Python control scripts (file paths) to execute before training starts
         std::vector<std::filesystem::path> python_scripts_;
 

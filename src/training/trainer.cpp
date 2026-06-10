@@ -20,6 +20,7 @@
 #include "core/splat_data_transform.hpp"
 #include "core/tensor/internal/cuda_stream_context.hpp"
 #include "core/tensor/internal/gpu_slab_allocator.hpp"
+#include "core/tensor/internal/memory_pool.hpp"
 #include "core/tensor/internal/size_bucketed_pool.hpp"
 #include "diagnostics/vram_profiler.hpp"
 #include "io/cache_image_loader.hpp"
@@ -56,6 +57,7 @@
 #include <memory>
 #include <numeric>
 #include <nvtx3/nvToolsExt.h>
+#include <nvtx3/nvToolsExtCudaRt.h>
 #include <string_view>
 #include <thread>
 #include <unordered_map>
@@ -1611,6 +1613,13 @@ namespace lfs::training {
         }
 
         cudaStreamCreateWithFlags(&callback_stream_, cudaStreamNonBlocking);
+        // Blocking flag (not cudaStreamNonBlocking): legacy-stream work — blocking
+        // cudaMemcpy readbacks, cold-path loader uploads — must stay implicitly
+        // ordered against training kernels. Overlap partners (loader decode,
+        // viewer render) use non-blocking streams with explicit event edges.
+        cudaStreamCreate(&training_stream_);
+        nvtxNameCudaStreamA(training_stream_, "lfs.train");
+        nvtxNameCudaStreamA(callback_stream_, "lfs.train.callback");
 
         LOG_DEBUG("Trainer constructed with {} cameras", base_dataset_->get_cameras().size());
     }
@@ -1624,6 +1633,13 @@ namespace lfs::training {
         }
 
         cudaStreamCreateWithFlags(&callback_stream_, cudaStreamNonBlocking);
+        // Blocking flag (not cudaStreamNonBlocking): legacy-stream work — blocking
+        // cudaMemcpy readbacks, cold-path loader uploads — must stay implicitly
+        // ordered against training kernels. Overlap partners (loader decode,
+        // viewer render) use non-blocking streams with explicit event edges.
+        cudaStreamCreate(&training_stream_);
+        nvtxNameCudaStreamA(training_stream_, "lfs.train");
+        nvtxNameCudaStreamA(callback_stream_, "lfs.train.callback");
 
         if (!scene.hasTrainingData()) {
             throw std::runtime_error("Scene has no cameras");
@@ -2459,6 +2475,13 @@ namespace lfs::training {
             callback_stream_ = nullptr;
         }
         callback_busy_ = false;
+
+        if (training_stream_) {
+            cudaStreamSynchronize(training_stream_);
+            lfs::core::CudaMemoryPool::instance().release_stream(training_stream_);
+            cudaStreamDestroy(training_stream_);
+            training_stream_ = nullptr;
+        }
 
         cudaDeviceSynchronize();
 
@@ -4142,6 +4165,18 @@ namespace lfs::training {
         }
 
         try {
+            static const bool legacy_stream = []() {
+                const char* env = std::getenv("LFS_TRAIN_STREAM_LEGACY");
+                return env && env[0] == '1';
+            }();
+            std::optional<lfs::core::CUDAStreamGuard> stream_guard;
+            if (training_stream_ && !legacy_stream) {
+                stream_guard.emplace(training_stream_);
+                // initialize() ran on another thread on the legacy stream; order
+                // all of its work before the first training-stream kernel.
+                cudaDeviceSynchronize();
+            }
+
             // Start from current_iteration_ (allows resume from checkpoint)
             int iter = current_iteration_.load() > 0 ? current_iteration_.load() + 1 : 1;
             const RenderMode render_mode = RenderMode::RGB;

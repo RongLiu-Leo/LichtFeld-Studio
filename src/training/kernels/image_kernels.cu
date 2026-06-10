@@ -216,6 +216,5 @@ namespace lfs::training::kernels {
         constexpr int block_size = 256;
         const int grid_size = static_cast<int>(std::min<std::size_t>((n + block_size - 1) / block_size, 4096));
         normalize_by_device_scalar_kernel<<<grid_size, block_size, 0, stream>>>(d_data, n, d_scalar);
-        cudaStreamSynchronize(stream);
     }
 } // namespace lfs::training::kernels
