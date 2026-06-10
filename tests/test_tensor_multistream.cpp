@@ -5,6 +5,7 @@
 #include <cstring>
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -310,6 +311,106 @@ TEST_F(TensorMultiStreamTest, ArenaCrossStreamFrameHandoff) {
 
     cudaFree(staging);
     destroyStreamSafely(render);
+}
+
+// Mirrors the trainer↔viewer protocol: writer records params_ready after each
+// in-place rewrite and waits the reader's done-event before the next one; the
+// reader brackets its snapshot with the matching wait/record. Every snapshot
+// must be one consistent iteration — without the handshake, the overlapping
+// memset tears it.
+TEST_F(TensorMultiStreamTest, TrainerViewerHandshakeYieldsConsistentSnapshots) {
+    constexpr size_t kBytes = 32 * 1024 * 1024;
+    constexpr int kMaxIterations = 200000;
+    constexpr int kTargetSnapshots = 50;
+
+    cudaStream_t train_stream, render_stream;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&train_stream, cudaStreamNonBlocking), cudaSuccess);
+    ASSERT_EQ(cudaStreamCreateWithFlags(&render_stream, cudaStreamNonBlocking), cudaSuccess);
+
+    void* params = nullptr;
+    void* staging = nullptr;
+    ASSERT_EQ(cudaMalloc(&params, kBytes), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&staging, kBytes), cudaSuccess);
+    ASSERT_EQ(cudaMemset(params, 0, kBytes), cudaSuccess);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    cudaEvent_t params_ready, reader_done;
+    ASSERT_EQ(cudaEventCreateWithFlags(&params_ready, cudaEventDisableTiming), cudaSuccess);
+    ASSERT_EQ(cudaEventCreateWithFlags(&reader_done, cudaEventDisableTiming), cudaSuccess);
+
+    std::mutex sync_mutex;
+    bool params_recorded = false;
+    bool reader_pending = false;
+    std::atomic<bool> writer_done{false};
+    std::atomic<bool> stop_writer{false};
+
+    std::thread writer([&] {
+        cudaSetDevice(0);
+        for (int i = 1; i <= kMaxIterations && !stop_writer.load(std::memory_order_acquire); ++i) {
+            {
+                std::lock_guard<std::mutex> lock(sync_mutex);
+                if (reader_pending) {
+                    cudaStreamWaitEvent(train_stream, reader_done, 0);
+                    reader_pending = false;
+                }
+            }
+            cudaMemsetAsync(params, i & 0xFF, kBytes, train_stream);
+            {
+                std::lock_guard<std::mutex> lock(sync_mutex);
+                cudaEventRecord(params_ready, train_stream);
+                params_recorded = true;
+            }
+        }
+        cudaStreamSynchronize(train_stream);
+        writer_done.store(true, std::memory_order_release);
+    });
+
+    std::vector<unsigned char> host(kBytes / 65536);
+    int snapshots = 0;
+    int torn_snapshots = 0;
+    while (!writer_done.load(std::memory_order_acquire)) {
+        {
+            std::lock_guard<std::mutex> lock(sync_mutex);
+            if (params_recorded) {
+                cudaStreamWaitEvent(render_stream, params_ready, 0);
+            }
+        }
+        ASSERT_EQ(cudaMemcpyAsync(staging, params, kBytes, cudaMemcpyDeviceToDevice, render_stream),
+                  cudaSuccess);
+        {
+            std::lock_guard<std::mutex> lock(sync_mutex);
+            cudaEventRecord(reader_done, render_stream);
+            reader_pending = true;
+        }
+        ASSERT_EQ(cudaStreamSynchronize(render_stream), cudaSuccess);
+
+        for (size_t i = 0; i < host.size(); ++i) {
+            ASSERT_EQ(cudaMemcpy(&host[i], static_cast<unsigned char*>(staging) + i * 65536, 1,
+                                 cudaMemcpyDeviceToHost),
+                      cudaSuccess);
+        }
+        ++snapshots;
+        for (size_t i = 1; i < host.size(); ++i) {
+            if (host[i] != host[0]) {
+                ++torn_snapshots;
+                break;
+            }
+        }
+        if (snapshots >= kTargetSnapshots) {
+            stop_writer.store(true, std::memory_order_release);
+        }
+    }
+    writer.join();
+
+    EXPECT_EQ(torn_snapshots, 0) << "of " << snapshots << " snapshots";
+    EXPECT_GE(snapshots, kTargetSnapshots);
+
+    cudaFree(params);
+    cudaFree(staging);
+    cudaEventDestroy(params_ready);
+    cudaEventDestroy(reader_done);
+    destroyStreamSafely(train_stream);
+    destroyStreamSafely(render_stream);
 }
 
 TEST_F(TensorMultiStreamTest, MultiThreadMultiStreamHammer) {

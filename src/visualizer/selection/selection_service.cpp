@@ -7,6 +7,7 @@
 #include "core/logger.hpp"
 #include "core/services.hpp"
 #include "core/splat_data.hpp"
+#include "core/tensor/internal/cuda_event_pool.hpp"
 #include "gui/gui_manager.hpp"
 #include "internal/viewport.hpp"
 #include "operation/undo_entry.hpp"
@@ -291,35 +292,12 @@ namespace lfs::vis {
                 output.is_contiguous()) {
                 const cudaStream_t source_stream = source.stream();
                 const cudaStream_t output_stream = output.stream();
-                cudaEvent_t bridge_event = nullptr;
 
-                const auto fail_cuda = [&](const char* const op, const cudaError_t status) {
-                    if (bridge_event != nullptr) {
-                        cudaEventDestroy(bridge_event);
-                    }
-                    LOG_WARN("SelectionService: async selection copy {} failed: {} ({})",
-                             op,
-                             cudaGetErrorName(status),
-                             cudaGetErrorString(status));
-                    return false;
-                };
-
-                if (source_stream != output_stream) {
-                    if (const cudaError_t status = cudaEventCreateWithFlags(&bridge_event, cudaEventDisableTiming);
-                        status != cudaSuccess) {
-                        return fail_cuda("cudaEventCreateWithFlags(output-ready)", status);
-                    }
-                    if (const cudaError_t status = cudaEventRecord(bridge_event, output_stream);
-                        status != cudaSuccess) {
-                        return fail_cuda("cudaEventRecord(output-ready)", status);
-                    }
-                    if (const cudaError_t status = cudaStreamWaitEvent(source_stream, bridge_event, 0);
-                        status != cudaSuccess) {
-                        return fail_cuda("cudaStreamWaitEvent(output-ready)", status);
-                    }
-                    cudaEventDestroy(bridge_event);
-                    bridge_event = nullptr;
-                }
+                // Pooled event edges both ways: copy on the source stream after
+                // the output's pending work, then hand the result back to the
+                // output stream. record_stream keeps the allocator from
+                // recycling the output before the cross-stream write retires.
+                lfs::core::bridgeStreams(output_stream, source_stream);
 
                 if (const cudaError_t status = cudaMemcpyAsync(output.data_ptr(),
                                                                source.data_ptr(),
@@ -327,24 +305,14 @@ namespace lfs::vis {
                                                                cudaMemcpyDeviceToDevice,
                                                                source_stream);
                     status != cudaSuccess) {
-                    return fail_cuda("cudaMemcpyAsync", status);
+                    LOG_WARN("SelectionService: async selection copy failed: {} ({})",
+                             cudaGetErrorName(status),
+                             cudaGetErrorString(status));
+                    return false;
                 }
+                output.record_stream(source_stream);
 
-                if (source_stream != output_stream) {
-                    if (const cudaError_t status = cudaEventCreateWithFlags(&bridge_event, cudaEventDisableTiming);
-                        status != cudaSuccess) {
-                        return fail_cuda("cudaEventCreateWithFlags(copied)", status);
-                    }
-                    if (const cudaError_t status = cudaEventRecord(bridge_event, source_stream);
-                        status != cudaSuccess) {
-                        return fail_cuda("cudaEventRecord(copied)", status);
-                    }
-                    if (const cudaError_t status = cudaStreamWaitEvent(output_stream, bridge_event, 0);
-                        status != cudaSuccess) {
-                        return fail_cuda("cudaStreamWaitEvent(copied)", status);
-                    }
-                    cudaEventDestroy(bridge_event);
-                }
+                lfs::core::bridgeStreams(source_stream, output_stream);
                 return true;
             }
             output.copy_from(source);
