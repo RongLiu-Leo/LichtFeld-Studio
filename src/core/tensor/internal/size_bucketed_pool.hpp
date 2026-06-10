@@ -211,6 +211,19 @@ namespace lfs::core {
             }
         }
 
+        // Retags cached entries from one stream to another. Caller must have
+        // synchronized `from` first.
+        void retag_stream(cudaStream_t from, cudaStream_t to) {
+            for (size_t i = 0; i < NUM_BUCKETS; ++i) {
+                std::lock_guard<std::mutex> lock(buckets_[i].mutex);
+                for (CachedBlock& block : buckets_[i].cache) {
+                    if (block.stream == from) {
+                        block.stream = to;
+                    }
+                }
+            }
+        }
+
         void trim_cache() {
             for (size_t i = 0; i < NUM_BUCKETS; ++i) {
                 std::lock_guard<std::mutex> lock(buckets_[i].mutex);

@@ -21,6 +21,11 @@ namespace {
     constexpr size_t SLAB_BYTES = 64 * 1024;
     constexpr size_t BUCKET_BYTES = 4 * 1024 * 1024;
 
+    void destroyStreamSafely(cudaStream_t stream) {
+        CudaMemoryPool::instance().release_stream(stream);
+        cudaStreamDestroy(stream);
+    }
+
     class GateStream {
     public:
         GateStream() {
@@ -31,8 +36,7 @@ namespace {
 
         ~GateStream() {
             release();
-            cudaStreamSynchronize(stream_);
-            cudaStreamDestroy(stream_);
+            destroyStreamSafely(stream_);
             cudaStreamDestroy(gate_holder_);
             cudaEventDestroy(gate_);
         }
@@ -93,7 +97,7 @@ TEST_F(TensorMultiStreamTest, SlabSameStreamReuseIsImmediateAndStealFree) {
 
     pool.deallocate(second, stream);
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
-    cudaStreamDestroy(stream);
+    destroyStreamSafely(stream);
 }
 
 TEST_F(TensorMultiStreamTest, SlabCrossStreamStealIsOrdered) {
@@ -132,7 +136,7 @@ TEST_F(TensorMultiStreamTest, SlabCrossStreamStealIsOrdered) {
 
     pool.deallocate(stolen, consumer);
     ASSERT_EQ(cudaStreamSynchronize(consumer), cudaSuccess);
-    cudaStreamDestroy(consumer);
+    destroyStreamSafely(consumer);
 }
 
 TEST_F(TensorMultiStreamTest, BucketCrossStreamReuseIsOrdered) {
@@ -171,7 +175,7 @@ TEST_F(TensorMultiStreamTest, BucketCrossStreamReuseIsOrdered) {
 
     pool.deallocate(reused, consumer);
     ASSERT_EQ(cudaStreamSynchronize(consumer), cudaSuccess);
-    cudaStreamDestroy(consumer);
+    destroyStreamSafely(consumer);
 }
 
 TEST_F(TensorMultiStreamTest, RecordStreamBridgesReaderIntoFree) {
@@ -214,7 +218,7 @@ TEST_F(TensorMultiStreamTest, RecordStreamBridgesReaderIntoFree) {
         pool.deallocate(reused, owner);
     }
     cudaFree(staging);
-    cudaStreamDestroy(owner);
+    destroyStreamSafely(owner);
 }
 
 TEST_F(TensorMultiStreamTest, MultiThreadMultiStreamHammer) {
@@ -261,7 +265,7 @@ TEST_F(TensorMultiStreamTest, MultiThreadMultiStreamHammer) {
             }
 
             cudaStreamSynchronize(stream);
-            cudaStreamDestroy(stream);
+            destroyStreamSafely(stream);
         });
     }
     for (auto& thread : threads) {

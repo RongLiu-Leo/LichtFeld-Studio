@@ -83,6 +83,32 @@ namespace lfs::core {
             return nullptr;
         }
 
+        // Moves `stream`'s free-list entries to the virgin list. Caller must have
+        // synchronized the stream (or the device) first — entries become
+        // reusable on any stream with no event edge.
+        void merge_stream_into_virgin(cudaStream_t stream) {
+            for (auto& lists : free_lists_) {
+                std::lock_guard<std::mutex> lock(lists.mutex);
+                auto it = lists.per_stream.find(stream);
+                if (it == lists.per_stream.end()) {
+                    continue;
+                }
+                lists.virgin.insert(lists.virgin.end(), it->second.begin(), it->second.end());
+                lists.per_stream.erase(it);
+            }
+        }
+
+        // Same, for every stream. Caller must have synchronized the device.
+        void merge_all_streams_into_virgin() {
+            for (auto& lists : free_lists_) {
+                std::lock_guard<std::mutex> lock(lists.mutex);
+                for (auto& [stream, blocks] : lists.per_stream) {
+                    lists.virgin.insert(lists.virgin.end(), blocks.begin(), blocks.end());
+                }
+                lists.per_stream.clear();
+            }
+        }
+
         // `stream` must be the stream the block's last use is ordered on
         // (the owner's home stream after any cross-stream edges were bridged).
         void deallocate(void* ptr, size_t bytes, cudaStream_t stream = nullptr) {

@@ -160,6 +160,29 @@ namespace lfs::core {
             }
         }
 
+        // Severs every allocator reference to `stream` so it can be destroyed.
+        // Waits for the stream's pending work, then drops it from recorded uses,
+        // re-homes live allocations to the legacy stream, and migrates cached
+        // free-list entries. Must be called before cudaStreamDestroy on any
+        // stream that touched pool memory; destroying a referenced stream makes
+        // later frees/reuse dereference a dead handle.
+        void release_stream(cudaStream_t stream) {
+            if (!stream)
+                return;
+            cudaStreamSynchronize(stream);
+            {
+                std::lock_guard<std::mutex> lock(map_mutex_);
+                for (auto& [ptr, info] : allocation_map_) {
+                    std::erase(info.extra_streams, stream);
+                    if (info.home_stream == stream) {
+                        info.home_stream = nullptr;
+                    }
+                }
+            }
+            GPUSlabAllocator::instance().merge_stream_into_virgin(stream);
+            SizeBucketedPool::instance().retag_stream(stream, nullptr);
+        }
+
         // Moves `ptr`'s home to `stream` (declarative re-homing for tensors whose
         // future writes happen there). The old home becomes a recorded use.
         void rehome_stream(void* ptr, cudaStream_t stream) {
@@ -296,6 +319,13 @@ namespace lfs::core {
         void trim_cached_memory() {
             cudaDeviceSynchronize();
             DeferredFreeQueue::instance().flush();
+            {
+                std::lock_guard<std::mutex> lock(map_mutex_);
+                for (auto& [ptr, info] : allocation_map_) {
+                    info.extra_streams.clear();
+                }
+            }
+            GPUSlabAllocator::instance().merge_all_streams_into_virgin();
             SizeBucketedPool::instance().trim_cache();
 
 #if CUDART_VERSION >= 12080
