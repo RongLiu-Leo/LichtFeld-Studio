@@ -4,6 +4,7 @@
 
 #include "lod_page_cache.hpp"
 
+#include "core/logger.hpp"
 #include "core/path_utils.hpp"
 
 #include <algorithm>
@@ -75,7 +76,9 @@ namespace lfs::vis {
             std::uint32_t chunk = kInvalidPage;
             std::uint32_t page = kInvalidPage;
             std::uint64_t generation = 0;
-            std::expected<lfs::io::RadDecodedChunk, std::string> decoded;
+            // Empty = the page sink accepted the chunk (publish flows through
+            // the upload engine); non-empty = read/decode/sink failure.
+            std::string error;
         };
 
         explicit DecodeScheduler(RadSourceSnapshot source)
@@ -157,11 +160,17 @@ namespace lfs::vis {
             return in_flight_chunks_.count(chunk) > 0;
         }
 
+        void setSink(std::shared_ptr<const PageSink> sink) {
+            std::lock_guard lock(mutex_);
+            sink_ = std::move(sink);
+        }
+
     private:
         static bool byPriority(const Entry& a, const Entry& b) { return a.priority < b.priority; }
 
         void workerLoop() {
             std::ifstream stream;
+            std::vector<std::uint8_t> raw;
             std::unique_lock lock(mutex_);
             while (true) {
                 cv_.wait(lock, [this] { return stop_ || !queue_.empty(); });
@@ -173,33 +182,43 @@ namespace lfs::vis {
                 queue_.pop_back();
                 ++in_flight_;
                 in_flight_chunks_.insert(entry.chunk);
+                const std::shared_ptr<const PageSink> sink = sink_;
                 lock.unlock();
 
+                Result result{.chunk = entry.chunk, .page = entry.page, .generation = entry.generation, .error = {}};
                 if (!stream.is_open()) {
                     (void)lfs::core::open_file_for_read(source_.path, std::ios::binary, stream);
                 }
-                Result result{.chunk = entry.chunk, .page = entry.page, .generation = entry.generation, .decoded = std::unexpected(std::string{})};
-                if (stream.is_open()) {
-                    result.decoded = lfs::io::load_rad_chunk(stream,
-                                                             source_.path,
-                                                             entry.range,
-                                                             source_.max_sh_degree,
-                                                             source_.lod_opacity_encoded);
-                    if (!result.decoded) {
-                        stream.close();
-                    }
+                if (sink == nullptr || !(*sink)) {
+                    result.error = "page sink not installed";
+                } else if (!stream.is_open()) {
+                    result.error = "Failed to open RAD source for chunk decode";
                 } else {
-                    result.decoded = std::unexpected("Failed to open RAD source for chunk decode");
+                    raw.resize(entry.range.file_bytes);
+                    stream.clear();
+                    stream.seekg(static_cast<std::streamoff>(entry.range.file_offset), std::ios::beg);
+                    stream.read(reinterpret_cast<char*>(raw.data()),
+                                static_cast<std::streamsize>(raw.size()));
+                    if (!stream.good()) {
+                        result.error = "Failed to read RAD chunk bytes";
+                        stream.close();
+                    } else {
+                        result.error = (*sink)(entry.chunk, entry.page, entry.generation,
+                                               std::span<const std::uint8_t>(raw));
+                    }
                 }
 
                 lock.lock();
                 --in_flight_;
                 in_flight_chunks_.erase(entry.chunk);
-                completed_.push_back(std::move(result));
+                if (!result.error.empty()) {
+                    completed_.push_back(std::move(result));
+                }
             }
         }
 
         RadSourceSnapshot source_;
+        std::shared_ptr<const PageSink> sink_;
         mutable std::mutex mutex_;
         std::condition_variable cv_;
         std::vector<Entry> queue_;
@@ -249,28 +268,21 @@ namespace lfs::vis {
         snapshot_.page_resident_frame.assign(physical_page_capacity, 0);
 
         const std::size_t pinned_roots = std::min(root_chunk_count, logical_chunk_count);
-        for (std::uint32_t chunk = 0; chunk < pinned_roots; ++chunk) {
-            const std::size_t page = chooseEvictionSlot();
-            if (page >= pages_.size()) {
-                break;
-            }
-            reserveUpload(page, chunk, true, 0);
-            publishPage(page, chunk, true);
-        }
+        root_chunk_count_ = pinned_roots;
 
         // Full-capacity native loads retain the current all-resident behavior and
-        // still exercise the same maps used by paged RAD streaming.
+        // still exercise the same maps used by paged RAD streaming. Partial
+        // (streaming) caches bootstrap their pinned roots in beginFrame() once
+        // the RAD source and page sink are installed.
         if (physical_page_capacity == logical_chunk_count) {
             for (std::uint32_t chunk = 0; chunk < logical_chunk_count; ++chunk) {
-                if (chunk < pinned_roots) {
-                    continue;
-                }
+                const bool pin = chunk < pinned_roots;
                 const std::size_t page = chooseEvictionSlot();
                 if (page >= pages_.size()) {
                     break;
                 }
-                reserveUpload(page, chunk, false, 0);
-                publishPage(page, chunk, false);
+                reserveUpload(page, chunk, pin, 0);
+                publishPage(page, chunk, pin);
             }
         }
     }
@@ -296,9 +308,30 @@ namespace lfs::vis {
         rad_source_.lod_opacity_encoded = lod_opacity_encoded;
     }
 
+    void LodPageCache::setPageSink(PageSink sink) {
+        page_sink_ = sink ? std::make_shared<const PageSink>(std::move(sink)) : nullptr;
+        if (scheduler_) {
+            scheduler_->setSink(page_sink_);
+        }
+    }
+
+    void LodPageCache::ensureRootResidency() {
+        if (pages_.empty() || snapshot_.physical_pages >= snapshot_.logical_chunks) {
+            return;
+        }
+        for (std::uint32_t chunk = 0;
+             chunk < static_cast<std::uint32_t>(root_chunk_count_); ++chunk) {
+            // Self-healing: a failed stream (sink not yet installed, decode
+            // error) released the reservation; retry until the root is in.
+            (void)requestResident(chunk, true,
+                                  std::numeric_limits<std::uint32_t>::max());
+        }
+    }
+
     void LodPageCache::beginFrame() {
         ++frame_;
         deferred_requests_ = 0;
+        ensureRootResidency();
     }
 
     void LodPageCache::submitTraversalPriority(const std::span<const std::uint32_t> chunks,
@@ -381,7 +414,7 @@ namespace lfs::vis {
                 chunk < snapshot_.chunk_to_page.size() &&
                 snapshot_.chunk_to_page[chunk] != kInvalidPage;
             if (resident && stamp_resident_requests) {
-                stampProtection(chunk);
+                stampProtection(chunk, request.priority);
             }
             const bool active_request = resident || decodeInFlight(chunk) || has_pending_upload(chunk);
             if (!active_request) {
@@ -422,14 +455,22 @@ namespace lfs::vis {
 
     void LodPageCache::completeUploads(const std::span<const PendingUpload> uploads) {
         for (const auto& upload : uploads) {
-            if (!upload.error.empty() ||
-                upload.page == kInvalidPage ||
+            if (upload.page == kInvalidPage ||
                 upload.chunk == kInvalidPage ||
                 upload.page >= pages_.size() ||
                 upload.chunk >= snapshot_.logical_chunks) {
                 continue;
             }
             auto& slot = pages_[upload.page];
+            if (!upload.error.empty()) {
+                // Failed past the decode stage (async copy error, pool
+                // reconfigured mid-flight): release the reservation or the
+                // slot would never become evictable again.
+                if (slot.loading_chunk == upload.chunk) {
+                    slot.loading_chunk = kInvalidPage;
+                }
+                continue;
+            }
             if (slot.loading_chunk != upload.chunk &&
                 slot.chunk != upload.chunk) {
                 continue;
@@ -442,7 +483,7 @@ namespace lfs::vis {
         return (scheduler_ ? scheduler_->outstanding() : 0) + pending_uploads_.size();
     }
 
-    void LodPageCache::stampProtection(const std::uint32_t chunk) {
+    void LodPageCache::stampProtection(const std::uint32_t chunk, const std::uint32_t priority) {
         if (chunk >= snapshot_.chunk_to_page.size()) {
             return;
         }
@@ -450,8 +491,11 @@ namespace lfs::vis {
         if (page == kInvalidPage || page >= pages_.size()) {
             return;
         }
-        pages_[page].protected_until_frame = frame_ + protect_window_frames_;
-        pages_[page].last_used = ++clock_;
+        auto& slot = pages_[page];
+        slot.protected_until_frame = frame_ + protect_window_frames_;
+        slot.last_used = ++clock_;
+        slot.last_priority = std::max(effectivePriority(slot), priority);
+        slot.last_touch_frame = frame_;
     }
 
     std::size_t LodPageCache::requestBudgetPages() const {
@@ -465,7 +509,10 @@ namespace lfs::vis {
                 return std::min<std::size_t>(static_cast<std::size_t>(parsed), pages_.size());
             }
         }
-        return std::clamp<std::size_t>(pages_.size() / 16, std::min<std::size_t>(4, pages_.size()), 16);
+        // Decode workers (≤8) starve below ~4 queued chunks each; 16 capped
+        // the fill rate at ~830 chunks/s and a paused view took seconds to
+        // finish reallocating its pool.
+        return std::clamp<std::size_t>(pages_.size() / 16, std::min<std::size_t>(4, pages_.size()), 32);
     }
 
     bool LodPageCache::requestResident(const std::uint32_t chunk,
@@ -502,8 +549,42 @@ namespace lfs::vis {
             return false;
         }
 
+        // Priority admission: stealing an occupied slot must buy more screen
+        // quality than it destroys, or a working set larger than the pool
+        // rotates through the model forever (region refines, neighbor
+        // coarsens, repeat). Deferred refinements keep rendering their parent
+        // stand-ins; idle pages decay so a camera move reclaims them.
+        if (frame_ > 0 && !pin && pages_[page].chunk != kInvalidPage) {
+            // Hysteresis: displacement must buy at least 2x pixel scale
+            // (one float exponent step), or near-equal sibling regions swap
+            // pages forever at full pool.
+            constexpr std::uint32_t kAdmissionMargin = 0x00800000;
+            const std::uint32_t resistance = effectivePriority(pages_[page]);
+            const std::uint32_t bar =
+                resistance > std::numeric_limits<std::uint32_t>::max() - kAdmissionMargin
+                    ? std::numeric_limits<std::uint32_t>::max()
+                    : resistance + kAdmissionMargin;
+            if (priority <= bar) {
+                return false;
+            }
+        }
+
         reserveUpload(page, chunk, pin, priority);
         return true;
+    }
+
+    std::uint32_t LodPageCache::effectivePriority(const PageSlot& slot) const {
+        // The selector readback re-stamps every page the live cut renders
+        // from each frame, so an untouched page is ground truth for "not part
+        // of the current view" — it surrenders its admission resistance
+        // entirely once past a short flicker guard. Post-pause reallocation
+        // is then bounded by stream throughput (sub-second), not a decay
+        // clock (a gradual halving per 30 idle frames made new-view wants
+        // arrive seconds late). Touched pages keep full resistance; the
+        // admission margin alone guards same-view steals at full pool.
+        constexpr std::uint64_t kIdleFreeFrames = 12;
+        const std::uint64_t age = frame_ - std::min(frame_, slot.last_touch_frame);
+        return age > kIdleFreeFrames ? 0u : slot.last_priority;
     }
 
     std::size_t LodPageCache::chooseEvictionSlot(
@@ -519,6 +600,7 @@ namespace lfs::vis {
         }
 
         std::size_t best_page = pages_.size();
+        std::uint32_t best_priority = std::numeric_limits<std::uint32_t>::max();
         std::uint64_t best_time = std::numeric_limits<std::uint64_t>::max();
         for (std::size_t page = 0; page < pages_.size(); ++page) {
             if (page < protected_pages.size() && protected_pages[page] != 0) {
@@ -531,7 +613,10 @@ namespace lfs::vis {
             if (slot.protected_until_frame > frame_) {
                 continue;
             }
-            if (slot.last_used < best_time) {
+            const std::uint32_t priority = frame_ > 0 ? effectivePriority(slot) : 0u;
+            if (priority < best_priority ||
+                (priority == best_priority && slot.last_used < best_time)) {
+                best_priority = priority;
                 best_time = slot.last_used;
                 best_page = page;
             }
@@ -546,6 +631,8 @@ namespace lfs::vis {
         auto& slot = pages_[page];
         slot.loading_chunk = chunk;
         slot.last_used = ++clock_;
+        slot.last_priority = priority;
+        slot.last_touch_frame = frame_;
         slot.pinned = slot.pinned || pin;
 
         const auto enqueue_pending = [&] {
@@ -553,22 +640,22 @@ namespace lfs::vis {
                 .page = static_cast<std::uint32_t>(page),
                 .chunk = chunk,
                 .generation = snapshot_.generation,
-                .decoded_chunk = std::nullopt,
                 .error = {},
             });
         };
 
-        // Root pages are made visible before upload so the first exact traversal can
-        // still render root-only while the renderer fills the pinned physical page.
-        // Keep that bootstrap upload synchronous via the renderer's resident tensor
-        // fallback; all non-root RAD pages use the async decode queue.
-        if (pin || !rad_source_.valid() || chunk >= rad_source_.chunks.size()) {
+        // In-core pages (no RAD source) are filled from the resident tensors
+        // by the renderer (D2D); everything else — pinned roots included —
+        // streams from disk through the decode scheduler into the upload
+        // engine.
+        if (!rad_source_.valid() || chunk >= rad_source_.chunks.size()) {
             enqueue_pending();
             return;
         }
 
         if (!scheduler_) {
             scheduler_ = std::make_unique<DecodeScheduler>(rad_source_);
+            scheduler_->setSink(page_sink_);
         }
         scheduler_->enqueue({
             .chunk = chunk,
@@ -639,24 +726,14 @@ namespace lfs::vis {
         if (!scheduler_) {
             return;
         }
+        // Success flows through the upload engine; only failures come back
+        // here. Releasing the reservation lets the chunk re-request later.
         for (auto& result : scheduler_->drainCompleted()) {
-            PendingUpload upload{
-                .page = result.page,
-                .chunk = result.chunk,
-                .generation = result.generation,
-                .decoded_chunk = std::nullopt,
-                .error = {},
-            };
-            if (result.decoded) {
-                upload.decoded_chunk = std::move(*result.decoded);
-            } else {
-                upload.error = result.decoded.error();
-                if (result.page < pages_.size() &&
-                    pages_[result.page].loading_chunk == result.chunk) {
-                    pages_[result.page].loading_chunk = kInvalidPage;
-                }
+            LOG_WARN("LOD chunk {} stream failed: {}", result.chunk, result.error);
+            if (result.page < pages_.size() &&
+                pages_[result.page].loading_chunk == result.chunk) {
+                pages_[result.page].loading_chunk = kInvalidPage;
             }
-            pending_uploads_.push_back(std::move(upload));
         }
     }
 

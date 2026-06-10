@@ -10,8 +10,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
-#include <optional>
 #include <span>
 #include <vector>
 
@@ -47,9 +47,17 @@ namespace lfs::vis {
             std::uint32_t page = kInvalidPage;
             std::uint32_t chunk = kInvalidPage;
             std::uint64_t generation = 0;
-            std::optional<lfs::io::RadDecodedChunk> decoded_chunk;
             std::string error;
         };
+
+        // Installed by the renderer: called on decode workers with a chunk's
+        // raw file bytes; decodes into upload-engine staging and submits the
+        // async copies. Returns an error string (empty = accepted); failures
+        // release the page reservation and the chunk re-requests later.
+        using PageSink = std::function<std::string(std::uint32_t chunk,
+                                                   std::uint32_t page,
+                                                   std::uint64_t generation,
+                                                   std::span<const std::uint8_t> chunk_bytes)>;
 
         LodPageCache();
         ~LodPageCache();
@@ -64,11 +72,17 @@ namespace lfs::vis {
         void setRadSource(const lfs::core::SplatLodTree::RadSource* source,
                           int max_sh_degree,
                           bool lod_opacity_encoded);
+        void setPageSink(PageSink sink);
 
         // Advances the frame clock used by the eviction-protection window,
         // residency fade stamps, and stale-request expiry. Call once per
         // rendered frame before submitting traversal priorities.
         void beginFrame();
+
+        // Re-requests any pinned root chunk that is not resident or in
+        // flight; runs every beginFrame so failed bootstrap streams
+        // (sink installed late, transient decode error) self-heal.
+        void ensureRootResidency();
 
         // Legacy overload: chunks in caller-priority order, per-call protection
         // only (CPU SparkLodController path).
@@ -99,6 +113,10 @@ namespace lfs::vis {
         struct PageSlot {
             std::uint32_t chunk = kInvalidPage;
             std::uint32_t loading_chunk = kInvalidPage;
+            // Latest traversal interest (float bits of pixel scale); decays
+            // with idle frames in effectivePriority for eviction admission.
+            std::uint32_t last_priority = 0;
+            std::uint64_t last_touch_frame = 0;
             std::uint64_t last_used = 0;
             std::uint64_t protected_until_frame = 0;
             bool pinned = false;
@@ -127,17 +145,20 @@ namespace lfs::vis {
         void invalidateResidentPage(std::size_t page);
         void collectFinishedDecodes();
         [[nodiscard]] bool decodeInFlight(std::uint32_t chunk) const;
-        void stampProtection(std::uint32_t chunk);
+        void stampProtection(std::uint32_t chunk, std::uint32_t priority = 0);
+        [[nodiscard]] std::uint32_t effectivePriority(const PageSlot& slot) const;
         [[nodiscard]] std::size_t requestBudgetPages() const;
 
         std::vector<PageSlot> pages_;
         std::vector<PendingUpload> pending_uploads_;
+        std::shared_ptr<const PageSink> page_sink_;
         std::unique_ptr<DecodeScheduler> scheduler_;
         RadSourceSnapshot rad_source_;
         Snapshot snapshot_;
         std::uint64_t clock_ = 0;
         std::uint64_t frame_ = 0;
         std::uint64_t protect_window_frames_ = kDefaultProtectWindowFrames;
+        std::size_t root_chunk_count_ = 0;
         std::size_t page_payload_bytes_ = 0;
         std::size_t deferred_requests_ = 0;
     };

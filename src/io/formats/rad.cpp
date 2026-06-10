@@ -3111,7 +3111,9 @@ namespace lfs::io {
         // --------------------------------------------------------------------
 
         constexpr std::uint32_t RAD_META_MAGIC = 0x4D52464Cu; // 'LFRM'
-        constexpr std::uint32_t RAD_META_VERSION = 1;
+        // v2: quantized 20 B/node planes (RadMetaBoundsQ + RadMetaLinksQ with
+        // per-chunk dequant frames). v1 sidecars are invalid and rebuilt.
+        constexpr std::uint32_t RAD_META_VERSION = 2;
         constexpr std::uint32_t RAD_META_ENDIAN_SENTINEL = 0x01020304u;
         constexpr std::size_t RAD_META_HEADER_BYTES = 4096;
         constexpr std::size_t RAD_META_PLANE_ALIGN = 4096;
@@ -3137,11 +3139,7 @@ namespace lfs::io {
         static_assert(sizeof(RadMetaHeader) == 96);
         static_assert(sizeof(RadMetaHeader) <= RAD_META_HEADER_BYTES);
 
-        struct RadMetaChunkEntry {
-            std::uint64_t payload_offset = 0;
-            std::uint64_t payload_bytes = 0;
-        };
-        static_assert(sizeof(RadMetaChunkEntry) == 16);
+        using RadMetaChunkEntry = lfs::core::RadMetaChunkRecord;
 
         std::size_t alignPlane(const std::size_t bytes) {
             return (bytes + RAD_META_PLANE_ALIGN - 1) / RAD_META_PLANE_ALIGN * RAD_META_PLANE_ALIGN;
@@ -3586,28 +3584,25 @@ namespace lfs::io {
 
             // Out-of-core models keep tree metadata on disk via the sidecar:
             // host RAM stays O(chunks) and cached re-opens skip decoding every
-            // chunk. Failure falls back to today's in-RAM metadata path.
+            // chunk. The sidecar is required — in-RAM tree metadata does not
+            // scale to the model sizes that stream out of core.
             lfs::core::SplatLodTree::NodeMetaView meta_view;
-            const bool sidecar_enabled = [] {
-                const char* const env = std::getenv("LFS_RAD_META");
-                return env == nullptr || env[0] == '\0' || env[0] != '0';
-            }();
-            if (payload_count < N && sidecar_enabled) {
+            if (payload_count < N) {
                 auto view = open_rad_meta_sidecar(filepath);
                 if (!view) {
                     LOG_INFO("RAD metadata sidecar unavailable ({}); building", view.error());
                     if (auto built = build_rad_meta_sidecar(filepath); built) {
                         view = open_rad_meta_sidecar(filepath);
                     } else {
-                        LOG_WARN("RAD metadata sidecar build failed: {}", built.error().message);
+                        return std::unexpected(std::format(
+                            "RAD metadata sidecar build failed: {}", built.error().message));
                     }
                 }
-                if (view) {
-                    meta_view = std::move(*view);
-                } else {
-                    LOG_WARN("RAD metadata sidecar unusable ({}); keeping tree metadata in RAM",
-                             view.error());
+                if (!view) {
+                    return std::unexpected(std::format(
+                        "RAD metadata sidecar unusable: {}", view.error()));
                 }
+                meta_view = std::move(*view);
             }
 
             auto result = decode_rad_chunked(filepath, *info, payload_count,
@@ -3657,6 +3652,88 @@ namespace lfs::io {
                  result->size(), result->get_max_sh_degree(), elapsed.count());
 
         return result;
+    }
+
+    std::expected<RadChunkInfo, std::string> decode_rad_chunk_into(
+        const std::span<const std::uint8_t> data,
+        const int fallback_max_sh,
+        bool lod_opacity_encoded,
+        const std::size_t dst_capacity,
+        const RadChunkDsts& dsts) {
+        auto parsed = parse_rad_chunk_header(data.data(), data.size());
+        if (!parsed) {
+            return std::unexpected(parsed.error());
+        }
+        const RadChunkMeta& chunk = parsed->meta;
+        if (chunk.splat_encoding.has_value() && chunk.splat_encoding->is_object()) {
+            const auto it = chunk.splat_encoding->find("lodOpacity");
+            if (it != chunk.splat_encoding->end() && it->is_boolean()) {
+                lod_opacity_encoded = it->get<bool>();
+            }
+        }
+        const int max_sh = std::clamp(chunk.max_sh > 0 ? chunk.max_sh : fallback_max_sh, 0, 3);
+        const int sh_coeffs = max_sh > 0 ? SH_COEFFS_FOR_DEGREE[max_sh] : 0;
+        const std::size_t count = static_cast<std::size_t>(chunk.count);
+        if (count > dst_capacity) {
+            return std::unexpected(std::format(
+                "RAD chunk holds {} splats, destination capacity is {}", count, dst_capacity));
+        }
+
+        float* shN = nullptr;
+        if (sh_coeffs > 0 && dsts.shN_canonical != nullptr) {
+            dsts.shN_canonical->assign(count * static_cast<std::size_t>(sh_coeffs) * 3u, 0.0f);
+            shN = dsts.shN_canonical->data();
+        }
+        if (auto err = decode_chunk_properties(data.data(),
+                                               chunk,
+                                               0,
+                                               parsed->payload_start,
+                                               parsed->has_payload_prefix,
+                                               parsed->chunk_end,
+                                               sh_coeffs,
+                                               dsts.means,
+                                               dsts.opacity_raw,
+                                               dsts.sh0_raw,
+                                               dsts.scaling_raw,
+                                               dsts.rotation_raw,
+                                               shN,
+                                               nullptr,
+                                               nullptr);
+            err.has_value()) {
+            return std::unexpected(std::move(*err));
+        }
+
+        // Same post-decode transforms as decode_rad_chunk_buffer, in place.
+        if (dsts.sh0_raw != nullptr) {
+            for (std::size_t i = 0; i < count * 3u; ++i) {
+                dsts.sh0_raw[i] = (dsts.sh0_raw[i] - 0.5f) / SH_C0;
+            }
+        }
+        if (dsts.opacity_raw != nullptr) {
+            if (!lod_opacity_encoded) {
+                for (std::size_t i = 0; i < count; ++i) {
+                    const float a = std::clamp(dsts.opacity_raw[i], 1.0e-6f, 1.0f - 1.0e-6f);
+                    dsts.opacity_raw[i] = std::log(a / (1.0f - a));
+                }
+            } else {
+                for (std::size_t i = 0; i < count; ++i) {
+                    dsts.opacity_raw[i] = std::max(dsts.opacity_raw[i], 0.0f);
+                }
+            }
+        }
+        if (dsts.scaling_raw != nullptr) {
+            for (std::size_t i = 0; i < count * 3u; ++i) {
+                dsts.scaling_raw[i] = std::log(std::max(dsts.scaling_raw[i], 1.0e-8f));
+            }
+        }
+
+        return RadChunkInfo{
+            .base = chunk.base,
+            .count = chunk.count,
+            .max_sh_degree = max_sh,
+            .sh_coeffs_rest = static_cast<std::uint32_t>(sh_coeffs),
+            .lod_opacity_encoded = lod_opacity_encoded,
+        };
     }
 
     std::expected<RadDecodedChunk, std::string> load_rad_chunk(
@@ -4011,7 +4088,7 @@ namespace lfs::io {
     }
 
     std::expected<std::uint64_t, std::string> derive_rad_meta_parents_levels(
-        const std::span<lfs::core::NodeLinksRecord> links) {
+        const std::span<lfs::core::RadMetaLinksQ> links) {
         const std::uint64_t n = links.size();
         if (n == 0) {
             return std::unexpected("empty links plane");
@@ -4025,7 +4102,7 @@ namespace lfs::io {
             rec.parent = parent[i];
             rec.packed = (rec.packed & 0xff00ffffu) |
                          ((static_cast<std::uint32_t>(level[i]) & 0xffu) << 16u);
-            const std::uint32_t cc = rec.childCount();
+            const std::uint32_t cc = rec.packed & 0xffffu;
             if (cc == 0) {
                 ++leaf_count;
                 continue;
@@ -4095,23 +4172,55 @@ namespace lfs::io {
             return std::unexpected("sidecar node count disagrees with RAD metadata");
         }
 
-        const std::size_t links_end =
-            header.links_offset + header.node_count * sizeof(lfs::core::NodeLinksRecord);
         const std::size_t bounds_end =
-            header.bounds_offset + header.node_count * sizeof(lfs::core::NodeBoundsRecord);
-        if (bounds_end > file->size() || links_end > file->size()) {
+            header.bounds_offset + header.node_count * sizeof(lfs::core::RadMetaBoundsQ);
+        const std::size_t links_end =
+            header.links_offset + header.node_count * sizeof(lfs::core::RadMetaLinksQ);
+        const std::size_t chunks_end =
+            header.chunk_table_offset + header.chunk_count * sizeof(lfs::core::RadMetaChunkRecord);
+        if (bounds_end > file->size() || links_end > file->size() || chunks_end > file->size()) {
             return std::unexpected("sidecar planes exceed file size");
         }
 
         lfs::core::SplatLodTree::NodeMetaView view;
-        view.bounds = reinterpret_cast<const lfs::core::NodeBoundsRecord*>(
+        view.bounds = reinterpret_cast<const lfs::core::RadMetaBoundsQ*>(
             file->data() + header.bounds_offset);
-        view.links = reinterpret_cast<const lfs::core::NodeLinksRecord*>(
+        view.links = reinterpret_cast<const lfs::core::RadMetaLinksQ*>(
             file->data() + header.links_offset);
+        view.chunks = reinterpret_cast<const lfs::core::RadMetaChunkRecord*>(
+            file->data() + header.chunk_table_offset);
         view.node_count = header.node_count;
+        view.chunk_count = header.chunk_count;
         view.leaf_count = header.leaf_count;
         view.file = std::move(file);
         return view;
+    }
+
+    void expand_rad_meta_page(const lfs::core::SplatLodTree::NodeMetaView& view,
+                              const std::uint32_t chunk,
+                              const std::size_t node_count,
+                              lfs::core::NodeBoundsRecord* const out_bounds,
+                              lfs::core::NodeLinksRecord* const out_links) {
+        const std::size_t logical_start =
+            static_cast<std::size_t>(chunk) * lfs::core::SplatLodTree::kChunkSplats;
+        const auto& frame = view.chunks[chunk];
+        for (std::size_t i = 0; i < node_count; ++i) {
+            const auto& q = view.bounds[logical_start + i];
+            const glm::vec3 center = frame.dequantCenter(q);
+            out_bounds[i] = {
+                .x = center.x,
+                .y = center.y,
+                .z = center.z,
+                .size = frame.dequantSize(q),
+            };
+            const auto& l = view.links[logical_start + i];
+            out_links[i] = {
+                .child_start = l.child_start,
+                .packed = l.packed,
+                .parent = l.parent,
+                .logical = static_cast<std::uint32_t>(logical_start + i),
+            };
+        }
     }
 
     Result<void> build_rad_meta_sidecar(
@@ -4163,9 +4272,9 @@ namespace lfs::io {
         header.source_header_hash = stamp->header_hash;
         header.bounds_offset = RAD_META_HEADER_BYTES;
         header.links_offset =
-            header.bounds_offset + alignPlane(n * sizeof(lfs::core::NodeBoundsRecord));
+            header.bounds_offset + alignPlane(n * sizeof(lfs::core::RadMetaBoundsQ));
         header.chunk_table_offset =
-            header.links_offset + alignPlane(n * sizeof(lfs::core::NodeLinksRecord));
+            header.links_offset + alignPlane(n * sizeof(lfs::core::RadMetaLinksQ));
         header.lod_opacity_encoded = lod_opacity_encoded ? 1 : 0;
         header.complete = 0;
         const std::uint64_t total_bytes =
@@ -4247,10 +4356,11 @@ namespace lfs::io {
             std::vector<float> means;
             std::vector<float> scales;
             std::vector<float> alpha;
+            std::vector<float> sizes;
             std::vector<std::uint16_t> child_count;
             std::vector<std::uint32_t> child_start;
-            std::vector<lfs::core::NodeBoundsRecord> bounds;
-            std::vector<lfs::core::NodeLinksRecord> links;
+            std::vector<lfs::core::RadMetaBoundsQ> bounds;
+            std::vector<lfs::core::RadMetaLinksQ> links;
         };
         tbb::enumerable_thread_specific<BuildScratch> scratch_tls;
 
@@ -4320,8 +4430,13 @@ namespace lfs::io {
                         return;
                     }
 
-                    scratch.bounds.resize(count);
-                    scratch.links.resize(count);
+                    // Pass 1: float centers/sizes + the chunk's quantization frame.
+                    constexpr float kSizeFloor = 1e-20f;
+                    scratch.sizes.resize(count);
+                    glm::vec3 bbox_min{std::numeric_limits<float>::max()};
+                    glm::vec3 bbox_max{std::numeric_limits<float>::lowest()};
+                    float log_min = std::numeric_limits<float>::max();
+                    float log_max = std::numeric_limits<float>::lowest();
                     for (std::size_t i = 0; i < count; ++i) {
                         const float max_scale = std::max({scratch.scales[i * 3 + 0],
                                                           scratch.scales[i * 3 + 1],
@@ -4335,11 +4450,35 @@ namespace lfs::io {
                                 expansion = 1.0f + 0.7f * (spark_lod_opacity - 1.0f);
                             }
                         }
+                        const float size = std::max(2.0f * expansion * max_scale, kSizeFloor);
+                        scratch.sizes[i] = size;
+                        const glm::vec3 center{scratch.means[i * 3 + 0],
+                                               scratch.means[i * 3 + 1],
+                                               scratch.means[i * 3 + 2]};
+                        bbox_min = glm::min(bbox_min, center);
+                        bbox_max = glm::max(bbox_max, center);
+                        log_min = std::min(log_min, std::log(size));
+                        log_max = std::max(log_max, std::log(size));
+                    }
+                    const glm::vec3 extent = bbox_max - bbox_min;
+                    const float log_range = log_max - log_min;
+
+                    // Pass 2: quantize against the frame.
+                    const auto quant = [](const float v, const float lo, const float range) {
+                        if (!(range > 0.0f)) {
+                            return std::uint16_t{0};
+                        }
+                        const float t = std::clamp((v - lo) / range, 0.0f, 1.0f);
+                        return static_cast<std::uint16_t>(std::lround(t * 65535.0f));
+                    };
+                    scratch.bounds.resize(count);
+                    scratch.links.resize(count);
+                    for (std::size_t i = 0; i < count; ++i) {
                         scratch.bounds[i] = {
-                            .x = scratch.means[i * 3 + 0],
-                            .y = scratch.means[i * 3 + 1],
-                            .z = scratch.means[i * 3 + 2],
-                            .size = 2.0f * expansion * max_scale,
+                            .qx = quant(scratch.means[i * 3 + 0], bbox_min.x, extent.x),
+                            .qy = quant(scratch.means[i * 3 + 1], bbox_min.y, extent.y),
+                            .qz = quant(scratch.means[i * 3 + 2], bbox_min.z, extent.z),
+                            .qsize = quant(std::log(scratch.sizes[i]), log_min, log_range),
                         };
 
                         const std::uint32_t cc = scratch.child_count[i];
@@ -4358,23 +4497,22 @@ namespace lfs::io {
                             .child_start = scratch.child_start[i],
                             .packed = (cc & 0xffffu) | ((flags & 0xffu) << 24u),
                             .parent = lfs::core::SplatLodTree::kInvalidPage,
-                            .logical = logical,
                         };
                     }
 
                     scratch.out.clear();
                     scratch.out.seekp(static_cast<std::streamoff>(
                                           header.bounds_offset +
-                                          base * sizeof(lfs::core::NodeBoundsRecord)),
+                                          base * sizeof(lfs::core::RadMetaBoundsQ)),
                                       std::ios::beg);
                     scratch.out.write(reinterpret_cast<const char*>(scratch.bounds.data()),
-                                      static_cast<std::streamsize>(count * sizeof(lfs::core::NodeBoundsRecord)));
+                                      static_cast<std::streamsize>(count * sizeof(lfs::core::RadMetaBoundsQ)));
                     scratch.out.seekp(static_cast<std::streamoff>(
                                           header.links_offset +
-                                          base * sizeof(lfs::core::NodeLinksRecord)),
+                                          base * sizeof(lfs::core::RadMetaLinksQ)),
                                       std::ios::beg);
                     scratch.out.write(reinterpret_cast<const char*>(scratch.links.data()),
-                                      static_cast<std::streamsize>(count * sizeof(lfs::core::NodeLinksRecord)));
+                                      static_cast<std::streamsize>(count * sizeof(lfs::core::RadMetaLinksQ)));
                     if (!scratch.out.good()) {
                         record_error(std::format("Failed to write sidecar planes: {}", io_error_detail()));
                         return;
@@ -4383,6 +4521,10 @@ namespace lfs::io {
                     chunk_table[ci] = {
                         .payload_offset = file_offset + parsed->payload_start,
                         .payload_bytes = chunk.payload_bytes,
+                        .bbox_min = {bbox_min.x, bbox_min.y, bbox_min.z},
+                        .bbox_extent = {extent.x, extent.y, extent.z},
+                        .log_size_min = log_min,
+                        .log_size_range = log_range,
                     };
 
                     const std::size_t done = chunks_done.fetch_add(1) + 1;
@@ -4432,16 +4574,16 @@ namespace lfs::io {
             std::uint64_t leaf_count = 0;
             std::uint64_t assigned = 0;
             constexpr std::size_t kBlockRecords = std::size_t{4} << 20;
-            std::vector<lfs::core::NodeLinksRecord> block(std::min<std::size_t>(kBlockRecords, n));
+            std::vector<lfs::core::RadMetaLinksQ> block(std::min<std::size_t>(kBlockRecords, n));
             for (std::uint64_t first = 0; first < n; first += kBlockRecords) {
                 const std::size_t count = static_cast<std::size_t>(
                     std::min<std::uint64_t>(kBlockRecords, n - first));
                 const std::streamoff offset = static_cast<std::streamoff>(
-                    header.links_offset + first * sizeof(lfs::core::NodeLinksRecord));
+                    header.links_offset + first * sizeof(lfs::core::RadMetaLinksQ));
                 rmw.clear();
                 rmw.seekg(offset, std::ios::beg);
                 rmw.read(reinterpret_cast<char*>(block.data()),
-                         static_cast<std::streamsize>(count * sizeof(lfs::core::NodeLinksRecord)));
+                         static_cast<std::streamsize>(count * sizeof(lfs::core::RadMetaLinksQ)));
                 if (!rmw.good()) {
                     return make_error(ErrorCode::READ_FAILURE,
                                       std::format("Failed to read sidecar links block: {}", io_error_detail()),
@@ -4453,7 +4595,7 @@ namespace lfs::io {
                     rec.parent = parent[i];
                     rec.packed = (rec.packed & 0xff00ffffu) |
                                  ((static_cast<std::uint32_t>(level[i]) & 0xffu) << 16u);
-                    const std::uint32_t cc = rec.childCount();
+                    const std::uint32_t cc = rec.packed & 0xffffu;
                     if (cc == 0) {
                         ++leaf_count;
                         continue;
@@ -4476,7 +4618,7 @@ namespace lfs::io {
                 rmw.clear();
                 rmw.seekp(offset, std::ios::beg);
                 rmw.write(reinterpret_cast<const char*>(block.data()),
-                          static_cast<std::streamsize>(count * sizeof(lfs::core::NodeLinksRecord)));
+                          static_cast<std::streamsize>(count * sizeof(lfs::core::RadMetaLinksQ)));
                 if (!rmw.good()) {
                     return make_error(ErrorCode::WRITE_FAILURE,
                                       std::format("Failed to write sidecar links block: {}", io_error_detail()),

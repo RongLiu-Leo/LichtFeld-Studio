@@ -8,6 +8,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -18,22 +19,26 @@
 
 namespace {
 
+    using lfs::core::NodeBoundsRecord;
     using lfs::core::NodeLinksRecord;
+    using lfs::core::RadMetaLinksQ;
+    using lfs::core::SplatLodTree;
 
-    NodeLinksRecord makeNode(const std::uint32_t child_start, const std::uint32_t child_count) {
+    RadMetaLinksQ makeNode(const std::uint32_t child_start, const std::uint32_t child_count) {
         return {
             .child_start = child_start,
             .packed = child_count & 0xffffu,
             .parent = 0xFFFFFFFFu,
-            .logical = 0,
         };
     }
+
+    std::uint32_t levelOf(const RadMetaLinksQ& rec) { return (rec.packed >> 16u) & 0xffu; }
 
     TEST(RadMetaSidecar, DeriveParentsHandlesNonMonotoneChildStart) {
         // Level-ordered tree whose level-1 parents point at non-monotone
         // child_start ranges, as the multi-bucket converter layouts produce:
         // node 0 (root) -> [1, 3); node 1 -> [5, 7); node 2 -> [3, 5).
-        std::vector<NodeLinksRecord> links{
+        std::vector<RadMetaLinksQ> links{
             makeNode(1, 2),
             makeNode(5, 2),
             makeNode(3, 2),
@@ -53,21 +58,21 @@ namespace {
         EXPECT_EQ(links[4].parent, 2u);
         EXPECT_EQ(links[5].parent, 1u);
         EXPECT_EQ(links[6].parent, 1u);
-        EXPECT_EQ(links[0].level(), 0u);
-        EXPECT_EQ(links[1].level(), 1u);
-        EXPECT_EQ(links[2].level(), 1u);
+        EXPECT_EQ(levelOf(links[0]), 0u);
+        EXPECT_EQ(levelOf(links[1]), 1u);
+        EXPECT_EQ(levelOf(links[2]), 1u);
         for (std::size_t i = 3; i < links.size(); ++i) {
-            EXPECT_EQ(links[i].level(), 2u);
+            EXPECT_EQ(levelOf(links[i]), 2u);
         }
     }
 
     TEST(RadMetaSidecar, DeriveParentsRejectsCorruptLayouts) {
         // Child range pointing backwards.
-        std::vector<NodeLinksRecord> backwards{makeNode(0, 1), makeNode(0, 0)};
+        std::vector<RadMetaLinksQ> backwards{makeNode(0, 1), makeNode(0, 0)};
         EXPECT_FALSE(lfs::io::derive_rad_meta_parents_levels(std::span(backwards)).has_value());
 
         // Orphan node (no parent assigns it).
-        std::vector<NodeLinksRecord> orphan{makeNode(1, 1), makeNode(0, 0), makeNode(0, 0)};
+        std::vector<RadMetaLinksQ> orphan{makeNode(1, 1), makeNode(0, 0), makeNode(0, 0)};
         EXPECT_FALSE(lfs::io::derive_rad_meta_parents_levels(std::span(orphan)).has_value());
     }
 
@@ -83,9 +88,11 @@ namespace {
     void writeSyntheticPly(const std::filesystem::path& path, const std::size_t count) {
         std::mt19937 rng(99);
         std::uniform_real_distribution<float> pos(-50.0f, 50.0f);
+        std::uniform_real_distribution<float> log_scale(-6.0f, -2.0f);
         std::vector<SyntheticSplat> splats(count);
         for (auto& s : splats) {
-            s = {.x = pos(rng), .y = pos(rng), .z = pos(rng), .dc0 = 0.1f, .dc1 = 0.2f, .dc2 = 0.3f, .opacity = 1.0f, .s0 = -4.0f, .s1 = -4.0f, .s2 = -4.0f, .r0 = 1.0f, .r1 = 0.0f, .r2 = 0.0f, .r3 = 0.0f};
+            const float ls = log_scale(rng);
+            s = {.x = pos(rng), .y = pos(rng), .z = pos(rng), .dc0 = 0.1f, .dc1 = 0.2f, .dc2 = 0.3f, .opacity = 1.0f, .s0 = ls, .s1 = ls, .s2 = ls, .r0 = 1.0f, .r1 = 0.0f, .r2 = 0.0f, .r3 = 0.0f};
         }
         std::ofstream out(path, std::ios::binary);
         ASSERT_TRUE(out.good());
@@ -116,10 +123,16 @@ namespace {
         return rad_path;
     }
 
-    TEST(RadMetaSidecar, RoundtripAndInvalidation) {
+    TEST(RadMetaSidecar, RoundtripQuantizationAndInvalidation) {
         const auto temp_dir = std::filesystem::temp_directory_path() / "rad_meta_sidecar";
         std::filesystem::remove_all(temp_dir);
         const auto rad_path = makeTestRad(temp_dir);
+
+        // Full in-RAM load is the ground truth the quantized view must match.
+        auto full = lfs::io::load_rad(rad_path);
+        ASSERT_TRUE(full.has_value()) << full.error();
+        ASSERT_TRUE(full->lod_tree && full->lod_tree->nodes_in_memory());
+        const auto& tree = *full->lod_tree;
 
         ASSERT_TRUE(lfs::io::build_rad_meta_sidecar(rad_path).has_value());
         const auto meta_path = lfs::io::rad_meta_sidecar_path(rad_path);
@@ -129,8 +142,48 @@ namespace {
         ASSERT_TRUE(view.has_value()) << view.error();
         EXPECT_GT(view->node_count, 200'000u);
         EXPECT_EQ(view->leaf_count, 200'000u);
+        EXPECT_EQ(view->node_count, tree.total_nodes());
         EXPECT_EQ(view->links[0].parent, 0xFFFFFFFFu);
-        EXPECT_EQ(view->links[0].logical, 0u);
+
+        // Links bit-exact; bounds within the per-chunk quantization tolerance.
+        for (std::size_t i = 0; i < view->node_count; ++i) {
+            ASSERT_EQ(view->links[i].child_start, tree.child_start[i]) << "node " << i;
+            ASSERT_EQ(view->links[i].packed & 0xffffu, tree.child_count[i]) << "node " << i;
+            const auto& frame = view->chunkOf(i);
+            const glm::vec3 center = frame.dequantCenter(view->bounds[i]);
+            const glm::vec3 truth = tree.centers[i];
+            for (int d = 0; d < 3; ++d) {
+                const float tolerance = std::max(2.0f * frame.bbox_extent[d] / 65535.0f, 1e-6f);
+                ASSERT_NEAR(center[d], truth[d], tolerance) << "node " << i << " dim " << d;
+            }
+            const float size = frame.dequantSize(view->bounds[i]);
+            const float size_truth = tree.sizes[i];
+            const float rel_tolerance =
+                std::max(2.0f * frame.log_size_range / 65535.0f, 1e-5f);
+            ASSERT_NEAR(std::log(std::max(size, 1e-20f)),
+                        std::log(std::max(size_truth, 1e-20f)),
+                        rel_tolerance)
+                << "node " << i;
+        }
+
+        // Page expansion produces the exact GPU records, logical included.
+        constexpr std::size_t kChunk = SplatLodTree::kChunkSplats;
+        const std::size_t expand_chunk = view->chunk_count > 1 ? 1 : 0;
+        const std::size_t logical_start = expand_chunk * kChunk;
+        const std::size_t run = std::min(kChunk, view->node_count - logical_start);
+        std::vector<NodeBoundsRecord> bounds(run);
+        std::vector<NodeLinksRecord> links(run);
+        lfs::io::expand_rad_meta_page(*view, static_cast<std::uint32_t>(expand_chunk), run,
+                                      bounds.data(), links.data());
+        for (std::size_t i = 0; i < run; ++i) {
+            EXPECT_EQ(links[i].logical, logical_start + i);
+            EXPECT_EQ(links[i].child_start, tree.child_start[logical_start + i]);
+            EXPECT_EQ(links[i].childCount(), tree.child_count[logical_start + i]);
+            // Cross-TU FP contraction may differ by a few ULPs.
+            const float expected =
+                view->chunkOf(logical_start + i).dequantSize(view->bounds[logical_start + i]);
+            EXPECT_NEAR(bounds[i].size, expected, std::abs(expected) * 1e-5f);
+        }
 
         // Touching the RAD file invalidates the sidecar (mtime/hash stamp).
         {
@@ -152,6 +205,16 @@ namespace {
         }
         auto incomplete = lfs::io::open_rad_meta_sidecar(rad_path);
         EXPECT_FALSE(incomplete.has_value());
+
+        // Wrong version (e.g. a leftover v1 file) is rejected too.
+        {
+            std::fstream corrupt(meta_path, std::ios::binary | std::ios::in | std::ios::out);
+            const std::uint32_t old_version = 1;
+            corrupt.seekp(4, std::ios::beg); // RadMetaHeader::version offset
+            corrupt.write(reinterpret_cast<const char*>(&old_version), sizeof(old_version));
+        }
+        auto wrong_version = lfs::io::open_rad_meta_sidecar(rad_path);
+        EXPECT_FALSE(wrong_version.has_value());
 
         std::filesystem::remove_all(temp_dir);
     }

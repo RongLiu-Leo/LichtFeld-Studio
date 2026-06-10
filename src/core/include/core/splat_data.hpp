@@ -10,6 +10,7 @@
 #include "core/tensor.hpp"
 
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
@@ -30,8 +31,7 @@ namespace lfs::core {
         struct TrainingParameters;
     }
 
-    // Per-node tree metadata in the exact layouts the GPU traversal consumes;
-    // also the on-disk record layouts of the .rad.meta sidecar cache.
+    // Per-node tree metadata in the exact layouts the GPU traversal consumes.
     struct NodeBoundsRecord {
         float x = 0.0f, y = 0.0f, z = 0.0f, size = 0.0f;
     };
@@ -47,6 +47,44 @@ namespace lfs::core {
     };
     static_assert(sizeof(NodeBoundsRecord) == 16);
     static_assert(sizeof(NodeLinksRecord) == 16);
+
+    // On-disk .rad.meta sidecar records (20 B/node): bounds quantized against
+    // a per-chunk frame so 1B-leaf trees fit a ~34 GB cache. Centers are u16
+    // against the chunk AABB (error ≤ extent/65535); sizes are u16 over the
+    // chunk's log-size range (relative error ≤ range/65535).
+    struct RadMetaBoundsQ {
+        uint16_t qx = 0, qy = 0, qz = 0, qsize = 0;
+    };
+    struct RadMetaLinksQ {
+        uint32_t child_start = 0;
+        // Same encoding as NodeLinksRecord::packed; logical is derived as
+        // chunk * kChunkSplats + offset at expansion time.
+        uint32_t packed = 0;
+        uint32_t parent = 0xFFFFFFFFu;
+    };
+    // Per-chunk payload range + dequantization frame (sidecar chunk table).
+    struct RadMetaChunkRecord {
+        uint64_t payload_offset = 0;
+        uint64_t payload_bytes = 0;
+        float bbox_min[3] = {0.0f, 0.0f, 0.0f};
+        float bbox_extent[3] = {0.0f, 0.0f, 0.0f};
+        float log_size_min = 0.0f;
+        float log_size_range = 0.0f;
+
+        [[nodiscard]] glm::vec3 dequantCenter(const RadMetaBoundsQ& q) const {
+            constexpr float kInv = 1.0f / 65535.0f;
+            return {bbox_min[0] + static_cast<float>(q.qx) * kInv * bbox_extent[0],
+                    bbox_min[1] + static_cast<float>(q.qy) * kInv * bbox_extent[1],
+                    bbox_min[2] + static_cast<float>(q.qz) * kInv * bbox_extent[2]};
+        }
+        [[nodiscard]] float dequantSize(const RadMetaBoundsQ& q) const {
+            constexpr float kInv = 1.0f / 65535.0f;
+            return std::exp(log_size_min + static_cast<float>(q.qsize) * kInv * log_size_range);
+        }
+    };
+    static_assert(sizeof(RadMetaBoundsQ) == 8);
+    static_assert(sizeof(RadMetaLinksQ) == 12);
+    static_assert(sizeof(RadMetaChunkRecord) == 48);
 
     struct SplatLodTree {
         static constexpr std::size_t kChunkSplats = 65'536;
@@ -75,13 +113,19 @@ namespace lfs::core {
         // to billions of nodes). Copies share the mapping.
         struct NodeMetaView {
             std::shared_ptr<MappedFile> file;
-            const NodeBoundsRecord* bounds = nullptr;
-            const NodeLinksRecord* links = nullptr;
+            const RadMetaBoundsQ* bounds = nullptr;
+            const RadMetaLinksQ* links = nullptr;
+            const RadMetaChunkRecord* chunks = nullptr;
             std::size_t node_count = 0;
+            std::size_t chunk_count = 0;
             std::size_t leaf_count = 0;
 
             [[nodiscard]] bool valid() const {
-                return file != nullptr && bounds != nullptr && links != nullptr && node_count > 0;
+                return file != nullptr && bounds != nullptr && links != nullptr &&
+                       chunks != nullptr && node_count > 0;
+            }
+            [[nodiscard]] const RadMetaChunkRecord& chunkOf(const std::size_t node) const {
+                return chunks[node / kChunkSplats];
             }
         };
 
@@ -109,22 +153,21 @@ namespace lfs::core {
             return meta_view.valid() ? meta_view.links[i].child_start : child_start[i];
         }
         [[nodiscard]] uint16_t child_count_at(const std::size_t i) const {
-            return meta_view.valid() ? static_cast<uint16_t>(meta_view.links[i].childCount())
+            return meta_view.valid() ? static_cast<uint16_t>(meta_view.links[i].packed & 0xffffu)
                                      : child_count[i];
         }
         [[nodiscard]] uint8_t level_at(const std::size_t i) const {
-            return meta_view.valid() ? static_cast<uint8_t>(meta_view.links[i].level())
-                                     : (i < lod_level.size() ? lod_level[i] : 0);
+            return meta_view.valid()
+                       ? static_cast<uint8_t>((meta_view.links[i].packed >> 16u) & 0xffu)
+                       : (i < lod_level.size() ? lod_level[i] : 0);
         }
         [[nodiscard]] glm::vec3 center_at(const std::size_t i) const {
-            if (meta_view.valid()) {
-                const auto& b = meta_view.bounds[i];
-                return {b.x, b.y, b.z};
-            }
-            return centers[i];
+            return meta_view.valid() ? meta_view.chunkOf(i).dequantCenter(meta_view.bounds[i])
+                                     : centers[i];
         }
         [[nodiscard]] float size_at(const std::size_t i) const {
-            return meta_view.valid() ? meta_view.bounds[i].size : sizes[i];
+            return meta_view.valid() ? meta_view.chunkOf(i).dequantSize(meta_view.bounds[i])
+                                     : sizes[i];
         }
     };
 

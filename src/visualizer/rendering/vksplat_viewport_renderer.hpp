@@ -7,6 +7,7 @@
 #include "core/exportable_storage.hpp"
 #include "core/splat_data.hpp"
 #include "lod_page_cache.hpp"
+#include "lod_upload_engine.hpp"
 #include "rendering/cuda_vulkan_interop.hpp"
 #include "rendering/rasterizer/vulkan/src/gs_renderer.h"
 #include "rendering/rendering.hpp"
@@ -213,6 +214,10 @@ namespace lfs::vis {
             const lfs::core::SplatData& splat_data,
             std::span<const LodPageCache::PendingUpload> uploads,
             std::size_t ring_slot);
+        void configureLodUploadEngine(const lfs::core::SplatData& splat_data);
+        void discardLodEngineResults(std::vector<LodPageCache::PendingUpload>&& results,
+                                     std::string_view reason);
+        void logLodUploadProgress(std::size_t published_pages);
         struct OverlayBindingViews {
             _VulkanBuffer selection_mask{};
             _VulkanBuffer preview_mask{};
@@ -441,6 +446,23 @@ namespace lfs::vis {
             bool valid = false;
         };
         GpuLodTreeStorage gpu_lod_tree_;
+        // CUDA-importable backing for node_bounds/node_links so the upload
+        // engine writes expanded tree metadata with page payloads; the
+        // Buffer shells above hold region views into it.
+        struct LodTreeMetaStorage {
+            VulkanContext::ExternalBuffer buffer{};
+            lfs::rendering::CudaVulkanBufferInterop interop{};
+            std::size_t bounds_offset = 0;
+            std::size_t links_offset = 0;
+            std::size_t capacity_nodes = 0;
+        };
+        LodTreeMetaStorage lod_tree_meta_;
+        // Pages published through the synchronous tensor path this frame
+        // (pinned roots / in-core); for view-backed trees only these need
+        // render-thread metadata writes — engine pages carry their own.
+        std::vector<std::uint32_t> lod_sync_meta_pages_;
+        LodUploadEngine::DeviceLayout lod_engine_layout_{};
+        const lfs::core::SplatData* lod_sink_model_ = nullptr;
         struct LodPageInputStorage {
             VulkanContext::ExternalBuffer buffer{};
             lfs::rendering::CudaVulkanBufferInterop interop{};
@@ -522,6 +544,12 @@ namespace lfs::vis {
         std::array<UploadTimeline, kInputRingSize> upload_timelines_{};
         std::array<UploadTimeline, kInputRingSize> overlay_upload_timelines_{};
         UploadTimeline selection_query_timeline_{};
+        // Async RAD page streaming: decoded pages are packed and copied on the
+        // engine's own thread/stream; render frames only publish completions.
+        UploadTimeline lod_engine_timeline_{};
+        LodUploadEngine lod_upload_engine_;
+        std::uint64_t lod_upload_log_batches_ = 0;
+        bool lod_upload_log_converged_ = false;
     };
 
 } // namespace lfs::vis

@@ -35,6 +35,32 @@ namespace lfs::io {
         std::vector<std::uint32_t> child_start;
     };
 
+    // Caller-provided destinations for a zero-copy chunk decode: properties
+    // land directly in these buffers (each sized for the caller's capacity)
+    // with the same post-decode transforms as load_rad_chunk. shN decodes via
+    // the canonical scratch (resized by the decoder); null members are skipped.
+    struct RadChunkDsts {
+        float* means = nullptr;        // [capacity*3]
+        float* opacity_raw = nullptr;  // [capacity]
+        float* sh0_raw = nullptr;      // [capacity*3]
+        float* scaling_raw = nullptr;  // [capacity*3]
+        float* rotation_raw = nullptr; // [capacity*4]
+        std::vector<float>* shN_canonical = nullptr;
+    };
+    struct RadChunkInfo {
+        std::uint64_t base = 0;
+        std::uint64_t count = 0;
+        int max_sh_degree = 0;
+        std::uint32_t sh_coeffs_rest = 0;
+        bool lod_opacity_encoded = false;
+    };
+    [[nodiscard]] std::expected<RadChunkInfo, std::string> decode_rad_chunk_into(
+        std::span<const std::uint8_t> data,
+        int fallback_max_sh,
+        bool lod_opacity_encoded,
+        std::size_t dst_capacity,
+        const RadChunkDsts& dsts);
+
     // Load RAD (Random Access Dynamic) format - chunked hierarchical Gaussian splat format
     std::expected<SplatData, std::string> load_rad(const std::filesystem::path& filepath);
     std::expected<RadDecodedChunk, std::string> load_rad_chunk(
@@ -58,9 +84,10 @@ namespace lfs::io {
 
     // ------------------------------------------------------------------------
     // Node-metadata sidecar (<file>.rad.meta) — a derived cache, NOT part of
-    // the RAD format. Holds per-node bounds/links in the exact GPU layouts so
-    // out-of-core opens keep tree metadata on disk (mmap) instead of in RAM,
-    // and cached re-opens skip decoding every chunk.
+    // the RAD format. Holds per-node bounds/links quantized to 20 B/node
+    // (per-chunk dequant frames) so out-of-core opens keep tree metadata on
+    // disk (mmap) instead of in RAM, and cached re-opens skip decoding every
+    // chunk. 1B-leaf trees fit ~34 GB.
     // ------------------------------------------------------------------------
     [[nodiscard]] std::filesystem::path rad_meta_sidecar_path(const std::filesystem::path& rad_path);
     // Validates magic/version/completeness and that the sidecar matches the
@@ -74,7 +101,15 @@ namespace lfs::io {
     // children-contiguous links plane. child_start may be non-monotone across
     // parents within a level (multi-bucket converter layouts).
     [[nodiscard]] std::expected<std::uint64_t, std::string> derive_rad_meta_parents_levels(
-        std::span<lfs::core::NodeLinksRecord> links);
+        std::span<lfs::core::RadMetaLinksQ> links);
+    // Dequantizes one chunk's sidecar records into the exact GPU node
+    // bounds/links layouts; the single source of v2-to-GPU expansion shared by
+    // the upload engine, the renderer bootstrap path, and tests.
+    void expand_rad_meta_page(const lfs::core::SplatLodTree::NodeMetaView& view,
+                              std::uint32_t chunk,
+                              std::size_t node_count,
+                              lfs::core::NodeBoundsRecord* out_bounds,
+                              lfs::core::NodeLinksRecord* out_links);
 
     // One chunk of pack-domain splat arrays for streaming RAD export.
     // All values use the on-disk RAD domains: display alpha (lodOpacity),

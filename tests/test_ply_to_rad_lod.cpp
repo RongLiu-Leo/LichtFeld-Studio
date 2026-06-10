@@ -288,9 +288,21 @@ TEST(PlyToRadLod, OutOfCoreLoadKeepsTreeAndStreamsChunks) {
     EXPECT_FALSE(partial->lod_tree->nodes_in_memory());
     EXPECT_TRUE(std::filesystem::exists(lfs::io::rad_meta_sidecar_path(rad_path)));
 
+    // Links are bit-exact; bounds carry the sidecar's per-chunk u16
+    // quantization, so they compare within the frame's step size.
     for (std::size_t i = 0; i < total_nodes; ++i) {
-        EXPECT_EQ(partial->lod_tree->center_at(i).x, full->lod_tree->center_at(i).x);
-        EXPECT_EQ(partial->lod_tree->size_at(i), full->lod_tree->size_at(i));
+        const auto& frame = partial->lod_tree->meta_view.chunkOf(i);
+        const float center_tol = std::max(
+            {2.0f * frame.bbox_extent[0] / 65535.0f,
+             2.0f * frame.bbox_extent[1] / 65535.0f,
+             2.0f * frame.bbox_extent[2] / 65535.0f,
+             1e-6f});
+        EXPECT_NEAR(partial->lod_tree->center_at(i).x, full->lod_tree->center_at(i).x, center_tol);
+        const float size_tol =
+            full->lod_tree->size_at(i) *
+                std::max(2.0f * frame.log_size_range / 65535.0f, 1e-6f) +
+            1e-12f;
+        EXPECT_NEAR(partial->lod_tree->size_at(i), full->lod_tree->size_at(i), size_tol);
         EXPECT_EQ(partial->lod_tree->child_start_at(i), full->lod_tree->child_start_at(i));
         EXPECT_EQ(partial->lod_tree->child_count_at(i), full->lod_tree->child_count_at(i));
         EXPECT_EQ(partial->lod_tree->level_at(i), full->lod_tree->level_at(i));
