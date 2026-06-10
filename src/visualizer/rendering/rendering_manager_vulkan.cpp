@@ -741,9 +741,20 @@ namespace lfs::vis {
         if (live_trainer) {
             live_trainer->setViewerReleaseFence(vksplat_viewport_renderer_->renderCompleteFence());
             live_trainer->beginModelRead(vksplat_viewport_renderer_->renderStream());
+            // Prompt publish: the renderer invokes this right after each
+            // submit, before its shared arena frame releases — the trainer's
+            // borrow wait must cover the in-flight batch before the trainer
+            // can reacquire the arena.
+            lfs::training::Trainer* const trainer = live_trainer;
+            vksplat_viewport_renderer_->setLiveSubmitCallback(
+                [trainer](const std::uint64_t value) { trainer->publishViewerBorrow(value); });
+        } else if (vksplat_viewport_renderer_) {
+            vksplat_viewport_renderer_->setLiveSubmitCallback({});
         }
-        // Publishes the frame's final completion value at scope exit (all
-        // return paths), while the shared render lock is still held.
+        // Belt-and-suspenders: also publish the frame's final completion value
+        // at scope exit (all return paths), while the shared render lock is
+        // still held. publishViewerBorrow is monotonic, so this can't regress
+        // the prompt publishes.
         struct ViewerBorrowPublisher {
             lfs::training::Trainer* trainer;
             VksplatViewportRenderer* renderer;

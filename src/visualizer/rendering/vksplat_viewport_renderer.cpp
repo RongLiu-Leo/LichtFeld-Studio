@@ -174,6 +174,17 @@ namespace lfs::vis {
                 }
             }
 
+            // Must be called after the frame's Vulkan submit: the arena's next
+            // tenant waits this timeline value GPU-side before reusing scratch
+            // — neither the chain event nor a device sync can see in-flight
+            // Vulkan work, which lets training kernels overwrite scratch a
+            // running batch still reads (Xid 109 device-lost class).
+            void noteVulkanRelease(cudaExternalSemaphore_t semaphore, std::uint64_t value) const {
+                if (arena_ && frame_active_ && semaphore != nullptr) {
+                    arena_->note_external_release(semaphore, value);
+                }
+            }
+
         private:
             lfs::core::RasterizerMemoryArena* arena_ = nullptr;
             std::uint64_t frame_id_ = 0;
@@ -3965,6 +3976,28 @@ namespace lfs::vis {
         return {};
     }
 
+    // Exception-path safety: the batch may or may not have submitted/signaled.
+    // Publishing an unsignaled value would hang the trainer's borrow wait, and
+    // not waiting would let the trainer reuse arena scratch a partially
+    // submitted batch still reads — so block (bounded) until the value lands
+    // or the timeout proves the submit never happened.
+    void VksplatViewportRenderer::waitCompletionValueBounded(const std::uint64_t value) noexcept {
+        if (context_ == nullptr || render_complete_timeline_ == VK_NULL_HANDLE || value == 0) {
+            return;
+        }
+        VkSemaphoreWaitInfo wait_info{};
+        wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+        wait_info.semaphoreCount = 1;
+        wait_info.pSemaphores = &render_complete_timeline_;
+        wait_info.pValues = &value;
+        constexpr std::uint64_t kTimeoutNs = 2'000'000'000ull;
+        const VkResult result = vkWaitSemaphores(context_->device(), &wait_info, kTimeoutNs);
+        if (result != VK_SUCCESS) {
+            LOG_WARN("VkSplat completion wait after failed pass returned {} (value {})",
+                     static_cast<int>(result), value);
+        }
+    }
+
     std::expected<void, std::string> VksplatViewportRenderer::waitForRingSlot(
         const std::size_t ring_slot,
         const std::string_view reason) {
@@ -5816,6 +5849,19 @@ namespace lfs::vis {
                                       static_cast<std::size_t>(std::numeric_limits<uint32_t>::max())));
         }
 
+        // This pass re-reads the resident sort buffers in shared arena scratch:
+        // hold the arena frame across the submit so a training iteration cannot
+        // reset the offset and overwrite them mid-batch.
+        std::optional<RasterizerArenaRenderGuard> overlay_arena_guard;
+        if (synchronize_input_read && shared_scratch_.block) {
+            try {
+                overlay_arena_guard.emplace();
+            } catch (const std::exception& e) {
+                return std::unexpected(std::format(
+                    "VkSplat selection overlay arena unavailable: {}", e.what()));
+            }
+        }
+
         std::expected<void, std::string> compose_status;
         const std::uint64_t completion_value = ++render_complete_value_;
         // This pass re-reads the storages bound by the previous prepareInputs;
@@ -5876,7 +5922,17 @@ namespace lfs::vis {
                 }
             }
         } catch (const std::exception& e) {
+            waitCompletionValueBounded(completion_value);
+            if (overlay_arena_guard) {
+                overlay_arena_guard->noteVulkanRelease(render_complete_cuda_.handle(), completion_value);
+            }
             return std::unexpected(std::format("VkSplat selection overlay pass failed: {}", e.what()));
+        }
+        if (overlay_arena_guard) {
+            overlay_arena_guard->noteVulkanRelease(render_complete_cuda_.handle(), completion_value);
+        }
+        if (live_submit_callback_) {
+            live_submit_callback_(completion_value);
         }
         if (!compose_status) {
             return std::unexpected(compose_status.error());
@@ -6864,7 +6920,20 @@ namespace lfs::vis {
             // On try-block exit: `batch` destructs (endCommandBatch fence wait),
             // then batch_total timer logs.
         } catch (const std::exception& e) {
+            waitCompletionValueBounded(completion_value);
+            if (shared_arena_guard) {
+                shared_arena_guard->noteVulkanRelease(render_complete_cuda_.handle(), completion_value);
+            }
             return std::unexpected(std::format("VkSplat forward pass failed: {}", e.what()));
+        }
+        // The batch (and its timeline signal) is submitted; hand the release to
+        // the arena and the trainer before the guard/locks let them reuse the
+        // scratch this batch still reads.
+        if (shared_arena_guard) {
+            shared_arena_guard->noteVulkanRelease(render_complete_cuda_.handle(), completion_value);
+        }
+        if (live_submit_callback_) {
+            live_submit_callback_(completion_value);
         }
         logVramBreakdownIfChanged("render");
         if (!compose_status) {

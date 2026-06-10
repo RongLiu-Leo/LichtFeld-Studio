@@ -1787,10 +1787,20 @@ namespace lfs::training {
         }
         viewer_release_semaphore_ = semaphore;
         viewer_borrow_waited_ = 0;
+        // A new fence is a fresh timeline starting at 0 — a borrow value from
+        // the previous timeline would make the trainer wait a value the new
+        // semaphore never reaches.
+        viewer_borrow_value_.store(0, std::memory_order_release);
     }
 
     void Trainer::publishViewerBorrow(uint64_t value) {
-        viewer_borrow_value_.store(value, std::memory_order_release);
+        // Monotonic: prompt per-submit publishes and the frame-scope publisher
+        // may interleave; never regress to an older value.
+        uint64_t current = viewer_borrow_value_.load(std::memory_order_relaxed);
+        while (current < value &&
+               !viewer_borrow_value_.compare_exchange_weak(
+                   current, value, std::memory_order_release, std::memory_order_relaxed)) {
+        }
     }
 
     void Trainer::recordParamsReady() {

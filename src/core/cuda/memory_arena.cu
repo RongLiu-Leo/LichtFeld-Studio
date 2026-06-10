@@ -154,22 +154,58 @@ namespace lfs::core {
         return begin_frame_impl(stream, from_rendering, false);
     }
 
+    void RasterizerMemoryArena::note_external_release(cudaExternalSemaphore_t semaphore, uint64_t value) {
+        std::lock_guard<std::mutex> lock(last_frame_event_mutex_);
+        external_release_semaphore_ = semaphore;
+        external_release_value_ = value;
+    }
+
     // Orders the new frame's work after the previous frame before the arena
     // offset resets and memory gets overwritten. Stream-aware frames chain via
     // the completion event (GPU-side, no host stall); legacy frames or a broken
-    // chain fall back to a device-wide sync.
+    // chain fall back to a device-wide sync. A pending Vulkan release (viewport
+    // frames) is waited explicitly — neither the chain event nor a device sync
+    // can see in-flight Vulkan work.
     bool RasterizerMemoryArena::wait_for_previous_frame(cudaStream_t stream) {
         static const bool legacy_sync = []() {
             const char* env = std::getenv("LFS_ARENA_LEGACY_SYNC");
             return env && env[0] == '1';
         }();
 
-        if (stream && !legacy_sync) {
+        cudaExternalSemaphore_t release_semaphore = nullptr;
+        uint64_t release_value = 0;
+        bool chain_ok = false;
+        {
             std::lock_guard<std::mutex> lock(last_frame_event_mutex_);
-            if (last_frame_event_valid_ &&
-                cudaStreamWaitEvent(stream, last_frame_event_, 0) == cudaSuccess) {
-                return true;
+            release_semaphore = external_release_semaphore_;
+            release_value = external_release_value_;
+            external_release_semaphore_ = nullptr;
+            external_release_value_ = 0;
+            if (stream && !legacy_sync) {
+                chain_ok = last_frame_event_valid_ &&
+                           cudaStreamWaitEvent(stream, last_frame_event_, 0) == cudaSuccess;
             }
+        }
+
+        if (release_semaphore != nullptr && release_value != 0) {
+            // Enqueue on the frame's stream (or the legacy stream for streamless
+            // frames, where the device sync below then blocks until it passes).
+            cudaExternalSemaphoreWaitParams wait_params{};
+            wait_params.params.fence.value = release_value;
+            const cudaStream_t wait_stream = (stream && !legacy_sync) ? stream : nullptr;
+            if (cudaWaitExternalSemaphoresAsync(&release_semaphore, &wait_params, 1, wait_stream) != cudaSuccess) {
+                LOG_WARN("RasterizerMemoryArena: external release wait failed (value {})", release_value);
+                chain_ok = false;
+            } else if (wait_stream != nullptr) {
+                // The Vulkan tenant device-synced all prior CUDA work at its own
+                // streamless begin, and its arena work is Vulkan-only — this
+                // wait alone re-establishes the chain GPU-side.
+                chain_ok = true;
+            }
+        }
+
+        if (chain_ok) {
+            return true;
         }
         return cudaDeviceSynchronize() == cudaSuccess;
     }

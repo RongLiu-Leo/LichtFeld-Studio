@@ -136,6 +136,15 @@ namespace lfs::vis {
         }
         [[nodiscard]] std::uint64_t renderCompleteValue() const { return render_complete_value_; }
 
+        // Invoked with the completion value immediately after each live-model
+        // submit, BEFORE the shared arena frame is released — the trainer's
+        // borrow wait must cover the in-flight Vulkan batch before the trainer
+        // can reacquire the arena (publishing at frame-scope exit is too late
+        // and lets training kernels overwrite scratch the batch still reads).
+        void setLiveSubmitCallback(std::function<void(std::uint64_t)> callback) {
+            live_submit_callback_ = std::move(callback);
+        }
+
         [[nodiscard]] bool nextOutputImagesNeedResize(
             glm::ivec2 size,
             OutputSlot output_slot = OutputSlot::Main) const;
@@ -198,6 +207,7 @@ namespace lfs::vis {
         };
 
         [[nodiscard]] std::expected<void, std::string> ensureInitialized(VulkanContext& context);
+        void waitCompletionValueBounded(std::uint64_t value) noexcept;
         [[nodiscard]] std::expected<InputBindingResult, std::string> prepareInputs(
             VulkanContext& context,
             const lfs::core::SplatData& splat_data,
@@ -520,6 +530,8 @@ namespace lfs::vis {
         UploadTimeline selection_query_timeline_{};
 
         cudaStream_t render_stream_ = nullptr;
+
+        std::function<void(std::uint64_t)> live_submit_callback_;
 
         // CUDA import of the render-complete timeline: the reverse edge of the
         // trainer↔viewer handshake. The trainer waits "render_complete >=

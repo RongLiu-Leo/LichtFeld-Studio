@@ -150,6 +150,11 @@ namespace lfs::core {
         cudaEvent_t last_frame_event_ = nullptr;
         bool last_frame_event_valid_ = false;
 
+        // Pending Vulkan release of the previous frame's arena work (see
+        // note_external_release). Guarded by last_frame_event_mutex_.
+        cudaExternalSemaphore_t external_release_semaphore_ = nullptr;
+        uint64_t external_release_value_ = 0;
+
     public:
         // Constructors
         RasterizerMemoryArena();
@@ -170,12 +175,24 @@ namespace lfs::core {
         // must be the stream all of the frame's arena work was enqueued on. Frames
         // without a stream keep the legacy cudaDeviceSynchronize and invalidate
         // the chain. LFS_ARENA_LEGACY_SYNC=1 forces the legacy sync everywhere.
+        //
+        // A tenant whose arena work runs on a VULKAN queue (the viewport) must
+        // call note_external_release before ending its frame: neither the chain
+        // event nor cudaDeviceSynchronize can see in-flight Vulkan work, so the
+        // next frame waits the imported timeline value instead.
         uint64_t begin_frame(bool from_rendering = false) { return begin_frame(nullptr, from_rendering); }
         uint64_t begin_frame(cudaStream_t stream, bool from_rendering = false);
         std::optional<uint64_t> try_begin_frame(bool from_rendering = false) { return try_begin_frame(nullptr, from_rendering); }
         std::optional<uint64_t> try_begin_frame(cudaStream_t stream, bool from_rendering = false);
         void end_frame(uint64_t frame_id, bool from_rendering = false) { end_frame(frame_id, nullptr, from_rendering); }
         void end_frame(uint64_t frame_id, cudaStream_t stream, bool from_rendering = false);
+
+        // Registers the Vulkan-side completion of the current frame's arena work
+        // (an imported timeline + the value its submit signals). Consumed once by
+        // the next begin_frame, which waits it GPU-side (or via the legacy
+        // stream ahead of its device sync on the streamless path).
+        void note_external_release(cudaExternalSemaphore_t semaphore, uint64_t value);
+
         std::function<char*(size_t)> get_allocator(uint64_t frame_id);
         std::vector<BufferHandle> get_frame_buffers(uint64_t frame_id) const;
         void reset_frame(uint64_t frame_id); // Keeps allocation, resets offset
