@@ -243,6 +243,7 @@ namespace lfs::vis {
         frame_ = 0;
         page_payload_bytes_ = 0;
         deferred_requests_ = 0;
+        last_admission_log_frame_ = 0;
     }
 
     void LodPageCache::configure(const std::size_t logical_chunk_count,
@@ -398,6 +399,10 @@ namespace lfs::vis {
 
         const std::size_t request_budget = requestBudgetPages();
         std::size_t new_requests = 0;
+        std::size_t wants = 0;
+        std::size_t budget_deferred = 0;
+        std::size_t refused_no_slot = 0;
+        std::size_t refused_margin = 0;
 
         const auto has_pending_upload = [&](const std::uint32_t chunk) {
             return std::any_of(pending_uploads_.begin(), pending_uploads_.end(), [chunk](const PendingUpload& upload) {
@@ -418,20 +423,69 @@ namespace lfs::vis {
             }
             const bool active_request = resident || decodeInFlight(chunk) || has_pending_upload(chunk);
             if (!active_request) {
+                ++wants;
                 const std::size_t outstanding = outstandingWorkCount();
                 if (new_requests >= request_budget || outstanding >= request_budget) {
                     ++deferred_requests_;
+                    ++budget_deferred;
                     continue;
                 }
             }
-            const std::size_t before = outstandingWorkCount();
-            const bool accepted = requestResident(chunk, false, request.priority, protected_pages);
+            const AdmitResult result = requestResident(chunk, false, request.priority, protected_pages);
             if (!active_request) {
-                if (!accepted) {
-                    ++deferred_requests_;
-                } else if (outstandingWorkCount() > before) {
+                switch (result) {
+                case AdmitResult::Admitted:
                     ++new_requests;
+                    break;
+                case AdmitResult::NoSlot:
+                    ++deferred_requests_;
+                    ++refused_no_slot;
+                    break;
+                case AdmitResult::MarginRefused:
+                    ++deferred_requests_;
+                    ++refused_margin;
+                    break;
+                case AdmitResult::Invalid:
+                    ++deferred_requests_;
+                    break;
+                case AdmitResult::AlreadyActive:
+                    break; // raced into residency/flight between the checks
                 }
+            }
+        }
+
+        // Admission telemetry: a frozen pool (wants but zero admissions with
+        // margin/no-slot refusals) is indistinguishable from healthy flow
+        // control in the HUD's single deferred number; this line tells the
+        // refusal mode and whether any page is even evictable.
+        if (wants > 0) {
+            const bool frozen = new_requests == 0 && (refused_no_slot + refused_margin) > 0;
+            const std::uint64_t interval = frozen ? 16 : 64;
+            if (frame_ >= last_admission_log_frame_ + interval) {
+                last_admission_log_frame_ = frame_;
+                std::size_t freeable = 0;
+                for (const auto& slot : pages_) {
+                    if (slot.pinned || slot.chunk == kInvalidPage ||
+                        slot.loading_chunk != kInvalidPage ||
+                        slot.protected_until_frame > frame_) {
+                        continue;
+                    }
+                    if (effectivePriority(slot) == 0u) {
+                        ++freeable;
+                    }
+                }
+                LOG_PERF("vksplat.lod_admission frame={} wants={} admitted={} no_slot={} "
+                         "margin={} budget={} freeable={} resident={}/{}{}",
+                         frame_,
+                         wants,
+                         new_requests,
+                         refused_no_slot,
+                         refused_margin,
+                         budget_deferred,
+                         freeable,
+                         snapshot_.resident_chunks,
+                         snapshot_.physical_pages,
+                         frozen ? " FROZEN" : "");
             }
         }
     }
@@ -515,22 +569,23 @@ namespace lfs::vis {
         return std::clamp<std::size_t>(pages_.size() / 16, std::min<std::size_t>(4, pages_.size()), 32);
     }
 
-    bool LodPageCache::requestResident(const std::uint32_t chunk,
-                                       const bool pin,
-                                       const std::uint32_t priority,
-                                       const std::span<const std::uint8_t> protected_pages) {
+    LodPageCache::AdmitResult LodPageCache::requestResident(
+        const std::uint32_t chunk,
+        const bool pin,
+        const std::uint32_t priority,
+        const std::span<const std::uint8_t> protected_pages) {
         if (chunk >= snapshot_.logical_chunks || pages_.empty()) {
-            return false;
+            return AdmitResult::Invalid;
         }
 
         const std::uint32_t current_page = snapshot_.chunk_to_page[chunk];
         if (current_page != kInvalidPage && current_page < pages_.size()) {
             pages_[current_page].last_used = ++clock_;
             pages_[current_page].pinned = pages_[current_page].pinned || pin;
-            return true;
+            return AdmitResult::AlreadyActive;
         }
         if (decodeInFlight(chunk)) {
-            return true;
+            return AdmitResult::AlreadyActive;
         }
         for (auto& pending : pending_uploads_) {
             if (pending.chunk == chunk) {
@@ -538,7 +593,7 @@ namespace lfs::vis {
                     pages_[pending.page].last_used = ++clock_;
                     pages_[pending.page].pinned = pages_[pending.page].pinned || pin;
                 }
-                return true;
+                return AdmitResult::AlreadyActive;
             }
         }
 
@@ -546,7 +601,7 @@ namespace lfs::vis {
         if (page >= pages_.size()) {
             // Every slot is pinned, loading, or inside its protection window:
             // defer rather than churn a page the current cut renders from.
-            return false;
+            return AdmitResult::NoSlot;
         }
 
         // Priority admission: stealing an occupied slot must buy more screen
@@ -565,12 +620,12 @@ namespace lfs::vis {
                     ? std::numeric_limits<std::uint32_t>::max()
                     : resistance + kAdmissionMargin;
             if (priority <= bar) {
-                return false;
+                return AdmitResult::MarginRefused;
             }
         }
 
         reserveUpload(page, chunk, pin, priority);
-        return true;
+        return AdmitResult::Admitted;
     }
 
     std::uint32_t LodPageCache::effectivePriority(const PageSlot& slot) const {

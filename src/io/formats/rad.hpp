@@ -6,6 +6,7 @@
 
 #include "core/splat_data.hpp"
 #include "io/exporter.hpp"
+#include "rad_packed_page.hpp"
 
 #include <cstdint>
 #include <expected>
@@ -60,6 +61,21 @@ namespace lfs::io {
         bool lod_opacity_encoded,
         std::size_t dst_capacity,
         const RadChunkDsts& dsts);
+
+    // Inflate-only chunk decode for the GPU dequant path: property planes land
+    // in `dst` (an upload staging slot) still quantized, dimension-major, with
+    // delta variants normalized away; the chunk's sidecar bounds/links planes
+    // and dequant frame ride along. The returned descriptor drives the CUDA
+    // page-dequant kernel. Streaming-profile only — per-component property
+    // layouts and unknown encodings are hard errors, never fallbacks.
+    [[nodiscard]] std::expected<RadPagePackedDesc, std::string> decode_rad_chunk_packed(
+        std::span<const std::uint8_t> data,
+        int fallback_max_sh,
+        bool lod_opacity_encoded,
+        std::size_t dst_capacity,
+        const lfs::core::SplatLodTree::NodeMetaView& meta_view,
+        std::uint32_t chunk,
+        std::span<std::uint8_t> dst);
 
     // Load RAD (Random Access Dynamic) format - chunked hierarchical Gaussian splat format
     std::expected<SplatData, std::string> load_rad(const std::filesystem::path& filepath);

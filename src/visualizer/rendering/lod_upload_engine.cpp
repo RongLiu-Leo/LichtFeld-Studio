@@ -4,8 +4,7 @@
 
 #include "lod_upload_engine.hpp"
 
-#include "core/cuda/sh_layout.cuh"
-#include "core/splat_data.hpp"
+#include "lod_page_dequant_cuda.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -31,48 +30,19 @@ namespace lfs::vis {
             return std::max<std::size_t>(8, std::clamp<std::size_t>(hw / 2, 2, 8) + 2);
         }
 
-        LodUploadEngine::StagingLayout stagingLayoutFor(const std::uint32_t dst_rest,
-                                                        const bool has_meta) {
+        LodUploadEngine::StagingLayout stagingLayoutFor(const bool has_meta) {
+            // Worst case per splat: every payload property stored f32 at SH
+            // degree 3 (means 12 + sh0 12 + scales 12 + orientation xyz 12 +
+            // alpha 4 + SH bands 45*4), plus the sidecar planes (8 + 12) and
+            // per-plane 16-byte alignment slack. Quantized profiles use a
+            // fraction; only used_bytes is ever copied.
+            constexpr std::size_t kWorstPayloadPerSplat = 232;
+            constexpr std::size_t kMetaPerSplat = 20;
+            constexpr std::size_t kAlignSlack = 16u * (lfs::io::kRadPackedMaxProps + 2u);
             LodUploadEngine::StagingLayout layout{};
-            const std::size_t page_sh_bytes =
-                dst_rest == 0u ? 0u : lfs::core::sh_swizzled_byte_count(kPageSplats, dst_rest);
-            std::size_t offset = 0;
-            const auto place = [&offset](const std::size_t bytes) {
-                const std::size_t at = offset;
-                offset += bytes;
-                return at;
-            };
-            layout.means = place(kPageSplats * 3u * sizeof(float));
-            layout.sh0 = place(kPageSplats * 3u * sizeof(float));
-            layout.shN = place(page_sh_bytes);
-            layout.rotation = place(kPageSplats * 4u * sizeof(float));
-            layout.scaling = place(kPageSplats * 3u * sizeof(float));
-            layout.opacity = place(kPageSplats * sizeof(float));
-            if (has_meta) {
-                layout.meta_bounds = place(kPageSplats * sizeof(lfs::core::NodeBoundsRecord));
-                layout.meta_links = place(kPageSplats * sizeof(lfs::core::NodeLinksRecord));
-            }
-            layout.total_bytes = offset;
-            layout.page_sh_bytes = page_sh_bytes;
+            layout.total_bytes =
+                kPageSplats * (kWorstPayloadPerSplat + (has_meta ? kMetaPerSplat : 0u)) + kAlignSlack;
             return layout;
-        }
-
-        [[nodiscard]] std::string copyAsync(const void* const src,
-                                            void* const dst,
-                                            const std::size_t bytes,
-                                            const cudaStream_t stream,
-                                            const std::string_view label) {
-            if (bytes == 0) {
-                return {};
-            }
-            const cudaError_t status = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream);
-            if (status != cudaSuccess) {
-                return std::format("LOD page {} H2D copy failed: {} ({})",
-                                   label,
-                                   cudaGetErrorName(status),
-                                   cudaGetErrorString(status));
-            }
-            return {};
         }
 
     } // namespace
@@ -114,7 +84,7 @@ namespace lfs::vis {
             }
         }
         releaseStagingRingLocked();
-        staging_layout_ = stagingLayoutFor(layout_.dst_rest, layout_.meta_base != nullptr);
+        staging_layout_ = stagingLayoutFor(layout_.meta_base != nullptr);
         if (layout_.valid() && stream_ != nullptr) {
             staging_ring_.resize(stagingRingDepth());
             for (auto& slot : staging_ring_) {
@@ -122,6 +92,10 @@ namespace lfs::vis {
                                   staging_layout_.total_bytes,
                                   cudaHostAllocDefault) != cudaSuccess) {
                     slot.data = nullptr;
+                }
+                if (cudaMalloc(reinterpret_cast<void**>(&slot.device_data),
+                               staging_layout_.total_bytes) != cudaSuccess) {
+                    slot.device_data = nullptr;
                 }
                 if (cudaEventCreateWithFlags(&slot.last_use, cudaEventDisableTiming) != cudaSuccess) {
                     slot.last_use = nullptr;
@@ -165,7 +139,8 @@ namespace lfs::vis {
             StagingSlot* candidate = nullptr;
             for (std::size_t probe = 0; probe < staging_ring_.size(); ++probe) {
                 StagingSlot& slot = staging_ring_[(staging_cursor_ + probe) % staging_ring_.size()];
-                if (!slot.acquired && slot.data != nullptr && slot.last_use != nullptr) {
+                if (!slot.acquired && slot.data != nullptr && slot.device_data != nullptr &&
+                    slot.last_use != nullptr) {
                     candidate = &slot;
                     staging_cursor_ = (staging_cursor_ + probe + 1) % staging_ring_.size();
                     break;
@@ -203,85 +178,73 @@ namespace lfs::vis {
     }
 
     void LodUploadEngine::submitPackedPage(StagingSlot* const slot,
+                                           const lfs::io::RadPagePackedDesc& desc,
                                            const std::uint32_t page,
-                                           const std::uint32_t chunk,
-                                           const std::uint64_t generation,
-                                           const std::size_t splat_count) {
+                                           const std::uint64_t generation) {
         Job job{
             .upload = {
                 .page = page,
-                .chunk = chunk,
+                .chunk = desc.chunk,
                 .generation = generation,
                 .error = {},
             },
         };
 
-        // One lock section covers copy-issue + timeline signal + event record
-        // so timeline values stay monotone in stream order across workers.
+        // One lock section covers copy + kernel + timeline signal + event
+        // record so timeline values stay monotone in stream order across
+        // workers.
         std::lock_guard lock(mutex_);
         const auto submit = [&]() -> std::string {
             if (!layout_.valid() || stream_ == nullptr) {
                 return "LOD upload engine is not configured";
             }
             const std::size_t dst_start = static_cast<std::size_t>(page) * kPageSplats;
-            const std::size_t count =
-                std::min({splat_count, kPageSplats,
-                          layout_.splat_capacity > dst_start ? layout_.splat_capacity - dst_start
-                                                             : std::size_t{0}});
-            if (count == 0) {
+            if (dst_start + kPageSplats > layout_.splat_capacity || desc.count == 0 ||
+                desc.count > kPageSplats) {
                 return std::format("LOD upload page {} exceeds splat capacity {}",
                                    page, layout_.splat_capacity);
             }
-            auto* const base = slot->data;
-            auto* const device_base = static_cast<std::uint8_t*>(layout_.device_base);
-            const auto region = [&](const std::size_t index) {
-                return device_base + layout_.region_offset[index];
-            };
-            const std::size_t sh_block_offset =
-                (dst_start / lfs::core::kShReorderSize) *
-                static_cast<std::size_t>(layout_.dst_slots) *
-                lfs::core::kShReorderSize * 4u * sizeof(float);
+            if (layout_.meta_base != nullptr &&
+                dst_start + kPageSplats > layout_.meta_capacity_nodes) {
+                return std::format("LOD upload page {} exceeds metadata capacity {}",
+                                   page, layout_.meta_capacity_nodes);
+            }
+            if (desc.used_bytes == 0 || desc.used_bytes > staging_layout_.total_bytes) {
+                return std::format("LOD packed page descriptor spans {} bytes, slot holds {}",
+                                   desc.used_bytes, staging_layout_.total_bytes);
+            }
+            if (const cudaError_t status = cudaMemcpyAsync(slot->device_data, slot->data,
+                                                           desc.used_bytes,
+                                                           cudaMemcpyHostToDevice, stream_);
+                status != cudaSuccess) {
+                return std::format("LOD page slot H2D copy failed: {} ({})",
+                                   cudaGetErrorName(status),
+                                   cudaGetErrorString(status));
+            }
 
-            std::string error =
-                copyAsync(base + staging_layout_.means, region(0) + dst_start * 3u * sizeof(float),
-                          count * 3u * sizeof(float), stream_, "means");
-            if (error.empty()) {
-                error = copyAsync(base + staging_layout_.sh0, region(1) + dst_start * 3u * sizeof(float),
-                                  count * 3u * sizeof(float), stream_, "sh0");
-            }
-            if (error.empty() && staging_layout_.page_sh_bytes > 0) {
-                error = copyAsync(base + staging_layout_.shN, region(2) + sh_block_offset,
-                                  staging_layout_.page_sh_bytes, stream_, "shN");
-            }
-            if (error.empty()) {
-                error = copyAsync(base + staging_layout_.rotation, region(3) + dst_start * 4u * sizeof(float),
-                                  count * 4u * sizeof(float), stream_, "rotation");
-            }
-            if (error.empty()) {
-                error = copyAsync(base + staging_layout_.scaling, region(4) + dst_start * 3u * sizeof(float),
-                                  count * 3u * sizeof(float), stream_, "scaling");
-            }
-            if (error.empty()) {
-                error = copyAsync(base + staging_layout_.opacity, region(5) + dst_start * sizeof(float),
-                                  count * sizeof(float), stream_, "opacity");
-            }
-            if (error.empty() && layout_.meta_base != nullptr) {
+            auto* const device_base = static_cast<std::uint8_t*>(layout_.device_base);
+            LodPoolDeviceView view{};
+            view.means = reinterpret_cast<float*>(device_base + layout_.region_offset[0]);
+            view.sh0 = reinterpret_cast<float*>(device_base + layout_.region_offset[1]);
+            view.shN = reinterpret_cast<float*>(device_base + layout_.region_offset[2]);
+            view.rotation = reinterpret_cast<float*>(device_base + layout_.region_offset[3]);
+            view.scaling = reinterpret_cast<float*>(device_base + layout_.region_offset[4]);
+            view.opacity = reinterpret_cast<float*>(device_base + layout_.region_offset[5]);
+            view.dst_rest = layout_.dst_rest;
+            view.dst_slots = layout_.dst_slots;
+            if (layout_.meta_base != nullptr) {
                 auto* const meta_base = static_cast<std::uint8_t*>(layout_.meta_base);
-                error = copyAsync(base + staging_layout_.meta_bounds,
-                                  meta_base + layout_.meta_bounds_offset +
-                                      dst_start * sizeof(lfs::core::NodeBoundsRecord),
-                                  kPageSplats * sizeof(lfs::core::NodeBoundsRecord),
-                                  stream_, "node bounds");
-                if (error.empty()) {
-                    error = copyAsync(base + staging_layout_.meta_links,
-                                      meta_base + layout_.meta_links_offset +
-                                          dst_start * sizeof(lfs::core::NodeLinksRecord),
-                                      kPageSplats * sizeof(lfs::core::NodeLinksRecord),
-                                      stream_, "node links");
-                }
+                view.meta_bounds =
+                    reinterpret_cast<float4*>(meta_base + layout_.meta_bounds_offset);
+                view.meta_links = reinterpret_cast<uint4*>(meta_base + layout_.meta_links_offset);
             }
-            if (!error.empty()) {
-                return error;
+            if (const cudaError_t status =
+                    launchLodPageDequant(slot->device_data, desc, view, page,
+                                         static_cast<std::uint32_t>(kPageSplats), stream_);
+                status != cudaSuccess) {
+                return std::format("LOD page dequant kernel launch failed: {} ({})",
+                                   cudaGetErrorName(status),
+                                   cudaGetErrorString(status));
             }
 
             const cudaEvent_t event = acquireEventLocked();
@@ -375,6 +338,9 @@ namespace lfs::vis {
         for (auto& slot : staging_ring_) {
             if (slot.data != nullptr) {
                 (void)cudaFreeHost(slot.data);
+            }
+            if (slot.device_data != nullptr) {
+                (void)cudaFree(slot.device_data);
             }
             if (slot.last_use != nullptr) {
                 (void)cudaEventDestroy(slot.last_use);

@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "io/formats/rad_packed_page.hpp"
 #include "lod_page_cache.hpp"
 #include "rendering/cuda_vulkan_interop.hpp"
 
@@ -19,13 +20,13 @@
 namespace lfs::vis {
 
     // Streams packed RAD pages into the CUDA-imported pool buffers off the
-    // render thread. Decode workers acquire a pinned staging slot, write the
-    // page in final device layout (payload regions, SH pre-swizzled, plus the
-    // expanded tree metadata), then submit; the engine issues async copies on
-    // a dedicated CUDA stream. The render thread polls collectPublished() and
-    // publishes residency only for pages whose copies completed, so the
-    // selector never observes a partially written page. Staging slots are the
-    // backpressure.
+    // render thread. Decode workers acquire a pinned staging slot, fill it
+    // via decode_rad_chunk_packed (inflated-but-quantized planes + sidecar
+    // metadata), then submit; the engine copies the slot to a paired device
+    // scratch buffer and runs the page-dequant kernel on a dedicated CUDA
+    // stream. The render thread polls collectPublished() and publishes
+    // residency only for pages whose kernel completed, so the selector never
+    // observes a partially written page. Staging slots are the backpressure.
     class LodUploadEngine {
     public:
         struct DeviceLayout {
@@ -38,30 +39,26 @@ namespace lfs::vis {
             std::uint32_t dst_rest = 0;
             std::uint32_t dst_slots = 0;
             // Tree-metadata pool (expanded NodeBounds/NodeLinks records).
+            // Its capacity can lag the payload pool's across reconfigure
+            // frames; submits bounds-check against it independently.
             void* meta_base = nullptr;
             std::size_t meta_bounds_offset = 0;
             std::size_t meta_links_offset = 0;
+            std::size_t meta_capacity_nodes = 0;
 
             [[nodiscard]] bool valid() const { return device_base != nullptr && splat_capacity > 0; }
             [[nodiscard]] friend bool operator==(const DeviceLayout&, const DeviceLayout&) = default;
         };
 
-        // Byte offsets of a page's sections inside one staging slot.
+        // Staging slots are opaque byte arenas laid out by
+        // decode_rad_chunk_packed; only the capacity is fixed.
         struct StagingLayout {
-            std::size_t means = 0;
-            std::size_t sh0 = 0;
-            std::size_t shN = 0;
-            std::size_t rotation = 0;
-            std::size_t scaling = 0;
-            std::size_t opacity = 0;
-            std::size_t meta_bounds = 0;
-            std::size_t meta_links = 0;
             std::size_t total_bytes = 0;
-            std::size_t page_sh_bytes = 0;
         };
 
         struct StagingSlot {
-            std::uint8_t* data = nullptr;
+            std::uint8_t* data = nullptr;        // pinned host arena
+            std::uint8_t* device_data = nullptr; // paired device scratch
             cudaEvent_t last_use = nullptr;
             bool used = false;
             bool acquired = false;
@@ -88,13 +85,12 @@ namespace lfs::vis {
         // be passed to submitPackedPage or releaseSlot.
         [[nodiscard]] StagingSlot* acquireStagingSlot();
         void releaseSlot(StagingSlot* slot);
-        // Issues the async copies for a fully packed slot. Thread-safe across
-        // decode workers; timeline values stay monotone in stream order.
+        // Issues the slot copy + dequant kernel for a packed slot. Thread-safe
+        // across decode workers; timeline values stay monotone in stream order.
         void submitPackedPage(StagingSlot* slot,
+                              const lfs::io::RadPagePackedDesc& desc,
                               std::uint32_t page,
-                              std::uint32_t chunk,
-                              std::uint64_t generation,
-                              std::size_t splat_count);
+                              std::uint64_t generation);
 
         // Completed (event-signaled) uploads in submission order.
         [[nodiscard]] std::vector<LodPageCache::PendingUpload> collectPublished();

@@ -206,7 +206,6 @@ namespace lfs::vis {
         [[nodiscard]] std::expected<void, std::string> ensureLodPageInputStorage(
             VulkanContext& context,
             const lfs::core::SplatData& splat_data,
-            std::size_t ring_slot,
             int upload_sh_degree);
         [[nodiscard]] std::expected<void, std::string> ensureGpuLodTreeStorage(
             const lfs::core::SplatData& splat_data);

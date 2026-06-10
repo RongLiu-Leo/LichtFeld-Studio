@@ -1260,61 +1260,6 @@ namespace lfs::vis {
             return {};
         }
 
-        [[nodiscard]] std::expected<void, std::string> copyHostBytesToCuda(
-            const void* src,
-            void* dst,
-            const std::size_t bytes,
-            const cudaStream_t stream,
-            const std::string_view label) {
-            if (bytes == 0) {
-                return {};
-            }
-            if (src == nullptr || dst == nullptr) {
-                return std::unexpected(std::format("VkSplat LOD page {} H2D copy received a null pointer", label));
-            }
-            const cudaError_t status = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream);
-            if (status != cudaSuccess) {
-                return std::unexpected(std::format("VkSplat LOD page {} H2D copy failed: {} ({})",
-                                                   label,
-                                                   cudaGetErrorName(status),
-                                                   cudaGetErrorString(status)));
-            }
-            return {};
-        }
-
-        void writeSwizzledShPage(const std::vector<float>& canonical,
-                                 const std::size_t count,
-                                 const std::uint32_t src_rest,
-                                 const std::uint32_t dst_rest,
-                                 const std::uint32_t dst_slots,
-                                 float* const dst,
-                                 const std::size_t dst_bytes) {
-            std::memset(dst, 0, dst_bytes);
-            if (count == 0 || dst_rest == 0u || dst_slots == 0u || src_rest == 0u) {
-                return;
-            }
-            const std::size_t source_stride = static_cast<std::size_t>(src_rest) * lfs::core::kShChannels;
-            const std::size_t active_floats = source_stride;
-            const std::size_t row_count = std::min(count, LodPageCache::kChunkSplats);
-            for (std::size_t i = 0; i < row_count; ++i) {
-                const float* const row = canonical.data() + i * source_stride;
-                const std::uint32_t block = static_cast<std::uint32_t>(i / lfs::core::kShReorderSize);
-                const std::uint32_t lane = static_cast<std::uint32_t>(i % lfs::core::kShReorderSize);
-                for (std::uint32_t slot = 0; slot < dst_slots; ++slot) {
-                    const std::size_t float4_index =
-                        (static_cast<std::size_t>(block) * dst_slots * lfs::core::kShReorderSize) +
-                        (static_cast<std::size_t>(slot) * lfs::core::kShReorderSize) +
-                        lane;
-                    float* const out = dst + float4_index * 4u;
-                    const std::size_t source_offset = static_cast<std::size_t>(slot) * 4u;
-                    for (std::size_t component = 0; component < 4u; ++component) {
-                        const std::size_t source_index = source_offset + component;
-                        out[component] = source_index < active_floats ? row[source_index] : 0.0f;
-                    }
-                }
-            }
-        }
-
         void populateVksplatCameraUniforms(
             VulkanGSRendererUniforms& uniforms,
             const lfs::rendering::FrameView& frame_view,
@@ -1874,6 +1819,7 @@ namespace lfs::vis {
             .meta_base = lod_tree_meta_.interop.devicePointer(),
             .meta_bounds_offset = lod_tree_meta_.bounds_offset,
             .meta_links_offset = lod_tree_meta_.links_offset,
+            .meta_capacity_nodes = lod_tree_meta_.capacity_nodes,
         };
         if (layout == lod_engine_layout_ && lod_sink_model_ == &splat_data) {
             return;
@@ -1886,15 +1832,16 @@ namespace lfs::vis {
         lod_engine_layout_ = layout;
         lod_sink_model_ = &splat_data;
 
-        // Decode-worker sink: read bytes were handed over by the scheduler;
-        // decode straight into a pinned staging slot in final device layout,
-        // expand the chunk's tree metadata, and submit the async copies.
+        // Decode-worker sink: read bytes were handed over by the scheduler.
+        // Inflate the chunk's still-quantized planes plus its sidecar
+        // metadata into a pinned staging slot; the engine copies the slot to
+        // device scratch and the dequant kernel expands payload, swizzled SH,
+        // and tree metadata directly into the pool regions.
         const auto* view = &tree->meta_view;
         const int max_sh = splat_data.get_max_sh_degree();
         const bool lod_opacity = tree->lod_opacity_encoded;
-        const std::uint32_t dst_slots = layout.dst_slots;
         lod_page_cache_.setPageSink(
-            [this, view, max_sh, lod_opacity, dst_rest, dst_slots](
+            [this, view, max_sh, lod_opacity](
                 const std::uint32_t chunk,
                 const std::uint32_t page,
                 const std::uint64_t generation,
@@ -1904,49 +1851,19 @@ namespace lfs::vis {
                     return "LOD upload engine unavailable";
                 }
                 const auto staging = lod_upload_engine_.stagingLayout();
-                thread_local std::vector<float> shN_scratch;
-                const lfs::io::RadChunkDsts dsts{
-                    .means = reinterpret_cast<float*>(slot->data + staging.means),
-                    .opacity_raw = reinterpret_cast<float*>(slot->data + staging.opacity),
-                    .sh0_raw = reinterpret_cast<float*>(slot->data + staging.sh0),
-                    .scaling_raw = reinterpret_cast<float*>(slot->data + staging.scaling),
-                    .rotation_raw = reinterpret_cast<float*>(slot->data + staging.rotation),
-                    .shN_canonical = dst_rest > 0u ? &shN_scratch : nullptr,
-                };
-                auto info = lfs::io::decode_rad_chunk_into(chunk_bytes,
-                                                           max_sh,
-                                                           lod_opacity,
-                                                           LodPageCache::kChunkSplats,
-                                                           dsts);
-                if (!info) {
+                auto desc = lfs::io::decode_rad_chunk_packed(
+                    chunk_bytes,
+                    max_sh,
+                    lod_opacity,
+                    LodPageCache::kChunkSplats,
+                    *view,
+                    chunk,
+                    std::span<std::uint8_t>(slot->data, staging.total_bytes));
+                if (!desc) {
                     lod_upload_engine_.releaseSlot(slot);
-                    return std::move(info.error());
+                    return std::move(desc.error());
                 }
-                if (staging.page_sh_bytes > 0) {
-                    writeSwizzledShPage(shN_scratch,
-                                        static_cast<std::size_t>(info->count),
-                                        info->sh_coeffs_rest,
-                                        dst_rest,
-                                        dst_slots,
-                                        reinterpret_cast<float*>(slot->data + staging.shN),
-                                        staging.page_sh_bytes);
-                }
-                auto* const bounds =
-                    reinterpret_cast<lfs::core::NodeBoundsRecord*>(slot->data + staging.meta_bounds);
-                auto* const links =
-                    reinterpret_cast<lfs::core::NodeLinksRecord*>(slot->data + staging.meta_links);
-                std::memset(bounds, 0, LodPageCache::kChunkSplats * sizeof(lfs::core::NodeBoundsRecord));
-                // 0xFF words = kInvalidPage logical sentinel for slack nodes.
-                std::memset(links, 0xFF, LodPageCache::kChunkSplats * sizeof(lfs::core::NodeLinksRecord));
-                const std::size_t logical_start =
-                    static_cast<std::size_t>(chunk) * LodPageCache::kChunkSplats;
-                if (logical_start < view->node_count) {
-                    const std::size_t run =
-                        std::min(LodPageCache::kChunkSplats, view->node_count - logical_start);
-                    lfs::io::expand_rad_meta_page(*view, chunk, run, bounds, links);
-                }
-                lod_upload_engine_.submitPackedPage(slot, page, chunk, generation,
-                                                    static_cast<std::size_t>(info->count));
+                lod_upload_engine_.submitPackedPage(slot, *desc, page, generation);
                 return {};
             });
     }
@@ -2133,10 +2050,16 @@ namespace lfs::vis {
                 if (context_ == nullptr) {
                     return std::unexpected("VkSplat GPU LOD tree storage requires a Vulkan context");
                 }
-                // In-flight engine copies may target the old metadata buffer.
-                discardLodEngineResults(lod_upload_engine_.drainAndSync(),
+                // In-flight engine kernels may target the old metadata
+                // buffer. Stop the producers, then unconfigure the engine so
+                // its layout cannot dangle on the freed buffer (see
+                // ensureLodPageInputStorage).
+                lod_page_cache_.reset();
+                lod_page_cache_model_ = nullptr;
+                discardLodEngineResults(lod_upload_engine_.configure({}, nullptr),
                                         "LOD tree metadata storage reallocated before upload completed");
                 lod_engine_layout_ = {};
+                lod_sink_model_ = nullptr;
                 std::array<std::size_t, 2> meta_bytes{
                     physical_node_capacity * sizeof(lfs::core::NodeBoundsRecord),
                     physical_node_capacity * sizeof(lfs::core::NodeLinksRecord)};
@@ -2367,7 +2290,6 @@ namespace lfs::vis {
     std::expected<void, std::string> VksplatViewportRenderer::ensureLodPageInputStorage(
         VulkanContext& context,
         const lfs::core::SplatData& splat_data,
-        const std::size_t ring_slot,
         const int upload_sh_degree) {
         const auto snapshot = ensureLodPageCacheSnapshot(splat_data);
         if (!snapshot || !lod_page_cache_.configured()) {
@@ -2421,16 +2343,21 @@ namespace lfs::vis {
         const VkBuffer previous_buffer = lod_page_inputs_.buffer.buffer;
         const VkDeviceSize previous_size = lod_page_inputs_.buffer.size;
 
-        // In-flight engine copies target the old pool memory. Stop the
+        // In-flight engine work targets the old pool memory. Stop the
         // producers first: resetting the cache joins the decode workers, so
-        // no sink call can submit a new copy after the drain. Draining alone
-        // left a window — queued decodes kept packing and submitted against
-        // the freed buffer (cudaErrorInvalidValue bursts on reconfigure).
+        // no sink call can submit after the drain. Then UNCONFIGURE the
+        // engine, not just drain it — its layout_ would otherwise dangle on
+        // the freed buffer until configureLodUploadEngine runs, and any
+        // error-out in between leaves next frame's bootstrap submits
+        // launching kernels on freed memory (cudaErrorIllegalAddress, dead
+        // context).
         if (storage_config_changed && previous_buffer != VK_NULL_HANDLE) {
             lod_page_cache_.reset();
             lod_page_cache_model_ = nullptr;
-            discardLodEngineResults(lod_upload_engine_.drainAndSync(),
+            discardLodEngineResults(lod_upload_engine_.configure({}, nullptr),
                                     "LOD pool storage reconfigured before upload completed");
+            lod_engine_layout_ = {};
+            lod_sink_model_ = nullptr;
         }
 
         if (auto ok = ensureCudaInteropBuffer(context,
@@ -3274,7 +3201,9 @@ namespace lfs::vis {
         gpu_lod_tree_ = {};
 
         if (lod_tree_meta_.buffer.buffer != VK_NULL_HANDLE) {
-            discardLodEngineResults(lod_upload_engine_.drainAndSync(),
+            lod_page_cache_.reset();
+            lod_page_cache_model_ = nullptr;
+            discardLodEngineResults(lod_upload_engine_.configure({}, nullptr),
                                     "LOD tree metadata storage released before upload completed");
             lod_tree_meta_.interop.reset();
             if (context_ != nullptr) {
@@ -3282,6 +3211,7 @@ namespace lfs::vis {
             }
             lod_tree_meta_ = {};
             lod_engine_layout_ = {};
+            lod_sink_model_ = nullptr;
         }
     }
 
@@ -6116,7 +6046,6 @@ namespace lfs::vis {
         if (lod_page_inputs_active) {
             if (auto ok = ensureLodPageInputStorage(context,
                                                     splat_data,
-                                                    ring_slot,
                                                     active_sh_degree);
                 !ok) {
                 return std::unexpected(ok.error());

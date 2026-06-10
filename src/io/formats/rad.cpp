@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "rad.hpp"
+#include "rad_dequant_math.hpp"
+
 #include "core/bhatt_lod.hpp"
 #include "core/logger.hpp"
 #include "core/mapped_file.hpp"
@@ -252,34 +254,7 @@ namespace lfs::io {
 
         // Convert float16 to float32
         inline float float16_to_float32(uint16_t value) {
-            uint32_t sign = (value >> 15) & 0x1;
-            uint32_t exponent = (value >> 10) & 0x1F;
-            uint32_t mantissa = value & 0x3FF;
-
-            uint32_t f32;
-
-            if (exponent == 0) {
-                // Zero or subnormal
-                if (mantissa == 0) {
-                    f32 = sign << 31;
-                } else {
-                    // Subnormal - normalize it
-                    int shift = 10 - static_cast<int>(std::log2(mantissa));
-                    exponent = 1 - shift;
-                    mantissa <<= shift;
-                    f32 = (sign << 31) | ((exponent + 127 - 15) << 23) | ((mantissa & 0x3FF) << 13);
-                }
-            } else if (exponent == 0x1F) {
-                // Infinity or NaN
-                f32 = (sign << 31) | (0xFF << 23) | (mantissa << 13);
-            } else {
-                // Normal number
-                f32 = (sign << 31) | ((exponent + 127 - 15) << 23) | (mantissa << 13);
-            }
-
-            float result;
-            std::memcpy(&result, &f32, sizeof(float));
-            return result;
+            return radmath::halfToFloat(value);
         }
 
         // ============================================================================
@@ -487,6 +462,50 @@ namespace lfs::io {
             return rad_decompress(data, size);
         }
 
+        // Decompress a property stream directly into a caller buffer of the
+        // exact expected size. Streaming-profile planes always have a known
+        // decoded size; any mismatch is a hard error at the caller.
+        bool rad_decompress_into(const uint8_t* data, size_t size, uint8_t* dst, size_t expected_bytes) {
+            if (expected_bytes == 0 || size == 0) {
+                return false;
+            }
+            libdeflate_decompressor* const decompressor = tls_decompressor.get();
+            if (decompressor == nullptr) {
+                return false;
+            }
+            size_t actual = 0;
+            if (libdeflate_deflate_decompress(decompressor, data, size, dst, expected_bytes, &actual) ==
+                    LIBDEFLATE_SUCCESS &&
+                actual == expected_bytes) {
+                return true;
+            }
+            if (libdeflate_gzip_decompress(decompressor, data, size, dst, expected_bytes, &actual) ==
+                    LIBDEFLATE_SUCCESS &&
+                actual == expected_bytes) {
+                return true;
+            }
+            if (libdeflate_zlib_decompress(decompressor, data, size, dst, expected_bytes, &actual) ==
+                    LIBDEFLATE_SUCCESS &&
+                actual == expected_bytes) {
+                return true;
+            }
+            return false;
+        }
+
+        // In-place dimension-wise prefix sum reversing r8_delta/s8_delta; the
+        // s8 variant deltas the same uint8 reinterpretation, so one byte-wise
+        // pass serves both (matches decode_r8_delta/decode_s8_delta exactly).
+        void undelta_planes_u8(uint8_t* plane, size_t dims, size_t count) {
+            for (size_t d = 0; d < dims; ++d) {
+                uint8_t* const p = plane + d * count;
+                uint8_t last = 0;
+                for (size_t i = 0; i < count; ++i) {
+                    last = static_cast<uint8_t>(last + p[i]);
+                    p[i] = last;
+                }
+            }
+        }
+
         // Decoded byte count implied by a property's name + encoding, or 0 when unknown.
         size_t rad_property_decoded_bytes(const std::string& property, const std::string& encoding, size_t count) {
             size_t dims = 0;
@@ -691,7 +710,7 @@ namespace lfs::io {
             for (size_t i = 0; i < count; ++i) {
                 for (size_t d = 0; d < dims; ++d) {
                     const size_t src = d * count + i;
-                    output[i * dims + d] = min_val + (static_cast<float>(encoded[src]) / 255.0f) * range;
+                    output[i * dims + d] = radmath::dequantR8(encoded[src], min_val, range);
                 }
             }
         }
@@ -774,7 +793,7 @@ namespace lfs::io {
             for (size_t i = 0; i < count; ++i) {
                 for (size_t d = 0; d < dims; ++d) {
                     const size_t src = d * count + i;
-                    output[i * dims + d] = (static_cast<float>(encoded[src]) / 127.0f) * max_abs;
+                    output[i * dims + d] = radmath::dequantS8(encoded[src], max_abs);
                 }
             }
         }
@@ -882,13 +901,7 @@ namespace lfs::io {
             for (size_t i = 0; i < count; ++i) {
                 for (size_t d = 0; d < dims; ++d) {
                     const size_t src = d * count + i;
-                    uint8_t value = encoded[src];
-                    if (value == 0) {
-                        output[i * dims + d] = 0.0f;
-                    } else {
-                        float ln_scale = ln_min + (value - 1) * (ln_max - ln_min) / 254.0f;
-                        output[i * dims + d] = std::exp(ln_scale);
-                    }
+                    output[i * dims + d] = radmath::dequantLn0R8(encoded[src], ln_min, ln_max);
                 }
             }
         }
@@ -1016,58 +1029,11 @@ namespace lfs::io {
         //   2. Decode angle from 1 byte: theta = value / 255.0 * PI
         //   3. Reconstruct quaternion: w = cos(theta/2), (x,y,z) = axis * sin(theta/2)
         void decode_quat_oct88r8(const uint8_t* encoded, float* quats, size_t count) {
-            constexpr float PI = 3.14159265358979323846f;
-
             for (size_t i = 0; i < count; ++i) {
-                // Map from [0, 255] to [-1, 1] for octahedral coordinates
-                float oct_x = (static_cast<float>(encoded[i * 3 + 0]) / 255.0f) * 2.0f - 1.0f;
-                float oct_y = (static_cast<float>(encoded[i * 3 + 1]) / 255.0f) * 2.0f - 1.0f;
-
-                // Unfold from lower hemisphere when the stored oct_z was negative
-                float oct_z = 1.0f - std::abs(oct_x) - std::abs(oct_y);
-                if (oct_z < 0.0f) {
-                    float temp_x = oct_x;
-                    oct_x = (1.0f - std::abs(oct_y)) * (oct_x >= 0.0f ? 1.0f : -1.0f);
-                    oct_y = (1.0f - std::abs(temp_x)) * (oct_y >= 0.0f ? 1.0f : -1.0f);
-                }
-
-                // Project from octahedron to sphere (normalize)
-                float axis_x = oct_x;
-                float axis_y = oct_y;
-                float axis_z = oct_z;
-                float len = std::sqrt(axis_x * axis_x + axis_y * axis_y + axis_z * axis_z);
-                if (len > 0.0f) {
-                    axis_x /= len;
-                    axis_y /= len;
-                    axis_z /= len;
-                }
-
-                // Decode angle: theta = value / 255.0 * PI
-                float theta = (static_cast<float>(encoded[i * 3 + 2]) / 255.0f) * PI;
-
-                // Reconstruct quaternion from axis-angle
-                float half_theta = theta * 0.5f;
-                float sin_half_theta = std::sin(half_theta);
-                float cos_half_theta = std::cos(half_theta);
-
-                float x = axis_x * sin_half_theta;
-                float y = axis_y * sin_half_theta;
-                float z = axis_z * sin_half_theta;
-                float w = cos_half_theta;
-
-                // Normalize
-                float q_len = std::sqrt(x * x + y * y + z * z + w * w);
-                if (q_len > 0.0f) {
-                    x /= q_len;
-                    y /= q_len;
-                    z /= q_len;
-                    w /= q_len;
-                }
-
-                quats[i * 4 + 0] = x;
-                quats[i * 4 + 1] = y;
-                quats[i * 4 + 2] = z;
-                quats[i * 4 + 3] = w;
+                radmath::dequantQuatOct88R8(encoded[i * 3 + 0],
+                                            encoded[i * 3 + 1],
+                                            encoded[i * 3 + 2],
+                                            &quats[i * 4]);
             }
         }
 
@@ -1638,11 +1604,10 @@ namespace lfs::io {
                         const float x = xyz[i * 3 + 0];
                         const float y = xyz[i * 3 + 1];
                         const float z = xyz[i * 3 + 2];
-                        const float w = std::sqrt(std::max(0.0f, 1.0f - x * x - y * y - z * z));
                         output[i * 4 + 0] = x;
                         output[i * 4 + 1] = y;
                         output[i * 4 + 2] = z;
-                        output[i * 4 + 3] = w;
+                        output[i * 4 + 3] = radmath::quatWFromXyz(x, y, z);
                     }
                 } else if (encoding == "f16") {
                     std::vector<float> xyz(count * 3);
@@ -1651,11 +1616,10 @@ namespace lfs::io {
                         const float x = xyz[i * 3 + 0];
                         const float y = xyz[i * 3 + 1];
                         const float z = xyz[i * 3 + 2];
-                        const float w = std::sqrt(std::max(0.0f, 1.0f - x * x - y * y - z * z));
                         output[i * 4 + 0] = x;
                         output[i * 4 + 1] = y;
                         output[i * 4 + 2] = z;
-                        output[i * 4 + 3] = w;
+                        output[i * 4 + 3] = radmath::quatWFromXyz(x, y, z);
                     }
                 } else if (encoding == "oct88r8") {
                     decode_quat_oct88r8(data, output, count);
@@ -1668,7 +1632,7 @@ namespace lfs::io {
                                   const std::string& encoding,
                                   float min_val, float max_val,
                                   float, float scale) {
-                const float sh_max = std::max({std::abs(min_val), std::abs(max_val), std::abs(scale), 1e-6f});
+                const float sh_max = radmath::shMaxAbs(min_val, max_val, scale);
                 if (encoding == "f32") {
                     decode_f32(data, output, dims, count);
                 } else if (encoding == "f16") {
@@ -3706,24 +3670,23 @@ namespace lfs::io {
         // Same post-decode transforms as decode_rad_chunk_buffer, in place.
         if (dsts.sh0_raw != nullptr) {
             for (std::size_t i = 0; i < count * 3u; ++i) {
-                dsts.sh0_raw[i] = (dsts.sh0_raw[i] - 0.5f) / SH_C0;
+                dsts.sh0_raw[i] = radmath::sh0Transform(dsts.sh0_raw[i]);
             }
         }
         if (dsts.opacity_raw != nullptr) {
             if (!lod_opacity_encoded) {
                 for (std::size_t i = 0; i < count; ++i) {
-                    const float a = std::clamp(dsts.opacity_raw[i], 1.0e-6f, 1.0f - 1.0e-6f);
-                    dsts.opacity_raw[i] = std::log(a / (1.0f - a));
+                    dsts.opacity_raw[i] = radmath::opacityLogit(dsts.opacity_raw[i]);
                 }
             } else {
                 for (std::size_t i = 0; i < count; ++i) {
-                    dsts.opacity_raw[i] = std::max(dsts.opacity_raw[i], 0.0f);
+                    dsts.opacity_raw[i] = radmath::opacityLodEncoded(dsts.opacity_raw[i]);
                 }
             }
         }
         if (dsts.scaling_raw != nullptr) {
             for (std::size_t i = 0; i < count * 3u; ++i) {
-                dsts.scaling_raw[i] = std::log(std::max(dsts.scaling_raw[i], 1.0e-8f));
+                dsts.scaling_raw[i] = radmath::scaleLog(dsts.scaling_raw[i]);
             }
         }
 
@@ -3734,6 +3697,244 @@ namespace lfs::io {
             .sh_coeffs_rest = static_cast<std::uint32_t>(sh_coeffs),
             .lod_opacity_encoded = lod_opacity_encoded,
         };
+    }
+
+    namespace {
+
+        struct PackedPropInfo {
+            RadPackedKind kind;
+            std::size_t dims;
+        };
+
+        std::optional<PackedPropInfo> packed_prop_info(const std::string& name) {
+            if (name == PROP_CENTER) {
+                return PackedPropInfo{RadPackedKind::Means, 3};
+            }
+            if (name == PROP_ALPHA) {
+                return PackedPropInfo{RadPackedKind::Alpha, 1};
+            }
+            if (name == PROP_RGB) {
+                return PackedPropInfo{RadPackedKind::Sh0, 3};
+            }
+            if (name == PROP_SCALES) {
+                return PackedPropInfo{RadPackedKind::Scales, 3};
+            }
+            if (name == PROP_ORIENTATION) {
+                return PackedPropInfo{RadPackedKind::Rotation, 3};
+            }
+            if (name == PROP_SH1) {
+                return PackedPropInfo{RadPackedKind::Sh1, 9};
+            }
+            if (name == PROP_SH2) {
+                return PackedPropInfo{RadPackedKind::Sh2, 15};
+            }
+            if (name == PROP_SH3) {
+                return PackedPropInfo{RadPackedKind::Sh3, 21};
+            }
+            return std::nullopt;
+        }
+
+        struct PackedEncodingInfo {
+            RadPackedEncoding encoding;
+            bool delta;
+        };
+
+        std::optional<PackedEncodingInfo> packed_encoding_info(const std::string& encoding) {
+            if (encoding == "f32") {
+                return PackedEncodingInfo{RadPackedEncoding::F32, false};
+            }
+            if (encoding == "f32_lebytes") {
+                return PackedEncodingInfo{RadPackedEncoding::F32LeBytes, false};
+            }
+            if (encoding == "f16") {
+                return PackedEncodingInfo{RadPackedEncoding::F16, false};
+            }
+            if (encoding == "f16_lebytes") {
+                return PackedEncodingInfo{RadPackedEncoding::F16LeBytes, false};
+            }
+            if (encoding == "r8") {
+                return PackedEncodingInfo{RadPackedEncoding::R8, false};
+            }
+            if (encoding == "r8_delta") {
+                return PackedEncodingInfo{RadPackedEncoding::R8, true};
+            }
+            if (encoding == "s8") {
+                return PackedEncodingInfo{RadPackedEncoding::S8, false};
+            }
+            if (encoding == "s8_delta") {
+                return PackedEncodingInfo{RadPackedEncoding::S8, true};
+            }
+            if (encoding == "ln_0r8") {
+                return PackedEncodingInfo{RadPackedEncoding::Ln0R8, false};
+            }
+            if (encoding == "ln_f16") {
+                return PackedEncodingInfo{RadPackedEncoding::LnF16, false};
+            }
+            if (encoding == "oct88r8") {
+                return PackedEncodingInfo{RadPackedEncoding::Oct88R8, false};
+            }
+            return std::nullopt;
+        }
+
+    } // namespace
+
+    std::expected<RadPagePackedDesc, std::string> decode_rad_chunk_packed(
+        const std::span<const std::uint8_t> data,
+        const int fallback_max_sh,
+        bool lod_opacity_encoded,
+        const std::size_t dst_capacity,
+        const lfs::core::SplatLodTree::NodeMetaView& meta_view,
+        const std::uint32_t chunk,
+        const std::span<std::uint8_t> dst) {
+        static_assert(std::is_trivially_copyable_v<RadPagePackedDesc>);
+
+        auto parsed = parse_rad_chunk_header(data.data(), data.size());
+        if (!parsed) {
+            return std::unexpected(parsed.error());
+        }
+        const RadChunkMeta& chunk_meta = parsed->meta;
+        if (chunk_meta.splat_encoding.has_value() && chunk_meta.splat_encoding->is_object()) {
+            const auto it = chunk_meta.splat_encoding->find("lodOpacity");
+            if (it != chunk_meta.splat_encoding->end() && it->is_boolean()) {
+                lod_opacity_encoded = it->get<bool>();
+            }
+        }
+        const int max_sh = std::clamp(chunk_meta.max_sh > 0 ? chunk_meta.max_sh : fallback_max_sh, 0, 3);
+        const int sh_coeffs = max_sh > 0 ? SH_COEFFS_FOR_DEGREE[max_sh] : 0;
+        const std::size_t count = static_cast<std::size_t>(chunk_meta.count);
+        if (count == 0 || count > dst_capacity) {
+            return std::unexpected(std::format(
+                "RAD chunk holds {} splats, destination capacity is {}", count, dst_capacity));
+        }
+
+        RadPagePackedDesc desc{};
+        desc.count = static_cast<std::uint32_t>(count);
+        desc.sh_coeffs_rest = static_cast<std::uint32_t>(sh_coeffs);
+        desc.lod_opacity = lod_opacity_encoded ? 1u : 0u;
+        desc.chunk = chunk;
+
+        std::size_t cursor = 0;
+        const auto alloc_plane = [&](const std::size_t bytes) -> std::optional<std::size_t> {
+            const std::size_t at = (cursor + 15u) & ~std::size_t{15u};
+            if (at + bytes > dst.size()) {
+                return std::nullopt;
+            }
+            cursor = at + bytes;
+            return at;
+        };
+
+        std::uint32_t seen_kinds = 0;
+        for (const auto& prop : chunk_meta.properties) {
+            if (prop.property == PROP_CHILD_COUNT || prop.property == PROP_CHILD_START) {
+                continue; // tree links come from the sidecar planes instead
+            }
+            const auto info = packed_prop_info(prop.property);
+            if (!info) {
+                return std::unexpected(std::format(
+                    "RAD property '{}' is not part of the packed streaming profile", prop.property));
+            }
+            const auto enc = packed_encoding_info(prop.encoding);
+            if (!enc) {
+                return std::unexpected(std::format(
+                    "RAD encoding '{}' for property '{}' is not part of the packed streaming profile",
+                    prop.encoding, prop.property));
+            }
+            const std::uint32_t kind_bit = 1u << static_cast<std::uint32_t>(info->kind);
+            if ((seen_kinds & kind_bit) != 0u) {
+                return std::unexpected(std::format("Duplicate RAD property '{}'", prop.property));
+            }
+            seen_kinds |= kind_bit;
+            if (desc.property_count >= kRadPackedMaxProps) {
+                return std::unexpected("RAD chunk exceeds packed property limit");
+            }
+
+            const std::size_t plane_bytes =
+                rad_property_decoded_bytes(prop.property, prop.encoding, count);
+            if (plane_bytes == 0) {
+                return std::unexpected(std::format(
+                    "Cannot size RAD property '{}' ({})", prop.property, prop.encoding));
+            }
+            const auto plane_offset = alloc_plane(plane_bytes);
+            if (!plane_offset) {
+                return std::unexpected("RAD packed staging slot too small for chunk planes");
+            }
+
+            const std::size_t prop_bytes = static_cast<std::size_t>(prop.bytes);
+            const std::size_t absolute_offset =
+                parsed->has_payload_prefix
+                    ? parsed->payload_start + static_cast<std::size_t>(prop.offset)
+                    : static_cast<std::size_t>(prop.offset);
+            if (absolute_offset + prop_bytes > parsed->chunk_end || absolute_offset + prop_bytes > data.size()) {
+                return std::unexpected("RAD chunk property data exceeds file bounds");
+            }
+
+            std::uint8_t* const plane = dst.data() + *plane_offset;
+            const bool compressed =
+                prop.compression.has_value() &&
+                (prop.compression.value() == "gz" || prop.compression.value() == "gzip");
+            if (compressed) {
+                if (!rad_decompress_into(&data[absolute_offset], prop_bytes, plane, plane_bytes)) {
+                    return std::unexpected(std::format(
+                        "Failed to decompress RAD chunk property: {}", prop.property));
+                }
+            } else {
+                if (prop_bytes != plane_bytes) {
+                    return std::unexpected(std::format(
+                        "RAD property '{}' size mismatch: {} bytes on disk, {} expected",
+                        prop.property, prop_bytes, plane_bytes));
+                }
+                std::memcpy(plane, &data[absolute_offset], plane_bytes);
+            }
+            if (enc->delta) {
+                undelta_planes_u8(plane, info->dims, count);
+            }
+
+            auto& out = desc.props[desc.property_count++];
+            out.kind = static_cast<std::uint32_t>(info->kind);
+            out.encoding = static_cast<std::uint32_t>(enc->encoding);
+            out.plane_offset = static_cast<std::uint32_t>(*plane_offset);
+            out.plane_bytes = static_cast<std::uint32_t>(plane_bytes);
+            out.min_val = prop.min_val.value_or(0.0f);
+            out.max_val = info->kind == RadPackedKind::Scales
+                              ? prop.max_val.value_or(prop.scale.value_or(1.0f))
+                              : prop.max_val.value_or(1.0f);
+            out.base = prop.base.value_or(0.0f);
+            out.scale = prop.scale.value_or(1.0f);
+        }
+
+        if (meta_view.valid() && chunk < meta_view.chunk_count) {
+            const std::size_t logical_start =
+                static_cast<std::size_t>(chunk) * lfs::core::SplatLodTree::kChunkSplats;
+            if (logical_start < meta_view.node_count) {
+                const std::size_t run = std::min(lfs::core::SplatLodTree::kChunkSplats,
+                                                 meta_view.node_count - logical_start);
+                const auto bounds_offset = alloc_plane(run * sizeof(lfs::core::RadMetaBoundsQ));
+                const auto links_offset = alloc_plane(run * sizeof(lfs::core::RadMetaLinksQ));
+                if (!bounds_offset || !links_offset) {
+                    return std::unexpected("RAD packed staging slot too small for sidecar planes");
+                }
+                std::memcpy(dst.data() + *bounds_offset, meta_view.bounds + logical_start,
+                            run * sizeof(lfs::core::RadMetaBoundsQ));
+                std::memcpy(dst.data() + *links_offset, meta_view.links + logical_start,
+                            run * sizeof(lfs::core::RadMetaLinksQ));
+                desc.meta_bounds_offset = static_cast<std::uint32_t>(*bounds_offset);
+                desc.meta_links_offset = static_cast<std::uint32_t>(*links_offset);
+                desc.meta_node_count = static_cast<std::uint32_t>(run);
+
+                const auto& record = meta_view.chunks[chunk];
+                desc.frame.bbox_min[0] = record.bbox_min[0];
+                desc.frame.bbox_min[1] = record.bbox_min[1];
+                desc.frame.bbox_min[2] = record.bbox_min[2];
+                desc.frame.bbox_extent[0] = record.bbox_extent[0];
+                desc.frame.bbox_extent[1] = record.bbox_extent[1];
+                desc.frame.bbox_extent[2] = record.bbox_extent[2];
+                desc.frame.log_size_min = record.log_size_min;
+                desc.frame.log_size_range = record.log_size_range;
+            }
+        }
+
+        desc.used_bytes = static_cast<std::uint32_t>(cursor);
+        return desc;
     }
 
     std::expected<RadDecodedChunk, std::string> load_rad_chunk(

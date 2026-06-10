@@ -75,28 +75,75 @@ namespace {
                 .meta_base = meta_base,
                 .meta_bounds_offset = 0,
                 .meta_links_offset = meta_links_offset,
+                .meta_capacity_nodes = splat_capacity,
             };
         }
     };
 
-    // Packs a recognizable page into an acquired slot and submits it.
+    // Builds a packed slot the way decode_rad_chunk_packed lays one out
+    // (f32 means + f32 alpha planes, dimension-major, plus sidecar links)
+    // and submits it through the dequant kernel.
     void packAndSubmit(LodUploadEngine& engine,
                        const std::uint32_t page,
                        const std::uint32_t chunk,
                        const std::size_t count) {
         auto* const slot = engine.acquireStagingSlot();
         ASSERT_NE(slot, nullptr);
-        const auto staging = engine.stagingLayout();
-        auto* const means = reinterpret_cast<float*>(slot->data + staging.means);
-        std::iota(means, means + count * 3u, static_cast<float>(chunk) * 1000.0f);
-        auto* const opacity = reinterpret_cast<float*>(slot->data + staging.opacity);
-        std::iota(opacity, opacity + count, static_cast<float>(chunk));
-        auto* const links =
-            reinterpret_cast<lfs::core::NodeLinksRecord*>(slot->data + staging.meta_links);
-        for (std::size_t i = 0; i < kPageSplats; ++i) {
-            links[i] = {.child_start = chunk, .packed = 0, .parent = 0, .logical = static_cast<std::uint32_t>(i)};
+
+        lfs::io::RadPagePackedDesc desc{};
+        desc.count = static_cast<std::uint32_t>(count);
+        desc.lod_opacity = 1;
+        desc.chunk = chunk;
+
+        std::size_t cursor = 0;
+        const auto alloc_plane = [&](const std::size_t bytes) {
+            const std::size_t at = (cursor + 15u) & ~std::size_t{15u};
+            cursor = at + bytes;
+            return at;
+        };
+
+        const std::size_t means_offset = alloc_plane(count * 3u * sizeof(float));
+        auto* const means = reinterpret_cast<float*>(slot->data + means_offset);
+        for (std::size_t d = 0; d < 3u; ++d) {
+            for (std::size_t i = 0; i < count; ++i) {
+                means[d * count + i] =
+                    static_cast<float>(chunk) * 1000.0f + static_cast<float>(i * 3u + d);
+            }
         }
-        engine.submitPackedPage(slot, page, chunk, 1, count);
+        desc.props[desc.property_count++] = {
+            .kind = static_cast<std::uint32_t>(lfs::io::RadPackedKind::Means),
+            .encoding = static_cast<std::uint32_t>(lfs::io::RadPackedEncoding::F32),
+            .plane_offset = static_cast<std::uint32_t>(means_offset),
+            .plane_bytes = static_cast<std::uint32_t>(count * 3u * sizeof(float)),
+        };
+
+        const std::size_t alpha_offset = alloc_plane(count * sizeof(float));
+        auto* const alpha = reinterpret_cast<float*>(slot->data + alpha_offset);
+        std::iota(alpha, alpha + count, static_cast<float>(chunk));
+        desc.props[desc.property_count++] = {
+            .kind = static_cast<std::uint32_t>(lfs::io::RadPackedKind::Alpha),
+            .encoding = static_cast<std::uint32_t>(lfs::io::RadPackedEncoding::F32),
+            .plane_offset = static_cast<std::uint32_t>(alpha_offset),
+            .plane_bytes = static_cast<std::uint32_t>(count * sizeof(float)),
+        };
+
+        const std::size_t bounds_offset =
+            alloc_plane(kPageSplats * sizeof(lfs::core::RadMetaBoundsQ));
+        std::memset(slot->data + bounds_offset, 0,
+                    kPageSplats * sizeof(lfs::core::RadMetaBoundsQ));
+        const std::size_t links_offset =
+            alloc_plane(kPageSplats * sizeof(lfs::core::RadMetaLinksQ));
+        auto* const links =
+            reinterpret_cast<lfs::core::RadMetaLinksQ*>(slot->data + links_offset);
+        for (std::size_t i = 0; i < kPageSplats; ++i) {
+            links[i] = {.child_start = chunk, .packed = 0, .parent = 0};
+        }
+        desc.meta_bounds_offset = static_cast<std::uint32_t>(bounds_offset);
+        desc.meta_links_offset = static_cast<std::uint32_t>(links_offset);
+        desc.meta_node_count = static_cast<std::uint32_t>(kPageSplats);
+        desc.used_bytes = static_cast<std::uint32_t>(cursor);
+
+        engine.submitPackedPage(slot, desc, page, 1);
     }
 
     std::vector<LodPageCache::PendingUpload> collectAll(LodUploadEngine& engine,
@@ -147,7 +194,8 @@ namespace {
                   cudaSuccess);
         for (std::size_t i = 0; i < links.size(); ++i) {
             EXPECT_EQ(links[i].child_start, 7u);
-            EXPECT_EQ(links[i].logical, i);
+            // The kernel derives `logical` as chunk * page_splats + offset.
+            EXPECT_EQ(links[i].logical, 7u * kPageSplats + i);
         }
     }
 

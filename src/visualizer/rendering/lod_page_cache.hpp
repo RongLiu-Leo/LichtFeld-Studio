@@ -131,13 +131,23 @@ namespace lfs::vis {
         };
         struct DecodeScheduler;
 
+        // Admission outcome, kept distinct per refusal so the perf log can
+        // tell a frozen pool (margin/no-slot) from normal flow control.
+        enum class AdmitResult : std::uint8_t {
+            Admitted,
+            AlreadyActive,
+            NoSlot,
+            MarginRefused,
+            Invalid,
+        };
+
         void submitInternal(std::span<const ChunkRequest> requests,
                             std::span<const std::uint32_t> protected_chunks,
                             bool stamp_resident_requests);
-        bool requestResident(std::uint32_t chunk,
-                             bool pin,
-                             std::uint32_t priority,
-                             std::span<const std::uint8_t> protected_pages = {});
+        AdmitResult requestResident(std::uint32_t chunk,
+                                    bool pin,
+                                    std::uint32_t priority,
+                                    std::span<const std::uint8_t> protected_pages = {});
         [[nodiscard]] std::size_t chooseEvictionSlot(
             std::span<const std::uint8_t> protected_pages = {}) const;
         void reserveUpload(std::size_t page, std::uint32_t chunk, bool pin, std::uint32_t priority);
@@ -161,6 +171,7 @@ namespace lfs::vis {
         std::size_t root_chunk_count_ = 0;
         std::size_t page_payload_bytes_ = 0;
         std::size_t deferred_requests_ = 0;
+        std::uint64_t last_admission_log_frame_ = 0;
     };
 
 } // namespace lfs::vis
