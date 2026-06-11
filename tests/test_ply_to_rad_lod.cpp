@@ -409,8 +409,18 @@ TEST(PlyToRadLod, ValidateExternalRad) {
         ASSERT_EQ(chunk->count, range.count);
         for (std::size_t i = 0; i < chunk->count; ++i) {
             const std::size_t node = chunk->base + i;
-            ASSERT_EQ(chunk->means[i * 3 + 0], tree.center_at(node).x)
-                << "chunk/tree center mismatch at node " << node;
+            if (tree.meta_view.valid()) {
+                // Out-of-core centers dequantize from the sidecar's u16
+                // boundsQ against the chunk AABB; exactness ends there.
+                const auto& frame =
+                    tree.meta_view.chunks[node / lfs::core::SplatLodTree::kChunkSplats];
+                const float tol = frame.bbox_extent[0] / 65535.0f + 1e-6f;
+                ASSERT_NEAR(chunk->means[i * 3 + 0], tree.center_at(node).x, tol)
+                    << "chunk/tree center mismatch at node " << node;
+            } else {
+                ASSERT_EQ(chunk->means[i * 3 + 0], tree.center_at(node).x)
+                    << "chunk/tree center mismatch at node " << node;
+            }
         }
     }
 }
