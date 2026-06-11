@@ -3484,6 +3484,11 @@ namespace lfs::io {
     // ============================================================================
 
     std::expected<SplatData, std::string> load_rad(const std::filesystem::path& filepath) {
+        return load_rad(filepath, RadLoadOverrides{});
+    }
+
+    std::expected<SplatData, std::string> load_rad(const std::filesystem::path& filepath,
+                                                   const RadLoadOverrides& overrides) {
         auto start = std::chrono::high_resolution_clock::now();
 
         LOG_INFO("Loading RAD file: {}", lfs::core::path_to_utf8(filepath));
@@ -3504,25 +3509,13 @@ namespace lfs::io {
                 const std::size_t payload_bytes =
                     N * (56 + static_cast<std::size_t>(sh_coeffs) * 12);
                 const std::size_t tree_bytes = N * 23;
-                bool out_of_core = false;
-                if (const char* const env = std::getenv("LFS_RAD_OOC");
-                    env != nullptr && env[0] != '\0') {
-                    out_of_core = env[0] != '0';
-                } else {
-                    out_of_core = payload_bytes + tree_bytes >
-                                  available_host_memory_bytes() / 2;
-                }
+                const bool out_of_core = overrides.out_of_core.value_or(
+                    payload_bytes + tree_bytes > available_host_memory_bytes() / 2);
                 if (out_of_core) {
-                    std::size_t preview = 2048 * CHUNK_SIZE;
-                    if (const char* const env = std::getenv("LFS_RAD_PREVIEW_SPLATS");
-                        env != nullptr && env[0] != '\0') {
-                        try {
-                            preview = std::max<std::size_t>(std::stoull(env), 1);
-                        } catch (...) {
-                        }
-                    }
-                    // Chunk-aligned so every chunk is either fully resident or
-                    // tree-only.
+                    // Chunk count keeps the preview a clean prefix; every
+                    // chunk is either fully resident or tree-only.
+                    std::size_t preview =
+                        overrides.preview_splats.value_or(2048 * CHUNK_SIZE);
                     preview = ((preview + CHUNK_SIZE - 1) / CHUNK_SIZE) * CHUNK_SIZE;
                     payload_count = std::min<std::size_t>(N, preview);
                     LOG_INFO("RAD out-of-core load: {} nodes, keeping {} resident "
@@ -5022,16 +5015,6 @@ namespace lfs::io {
         if (logical_chunks <= 1) {
             return false;
         }
-        if (const char* const env = std::getenv("LFS_LOD_PAGE_CAPACITY");
-            env != nullptr && env[0] != '\0') {
-            try {
-                const std::size_t requested = static_cast<std::size_t>(std::stoull(env));
-                return std::clamp(requested, std::size_t{1}, logical_chunks) < logical_chunks;
-            } catch (...) {
-                return false;
-            }
-        }
-
         std::size_t free_bytes = 0;
         std::size_t total_bytes = 0;
         if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess || free_bytes == 0) {

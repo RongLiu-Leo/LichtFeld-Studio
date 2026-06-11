@@ -289,10 +289,6 @@ namespace lfs::app {
         // much faster (parallel subtrees, small merge neighborhoods), and it
         // is mandatory once the workset would not fit in RAM.
         bool shouldStreamLodConvert(const std::filesystem::path& input) {
-            if (const char* const env = std::getenv("LFS_RAD_STREAM_LOD");
-                env != nullptr && env[0] != '\0') {
-                return env[0] != '0';
-            }
             const auto info = lfs::io::probe_ply_gaussians(input);
             if (!info) {
                 return false;

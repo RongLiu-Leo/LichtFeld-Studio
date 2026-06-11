@@ -84,15 +84,6 @@ namespace lfs::vis {
             if (logical_chunks == 0 || splat_data.has_deleted_mask()) {
                 return logical_chunks;
             }
-            const char* const env = std::getenv("LFS_LOD_PAGE_CAPACITY");
-            if (env != nullptr && env[0] != '\0') {
-                try {
-                    const std::size_t requested = static_cast<std::size_t>(std::stoull(env));
-                    return std::clamp(requested, std::size_t{1}, logical_chunks);
-                } catch (...) {
-                    return logical_chunks;
-                }
-            }
             const bool rad_backed = splat_data.lod_tree && splat_data.lod_tree->rad_source.valid();
             const bool host_resident_leaves =
                 rad_backed && splat_data.means_raw().device() != lfs::core::Device::CUDA;
@@ -128,8 +119,8 @@ namespace lfs::vis {
                                       std::min(kMinPoolPages, logical_chunks),
                                       logical_chunks);
                 }
-                constexpr std::size_t kOutOfCoreFallbackPages = 8192;
-                return std::min(kOutOfCoreFallbackPages, logical_chunks);
+                LOG_ERROR("LOD pool sizing: cudaMemGetInfo failed; using minimum pool");
+                return std::min(kMinPoolPages, logical_chunks);
             }
             if (!host_resident_leaves || pool_budget_splats == 0) {
                 // Models whose tensors already live in VRAM (non-RAD, or RAD
@@ -1793,7 +1784,11 @@ namespace lfs::vis {
             lod_page_cache_.snapshot().physical_pages != physical_pages;
         if (needs_configure) {
             lod_page_cache_model_ = &splat_data;
-            lod_page_cache_.configure(logical_chunks, physical_pages, 1, lodPageDeviceBytes(splat_data));
+            const bool disk_backed =
+                splat_data.lod_tree && splat_data.lod_tree->rad_source.valid() &&
+                splat_data.lod_tree->meta_view.valid();
+            lod_page_cache_.configure(logical_chunks, physical_pages, 1,
+                                      lodPageDeviceBytes(splat_data), disk_backed);
             LOG_INFO("LOD page cache configured: logical_chunks={} physical_pages={} partial={} rad_source={}",
                      logical_chunks,
                      physical_pages,

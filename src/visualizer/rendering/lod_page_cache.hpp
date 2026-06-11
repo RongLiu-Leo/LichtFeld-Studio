@@ -65,10 +65,13 @@ namespace lfs::vis {
         LodPageCache& operator=(const LodPageCache&) = delete;
 
         void reset();
+        // disk_backed: pages stream from the RAD file; never pre-publish,
+        // even at full capacity (only a preview prefix is loaded).
         void configure(std::size_t logical_chunk_count,
                        std::size_t physical_page_capacity,
                        std::size_t root_chunk_count = 1,
-                       std::size_t page_payload_bytes = 0);
+                       std::size_t page_payload_bytes = 0,
+                       bool disk_backed = false);
         void setRadSource(const lfs::core::SplatLodTree::RadSource* source,
                           int max_sh_degree,
                           bool lod_opacity_encoded);
@@ -190,6 +193,7 @@ namespace lfs::vis {
         std::uint64_t frame_ = 0;
         std::uint64_t protect_window_frames_ = kDefaultProtectWindowFrames;
         std::size_t root_chunk_count_ = 0;
+        bool disk_backed_ = false;
         std::size_t page_payload_bytes_ = 0;
         std::size_t deferred_requests_ = 0;
         std::size_t admitted_requests_ = 0;

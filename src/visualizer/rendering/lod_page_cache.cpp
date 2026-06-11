@@ -23,27 +23,9 @@
 namespace lfs::vis {
     namespace {
 
-        std::size_t envCount(const char* const name, const std::size_t fallback) {
-            if (const char* const env = std::getenv(name)) {
-                char* end = nullptr;
-                const auto parsed = std::strtoull(env, &end, 10);
-                if (end != env && parsed > 0) {
-                    return static_cast<std::size_t>(parsed);
-                }
-            }
-            return fallback;
-        }
-
         std::size_t pageRequestBudgetFor(const std::size_t physical_pages) {
             if (physical_pages == 0) {
                 return 0;
-            }
-            if (const char* const env = std::getenv("LFS_LOD_PREFETCH_MAX_REQUESTS")) {
-                char* end = nullptr;
-                const auto parsed = std::strtoull(env, &end, 10);
-                if (end != env && parsed > 0) {
-                    return std::min<std::size_t>(static_cast<std::size_t>(parsed), physical_pages);
-                }
             }
             const std::size_t lower = std::min<std::size_t>(8, physical_pages);
             const std::size_t upper = std::min<std::size_t>(64, physical_pages);
@@ -52,12 +34,11 @@ namespace lfs::vis {
 
         std::size_t decodeWorkerCount() {
             const std::size_t hw = std::max<std::size_t>(std::thread::hardware_concurrency(), 1);
-            return envCount("LFS_LOD_DECODE_THREADS", std::clamp<std::size_t>(hw / 2, 2, 8));
+            return std::clamp<std::size_t>(hw / 2, 2, 8);
         }
 
-        std::size_t staleRequestFrames() {
-            return envCount("LFS_LOD_STALE_REQUEST_FRAMES", 8);
-        }
+        constexpr std::size_t kStaleRequestFrames = 8;
+        std::size_t staleRequestFrames() { return kStaleRequestFrames; }
 
     } // namespace
 
@@ -265,13 +246,15 @@ namespace lfs::vis {
     void LodPageCache::configure(const std::size_t logical_chunk_count,
                                  std::size_t physical_page_capacity,
                                  const std::size_t root_chunk_count,
-                                 const std::size_t page_payload_bytes) {
+                                 const std::size_t page_payload_bytes,
+                                 const bool disk_backed) {
         reset();
         if (logical_chunk_count == 0) {
             return;
         }
-        protect_window_frames_ = envCount("LFS_LOD_PROTECT_WINDOW", kDefaultProtectWindowFrames);
+        protect_window_frames_ = kDefaultProtectWindowFrames;
         page_payload_bytes_ = page_payload_bytes;
+        disk_backed_ = disk_backed;
 
         if (physical_page_capacity == 0 || physical_page_capacity > logical_chunk_count) {
             physical_page_capacity = logical_chunk_count;
@@ -287,11 +270,12 @@ namespace lfs::vis {
         const std::size_t pinned_roots = std::min(root_chunk_count, logical_chunk_count);
         root_chunk_count_ = pinned_roots;
 
-        // Full-capacity native loads retain the current all-resident behavior and
-        // still exercise the same maps used by paged RAD streaming. Partial
-        // (streaming) caches bootstrap their pinned roots in beginFrame() once
-        // the RAD source and page sink are installed.
-        if (physical_page_capacity == logical_chunk_count) {
+        // Full-capacity TENSOR-backed pools pre-publish everything: their
+        // uploads cover all pages from resident tensors. Disk-backed pools
+        // must stream regardless of capacity - only a preview prefix exists
+        // in memory, so pre-publishing would tell the selector chunks are
+        // resident that no upload will ever fill.
+        if (!disk_backed_ && physical_page_capacity == logical_chunk_count) {
             for (std::uint32_t chunk = 0; chunk < logical_chunk_count; ++chunk) {
                 const bool pin = chunk < pinned_roots;
                 const std::size_t page = chooseEvictionSlot();
@@ -333,7 +317,8 @@ namespace lfs::vis {
     }
 
     void LodPageCache::ensureRootResidency() {
-        if (pages_.empty() || snapshot_.physical_pages >= snapshot_.logical_chunks) {
+        if (pages_.empty() ||
+            (!disk_backed_ && snapshot_.physical_pages >= snapshot_.logical_chunks)) {
             return;
         }
         for (std::uint32_t chunk = 0;
@@ -626,13 +611,6 @@ namespace lfs::vis {
     std::size_t LodPageCache::requestBudgetPages() const {
         if (page_payload_bytes_ == 0) {
             return pageRequestBudgetFor(pages_.size());
-        }
-        if (const char* const env = std::getenv("LFS_LOD_PREFETCH_MAX_REQUESTS")) {
-            char* end = nullptr;
-            const auto parsed = std::strtoull(env, &end, 10);
-            if (end != env && parsed > 0) {
-                return std::min<std::size_t>(static_cast<std::size_t>(parsed), pages_.size());
-            }
         }
         // Decode workers (≤8) starve when the queue runs dry, so the depth
         // must track page size: smaller pages decode proportionally faster.

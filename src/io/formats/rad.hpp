@@ -12,6 +12,7 @@
 #include <expected>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -77,8 +78,16 @@ namespace lfs::io {
         std::uint32_t chunk,
         std::span<std::uint8_t> dst);
 
-    // Load RAD (Random Access Dynamic) format - chunked hierarchical Gaussian splat format
+    // Load RAD (Random Access Dynamic) format - chunked hierarchical Gaussian splat format.
+    // Overrides exist for deterministic tests; production callers use the
+    // heuristics (out-of-core when the workset exceeds half of available RAM).
+    struct RadLoadOverrides {
+        std::optional<bool> out_of_core;
+        std::optional<std::size_t> preview_splats;
+    };
     std::expected<SplatData, std::string> load_rad(const std::filesystem::path& filepath);
+    std::expected<SplatData, std::string> load_rad(const std::filesystem::path& filepath,
+                                                   const RadLoadOverrides& overrides);
     std::expected<RadDecodedChunk, std::string> load_rad_chunk(
         const std::filesystem::path& filepath,
         const lfs::core::SplatLodTree::ChunkFileRange& range,

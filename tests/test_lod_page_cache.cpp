@@ -361,6 +361,23 @@ namespace {
         EXPECT_EQ(uploads[2].chunk, 30u);
     }
 
+    TEST(LodPageCache, DiskBackedFullCapacityStillStreams) {
+        // Out-of-core RAD whose chunk count fits the pool entirely: only a
+        // preview prefix is loaded, so nothing may be pre-published and the
+        // roots must bootstrap through the normal streaming path.
+        LodPageCache cache;
+        cache.configure(64, 64, 2, 1024, /*disk_backed=*/true);
+        EXPECT_EQ(cache.snapshot().resident_chunks, 0u);
+
+        cache.ensureRootResidency();
+        const auto uploads = cache.drainPendingUploads();
+        ASSERT_EQ(uploads.size(), 2u);
+        EXPECT_EQ(uploads[0].chunk, 0u);
+        EXPECT_EQ(uploads[1].chunk, 1u);
+        cache.completeUploads(uploads);
+        EXPECT_EQ(cache.snapshot().resident_chunks, 2u);
+    }
+
     TEST(LodPageCache, UploadDrainHonorsByteBudget) {
         LodPageCache cache;
         constexpr std::size_t kPageBytes = 1024;

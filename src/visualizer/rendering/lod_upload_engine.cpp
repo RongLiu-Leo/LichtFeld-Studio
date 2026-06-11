@@ -21,13 +21,6 @@ namespace lfs::vis {
         constexpr std::size_t kPageSplats = LodPageCache::kChunkSplats;
 
         std::size_t stagingRingDepth() {
-            if (const char* const env = std::getenv("LFS_LOD_STAGING_SLOTS")) {
-                char* end = nullptr;
-                const auto parsed = std::strtoull(env, &end, 10);
-                if (end != env && parsed > 0) {
-                    return static_cast<std::size_t>(parsed);
-                }
-            }
             const std::size_t hw = std::max<std::size_t>(std::thread::hardware_concurrency(), 1);
             return std::max<std::size_t>(8, std::clamp<std::size_t>(hw / 2, 2, 8) + 2);
         }

@@ -271,11 +271,8 @@ TEST(PlyToRadLod, OutOfCoreLoadKeepsTreeAndStreamsChunks) {
     ASSERT_TRUE(full.has_value()) << full.error();
     const auto total_nodes = full->lod_tree->total_nodes();
 
-    setenv("LFS_RAD_OOC", "1", 1);
-    setenv("LFS_RAD_PREVIEW_SPLATS", "131072", 1);
-    auto partial = lfs::io::load_rad(rad_path);
-    unsetenv("LFS_RAD_OOC");
-    unsetenv("LFS_RAD_PREVIEW_SPLATS");
+    auto partial = lfs::io::load_rad(
+        rad_path, {.out_of_core = true, .preview_splats = 131072});
     ASSERT_TRUE(partial.has_value()) << partial.error();
 
     // Tree metadata covers all nodes; payload tensors hold the coarse prefix.
