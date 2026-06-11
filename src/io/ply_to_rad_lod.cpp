@@ -10,6 +10,7 @@
 #include "core/splat_data.hpp"
 #include "core/tensor.hpp"
 #include "formats/rad.hpp"
+#include "formats/rad_dequant_math.hpp"
 
 #include <tbb/blocked_range.h>
 #include <tbb/enumerable_thread_specific.h>
@@ -60,8 +61,6 @@ namespace lfs::io {
     namespace {
 
         constexpr float SH_C0 = 0.28209479177387814f;
-        // Pack-domain node payload: means3, rgb3, alpha, scales3, rot4.
-        constexpr std::size_t kBaseNodeFloats = 14;
         constexpr std::size_t kChunkSplats = lfs::core::SplatLodTree::kChunkSplats;
         constexpr int kCellBitsPerAxis = 8;
         constexpr std::size_t kCellsPerAxis = std::size_t{1} << kCellBitsPerAxis;
@@ -416,6 +415,26 @@ namespace lfs::io {
             return std::fread(data, 1, bytes, f) == bytes;
         }
 
+        // Scratch files quantize everything except positions and tree links:
+        // f16 is strictly finer than the 8-bit encodings the final RAD encode
+        // applies to color/alpha/scales/SH, and rotations use the file's own
+        // oct88r8 grid, so scratch roundtrips cost no extra output precision.
+        inline void put_f16(std::uint8_t* const dst, const float v) {
+            const std::uint16_t h = radmath::floatToHalf(v);
+            std::memcpy(dst, &h, sizeof(h));
+        }
+
+        inline float get_f16(const std::uint8_t* const src) {
+            std::uint16_t h;
+            std::memcpy(&h, src, sizeof(h));
+            return radmath::halfToFloat(h);
+        }
+
+        // Raw scatter records: positions f32x3, every other field f16.
+        std::size_t scatter_record_bytes(const std::size_t record_floats) {
+            return 3 * sizeof(float) + (record_floats - 3) * sizeof(std::uint16_t);
+        }
+
         // ====================================================================
         // Per-bucket subtree build
         // ====================================================================
@@ -593,8 +612,11 @@ namespace lfs::io {
             return nodes;
         }
 
+        // means f32x3 | rgb f16x3 | alpha f16 | scales f16x3 | rot oct88r8 |
+        // shN f16 | child_count u16 | child_start u32.
         std::size_t bucket_node_record_bytes(const int rest_coeffs) {
-            return (kBaseNodeFloats + static_cast<std::size_t>(rest_coeffs) * 3) * sizeof(float) +
+            return 3 * sizeof(float) + (3 + 1 + 3) * sizeof(std::uint16_t) + 3 +
+                   static_cast<std::size_t>(rest_coeffs) * 3 * sizeof(std::uint16_t) +
                    sizeof(std::uint16_t) + sizeof(std::uint32_t);
         }
 
@@ -618,14 +640,23 @@ namespace lfs::io {
                     const std::size_t i = first + k;
                     std::uint8_t* rec = buffer.data() + k * record_bytes;
                     std::memcpy(rec, nodes.means.data() + i * 3, 3 * sizeof(float));
-                    std::memcpy(rec + 12, nodes.rgb.data() + i * 3, 3 * sizeof(float));
-                    std::memcpy(rec + 24, &nodes.alpha[i], sizeof(float));
-                    std::memcpy(rec + 28, nodes.scales.data() + i * 3, 3 * sizeof(float));
-                    std::memcpy(rec + 40, nodes.rotation.data() + i * 4, 4 * sizeof(float));
-                    std::size_t off = 56;
-                    if (sh_floats > 0) {
-                        std::memcpy(rec + off, nodes.shN.data() + i * sh_floats, sh_floats * sizeof(float));
-                        off += sh_floats * sizeof(float);
+                    std::size_t off = 12;
+                    for (int d = 0; d < 3; ++d, off += 2) {
+                        put_f16(rec + off, nodes.rgb[i * 3 + d]);
+                    }
+                    put_f16(rec + off, nodes.alpha[i]);
+                    off += 2;
+                    for (int d = 0; d < 3; ++d, off += 2) {
+                        put_f16(rec + off, nodes.scales[i * 3 + d]);
+                    }
+                    radmath::quantQuatOct88R8(nodes.rotation[i * 4 + 1],
+                                              nodes.rotation[i * 4 + 2],
+                                              nodes.rotation[i * 4 + 3],
+                                              nodes.rotation[i * 4 + 0],
+                                              rec + off);
+                    off += 3;
+                    for (std::size_t s = 0; s < sh_floats; ++s, off += 2) {
+                        put_f16(rec + off, nodes.shN[i * sh_floats + s]);
                     }
                     std::memcpy(rec + off, &nodes.child_count[i], sizeof(std::uint16_t));
                     std::memcpy(rec + off + 2, &nodes.child_start[i], sizeof(std::uint32_t));
@@ -660,14 +691,24 @@ namespace lfs::io {
                     for (std::size_t i = range.begin(); i != range.end(); ++i) {
                         const std::uint8_t* rec = buffer.data() + i * record_bytes;
                         std::memcpy(nodes.means.data() + i * 3, rec, 3 * sizeof(float));
-                        std::memcpy(nodes.rgb.data() + i * 3, rec + 12, 3 * sizeof(float));
-                        std::memcpy(&nodes.alpha[i], rec + 24, sizeof(float));
-                        std::memcpy(nodes.scales.data() + i * 3, rec + 28, 3 * sizeof(float));
-                        std::memcpy(nodes.rotation.data() + i * 4, rec + 40, 4 * sizeof(float));
-                        std::size_t off = 56;
-                        if (sh_floats > 0) {
-                            std::memcpy(nodes.shN.data() + i * sh_floats, rec + off, sh_floats * sizeof(float));
-                            off += sh_floats * sizeof(float);
+                        std::size_t off = 12;
+                        for (int d = 0; d < 3; ++d, off += 2) {
+                            nodes.rgb[i * 3 + d] = get_f16(rec + off);
+                        }
+                        nodes.alpha[i] = get_f16(rec + off);
+                        off += 2;
+                        for (int d = 0; d < 3; ++d, off += 2) {
+                            nodes.scales[i * 3 + d] = get_f16(rec + off);
+                        }
+                        float xyzw[4];
+                        radmath::dequantQuatOct88R8(rec[off], rec[off + 1], rec[off + 2], xyzw);
+                        nodes.rotation[i * 4 + 0] = xyzw[3];
+                        nodes.rotation[i * 4 + 1] = xyzw[0];
+                        nodes.rotation[i * 4 + 2] = xyzw[1];
+                        nodes.rotation[i * 4 + 3] = xyzw[2];
+                        off += 3;
+                        for (std::size_t s = 0; s < sh_floats; ++s, off += 2) {
+                            nodes.shN[i * sh_floats + s] = get_f16(rec + off);
                         }
                         std::memcpy(&nodes.child_count[i], rec + off, sizeof(std::uint16_t));
                         std::memcpy(&nodes.child_start[i], rec + off + 2, sizeof(std::uint32_t));
@@ -1153,12 +1194,25 @@ namespace lfs::io {
             });
 
             std::atomic<int> write_errno{0};
+            const std::size_t packed_record_bytes = scatter_record_bytes(record_floats);
             const auto flush_bucket = [&](const std::size_t b, std::vector<float>& buf) {
                 if (buf.empty()) {
                     return;
                 }
+                thread_local std::vector<std::uint8_t> packed;
+                const std::size_t record_count = buf.size() / record_floats;
+                packed.resize(record_count * packed_record_bytes);
+                for (std::size_t r = 0; r < record_count; ++r) {
+                    const float* const src = buf.data() + r * record_floats;
+                    std::uint8_t* const dst = packed.data() + r * packed_record_bytes;
+                    std::memcpy(dst, src, 3 * sizeof(float));
+                    std::size_t off = 12;
+                    for (std::size_t k = 3; k < record_floats; ++k, off += 2) {
+                        put_f16(dst + off, src[k]);
+                    }
+                }
                 std::lock_guard<std::mutex> lock(bucket_mutexes[b]);
-                if (!write_exact(bucket_files[b].get(), buf.data(), buf.size() * sizeof(float))) {
+                if (!write_exact(bucket_files[b].get(), packed.data(), packed.size())) {
                     int expected = 0;
                     write_errno.compare_exchange_strong(expected, errno != 0 ? errno : EIO);
                 }
@@ -1294,10 +1348,21 @@ namespace lfs::io {
                     const std::size_t count = static_cast<std::size_t>(bucket_counts[b]);
                     std::vector<float> records(count * record_floats);
                     {
+                        const std::size_t packed_record_bytes = scatter_record_bytes(record_floats);
+                        std::vector<std::uint8_t> packed(count * packed_record_bytes);
                         FilePtr f(std::fopen(bucket_records_path(b).string().c_str(), "rb"));
-                        if (!f || !read_exact(f.get(), records.data(), records.size() * sizeof(float))) {
+                        if (!f || !read_exact(f.get(), packed.data(), packed.size())) {
                             fail(std::format("failed to read bucket records {}: {}", b, std::strerror(errno)));
                             return;
+                        }
+                        for (std::size_t r = 0; r < count; ++r) {
+                            const std::uint8_t* const src = packed.data() + r * packed_record_bytes;
+                            float* const dst = records.data() + r * record_floats;
+                            std::memcpy(dst, src, 3 * sizeof(float));
+                            std::size_t off = 12;
+                            for (std::size_t k = 3; k < record_floats; ++k, off += 2) {
+                                dst[k] = get_f16(src + off);
+                            }
                         }
                     }
                     std::error_code ec;

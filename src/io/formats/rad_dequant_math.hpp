@@ -204,6 +204,64 @@ namespace lfs::io::radmath {
         out_xyzw[3] = w;
     }
 
+    // Normalized [x,y,z,w] -> octahedral axis (2 bytes) + angle (1 byte).
+    // Same math as the RAD file encoder, so scratch-quantized rotations land
+    // on the grid the final encode would pick anyway.
+    LFS_RAD_HD void quantQuatOct88R8(float x, float y, float z, float w,
+                                     std::uint8_t out[3]) {
+        const float len = std::sqrt(x * x + y * y + z * z + w * w);
+        if (len > 0.0f) {
+            x /= len;
+            y /= len;
+            z /= len;
+            w /= len;
+        }
+        if (w < 0.0f) {
+            x = -x;
+            y = -y;
+            z = -z;
+            w = -w;
+        }
+
+        const float theta = 2.0f * std::acos(clampf(w, -1.0f, 1.0f));
+        const float sin_half_theta = std::sin(theta * 0.5f);
+        float axis_x = 1.0f;
+        float axis_y = 0.0f;
+        float axis_z = 0.0f;
+        if (sin_half_theta > 1e-6f) {
+            axis_x = x / sin_half_theta;
+            axis_y = y / sin_half_theta;
+            axis_z = z / sin_half_theta;
+        }
+        const float axis_len =
+            std::sqrt(axis_x * axis_x + axis_y * axis_y + axis_z * axis_z);
+        if (axis_len > 0.0f) {
+            axis_x /= axis_len;
+            axis_y /= axis_len;
+            axis_z /= axis_len;
+        }
+
+        const float abs_sum = std::fabs(axis_x) + std::fabs(axis_y) + std::fabs(axis_z);
+        float oct_x = axis_x;
+        float oct_y = axis_y;
+        float oct_z = axis_z;
+        if (abs_sum > 0.0f) {
+            const float inv_sum = 1.0f / abs_sum;
+            oct_x *= inv_sum;
+            oct_y *= inv_sum;
+            oct_z *= inv_sum;
+        }
+        if (oct_z < 0.0f) {
+            const float temp_x = oct_x;
+            oct_x = (1.0f - std::fabs(oct_y)) * (oct_x >= 0.0f ? 1.0f : -1.0f);
+            oct_y = (1.0f - std::fabs(temp_x)) * (oct_y >= 0.0f ? 1.0f : -1.0f);
+        }
+
+        out[0] = static_cast<std::uint8_t>(clampf((oct_x + 1.0f) * 0.5f * 255.0f, 0.0f, 255.0f));
+        out[1] = static_cast<std::uint8_t>(clampf((oct_y + 1.0f) * 0.5f * 255.0f, 0.0f, 255.0f));
+        out[2] = static_cast<std::uint8_t>(clampf(theta / kPi * 255.0f, 0.0f, 255.0f));
+    }
+
     // f32/f16 orientation planes store xyz; w is reconstructed.
     LFS_RAD_HD float quatWFromXyz(const float x, const float y, const float z) {
         const float t = 1.0f - x * x - y * y - z * z;
