@@ -6,7 +6,7 @@
 #include "io/formats/rad.hpp"
 #include "io/ply_to_rad_lod.hpp"
 
-#include <gtest/gtest.h>
+#include <gtest/gtest.h>\n\n#include <set>
 
 #include <algorithm>
 #include <array>
@@ -425,6 +425,78 @@ TEST(PlyToRadLod, ValidateExternalRad) {
                 ASSERT_EQ(chunk->means[i * 3 + 0], tree.center_at(node).x)
                     << "chunk/tree center mismatch at node " << node;
             }
+        }
+    }
+}
+
+// Layout audit: simulates view-local cuts straight from the sidecar and
+// reports how many distinct chunks each layout needs. Run with
+// LFS_RAD_AUDIT=<file.rad> against two files to compare layouts.
+TEST(PlyToRadLod, TreeletLayoutAudit) {
+    const char* const target = std::getenv("LFS_RAD_AUDIT");
+    if (target == nullptr) {
+        GTEST_SKIP() << "set LFS_RAD_AUDIT to run";
+    }
+    auto view = lfs::io::open_rad_meta_sidecar(target);
+    ASSERT_TRUE(view.has_value()) << view.error();
+    const std::size_t n = view->node_count;
+    const auto level_of = [&](const std::uint32_t i) {
+        return (view->links[i].packed >> 16u) & 0xffu;
+    };
+    const auto count_of = [&](const std::uint32_t i) {
+        return view->links[i].packed & 0xffffu;
+    };
+    constexpr std::size_t kChunk = lfs::core::SplatLodTree::kChunkSplats;
+
+    for (const std::uint32_t seed_level : {6u, 10u, 14u}) {
+        std::vector<std::uint32_t> seeds;
+        for (std::uint32_t i = 0; i < n && seeds.size() < 4096; ++i) {
+            if (level_of(i) == seed_level) {
+                seeds.push_back(i);
+            }
+            if (level_of(i) > seed_level + 1u) {
+                break;
+            }
+        }
+        if (seeds.size() < 64) {
+            continue;
+        }
+        // Spread 64 seeds across the level.
+        std::vector<std::uint32_t> picked;
+        for (std::size_t k = 0; k < 64; ++k) {
+            picked.push_back(seeds[k * seeds.size() / 64]);
+        }
+        for (const std::uint32_t descend : {4u, 8u}) {
+            std::set<std::uint64_t> chunks;
+            std::size_t cut_nodes = 0;
+            std::vector<std::uint32_t> frontier;
+            std::vector<std::uint32_t> next;
+            for (const std::uint32_t seed : picked) {
+                frontier.assign(1, seed);
+                for (std::uint32_t d = 0; d < descend && !frontier.empty(); ++d) {
+                    next.clear();
+                    for (const std::uint32_t node : frontier) {
+                        const std::uint32_t cc = count_of(node);
+                        for (std::uint32_t c = 0; c < cc; ++c) {
+                            next.push_back(view->links[node].child_start + c);
+                        }
+                    }
+                    frontier.swap(next);
+                }
+                for (const std::uint32_t node : frontier) {
+                    chunks.insert(node / kChunk);
+                    ++cut_nodes;
+                }
+            }
+            if (cut_nodes == 0) {
+                continue;
+            }
+            std::printf("audit level=%u+%u: cut=%zu chunks=%zu nodes/chunk=%.0f (%.1f%% of %zu)\n",
+                        seed_level, descend, cut_nodes, chunks.size(),
+                        static_cast<double>(cut_nodes) / static_cast<double>(chunks.size()),
+                        100.0 * static_cast<double>(cut_nodes) /
+                            (static_cast<double>(chunks.size()) * static_cast<double>(kChunk)),
+                        chunks.size());
         }
     }
 }
