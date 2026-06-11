@@ -6,7 +6,9 @@
 #include "io/formats/rad.hpp"
 #include "io/ply_to_rad_lod.hpp"
 
-#include <gtest/gtest.h>\n\n#include <set>
+#include <gtest/gtest.h>
+
+#include <set>
 
 #include <algorithm>
 #include <array>

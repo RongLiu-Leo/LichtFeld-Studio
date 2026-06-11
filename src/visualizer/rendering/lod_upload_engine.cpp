@@ -4,6 +4,8 @@
 
 #include "lod_upload_engine.hpp"
 
+#include "core/logger.hpp"
+
 #include "lod_page_dequant_cuda.hpp"
 
 #include <algorithm>
@@ -100,6 +102,32 @@ namespace lfs::vis {
                 if (cudaEventCreateWithFlags(&slot.last_use, cudaEventDisableTiming) != cudaSuccess) {
                     slot.last_use = nullptr;
                 }
+            }
+            // Partially-allocated slots can never be acquired; keep only
+            // complete ones so an allocation-starved ring reads as
+            // unconfigured instead of parking decode workers forever in
+            // acquireStagingSlot (cache reset would then hang on the join).
+            std::erase_if(staging_ring_, [](StagingSlot& slot) {
+                const bool complete = slot.data != nullptr &&
+                                      slot.device_data != nullptr &&
+                                      slot.last_use != nullptr;
+                if (!complete) {
+                    if (slot.data != nullptr) {
+                        (void)cudaFreeHost(slot.data);
+                    }
+                    if (slot.device_data != nullptr) {
+                        (void)cudaFree(slot.device_data);
+                    }
+                    if (slot.last_use != nullptr) {
+                        (void)cudaEventDestroy(slot.last_use);
+                    }
+                }
+                return !complete;
+            });
+            if (staging_ring_.empty()) {
+                LOG_ERROR("LOD upload engine: no staging slot survived allocation; "
+                          "engine stays unconfigured");
+                layout_ = {};
             }
         }
         slot_cv_.notify_all();
@@ -254,8 +282,14 @@ namespace lfs::vis {
                 return "LOD upload failed to create a CUDA event";
             }
             const std::uint64_t signal_value = ++signal_counter_;
-            if (timeline_ != nullptr && timeline_->valid()) {
-                (void)timeline_->cudaSignal(signal_value, stream_);
+            if (timeline_ != nullptr && timeline_->valid() &&
+                !timeline_->cudaSignal(signal_value, stream_)) {
+                // Publishing without the signal would hand the renderer a
+                // timeline value CUDA never reaches - a render-queue hang.
+                // The skipped value is safe: any later successful signal is
+                // larger and satisfies waits at or below it.
+                event_pool_.push_back(event);
+                return "LOD upload timeline signal failed";
             }
             if (const cudaError_t status = cudaEventRecord(event, stream_); status != cudaSuccess) {
                 event_pool_.push_back(event);

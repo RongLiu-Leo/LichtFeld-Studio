@@ -1800,7 +1800,14 @@ namespace lfs::vis {
                      physical_pages < logical_chunks ? 1 : 0,
                      splat_data.lod_tree && splat_data.lod_tree->rad_source.valid() ? 1 : 0);
         }
-        lod_page_cache_.setRadSource(splat_data.lod_tree ? &splat_data.lod_tree->rad_source : nullptr,
+        // RAD-file streaming needs the sidecar-backed meta view (the upload
+        // engine and page sink are gated on it). In-core trees without it
+        // keep the resident-tensor upload path; routing them to the decode
+        // scheduler would strand every request on a never-installed sink.
+        const bool rad_streamable =
+            splat_data.lod_tree && splat_data.lod_tree->rad_source.valid() &&
+            splat_data.lod_tree->meta_view.valid();
+        lod_page_cache_.setRadSource(rad_streamable ? &splat_data.lod_tree->rad_source : nullptr,
                                      splat_data.get_max_sh_degree(),
                                      splat_data.lod_tree ? splat_data.lod_tree->lod_opacity_encoded : false);
         const bool rad_page_inputs =
