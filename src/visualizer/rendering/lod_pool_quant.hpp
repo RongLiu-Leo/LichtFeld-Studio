@@ -26,16 +26,32 @@ namespace lfs::vis::lodq {
     inline constexpr std::size_t kScalingBytes = 8;  // log-domain f16x3 + pad
     inline constexpr std::size_t kOpacityBytes = 2;  // f16, post lod/logit transform
 
+    // Node metadata stays in the sidecar's quantized records; the selector
+    // dequantizes against the page frame. logical is derived from
+    // page_to_chunk, so the expanded 16 B records are gone (32 -> 20 B/node).
+    inline constexpr std::size_t kMetaBoundsBytes = 8; // RadMetaBoundsQ (u16 x4)
+    inline constexpr std::size_t kMetaLinksBytes = 12; // RadMetaLinksQ (u32 x3)
+    inline constexpr std::size_t kMetaLinksWords = 3;
+
     // Per-page dequant frame in the InputPageFrames region: float4[4].
     //   [0] = (sh1_max_abs, sh2_max_abs, sh3_max_abs, unused)
-    //   [1..3] reserved (PR4: bbox/log-size frames for quantized node bounds)
+    //   [1] = (bbox_min.xyz, log_size_min)
+    //   [2] = (bbox_extent.xyz, log_size_range)
+    //   [3] reserved
+    // The from-tensors payload path writes only [0]; the render thread owns
+    // [1..2] for sync-published pages (two writers, disjoint slots).
     inline constexpr std::size_t kPageFrameBytes = 64;
     inline constexpr std::size_t kPageFrameFloat4s = kPageFrameBytes / 16;
+    inline constexpr std::size_t kPageFrameBoundsOffset = 16;
 
     struct PageFrame {
         float sh_max[3] = {0.0f, 0.0f, 0.0f};
         float reserved0 = 0.0f;
-        float reserved[12] = {};
+        float bbox_min[3] = {0.0f, 0.0f, 0.0f};
+        float log_size_min = 0.0f;
+        float bbox_extent[3] = {0.0f, 0.0f, 0.0f};
+        float log_size_range = 0.0f;
+        float reserved[4] = {};
     };
     static_assert(sizeof(PageFrame) == kPageFrameBytes);
 

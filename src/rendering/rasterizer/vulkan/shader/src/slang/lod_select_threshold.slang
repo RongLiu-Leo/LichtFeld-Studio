@@ -30,7 +30,10 @@ struct Uniforms {
     uint32_t pad0;
 };
 
-layout(binding = 0) StructuredBuffer<float> node_bounds;
+// Quantized sidecar records: bounds 2 words/node (RadMetaBoundsQ u16 x4),
+// links 3 words/node (RadMetaLinksQ); dequant frames live per page in
+// page_frames float4 slots [1..2]. logical derives from page_to_chunk.
+layout(binding = 0) StructuredBuffer<uint32_t> node_bounds;
 layout(binding = 1) StructuredBuffer<uint32_t> node_links;
 layout(binding = 2) StructuredBuffer<uint32_t> chunk_to_page;
 layout(binding = 3) RWStructuredBuffer<uint32_t> out_counts;
@@ -45,6 +48,8 @@ layout(binding = 7) RWStructuredBuffer<uint32_t> chunk_touch;
 layout(binding = 8) RWStructuredBuffer<uint32_t> out_levels;
 // Frame stamp of each pool page's last publish; 0 = always fully visible.
 layout(binding = 9) StructuredBuffer<uint32_t> page_age;
+layout(binding = 10) StructuredBuffer<float4> page_frames;
+layout(binding = 11) StructuredBuffer<uint32_t> page_to_chunk;
 
 static const float LOD_TRANSITION_START = 1.0f;
 static const float LOD_TRANSITION_END = 1.18f;
@@ -67,11 +72,16 @@ float3 view_position_for_center(float3 center, Uniforms uniforms) {
 }
 
 float node_pixel_scale(uint32_t physical, Uniforms uniforms) {
-    const uint32_t bounds_base = physical * 4u;
-    const float3 center = float3(node_bounds[bounds_base + 0u],
-                                 node_bounds[bounds_base + 1u],
-                                 node_bounds[bounds_base + 2u]);
-    const float radius = max(node_bounds[bounds_base + 3u] * uniforms.object_scale, 1.0e-6f);
+    const uint32_t page = physical / max(uniforms.chunk_splats, 1u);
+    const uint32_t w0 = node_bounds[physical * 2u + 0u];
+    const uint32_t w1 = node_bounds[physical * 2u + 1u];
+    const float4 frame_min = page_frames[page * 4u + 1u];
+    const float4 frame_ext = page_frames[page * 4u + 2u];
+    const float k_inv = 1.0f / 65535.0f;
+    const float3 q = float3(float(w0 & 0xffffu), float(w0 >> 16u), float(w1 & 0xffffu));
+    const float3 center = frame_min.xyz + q * k_inv * frame_ext.xyz;
+    const float size = exp(frame_min.w + float(w1 >> 16u) * k_inv * frame_ext.w);
+    const float radius = max(size * uniforms.object_scale, 1.0e-6f);
     const float3 view_center = view_position_for_center(center, uniforms);
     const float distance = max(length(view_center), 1.0e-6f);
     const float forward_dot = -view_center.z;
@@ -228,11 +238,18 @@ void append_node(uint32_t physical, uint32_t logical, float weight, uint32_t lev
         if (physical >= uniforms.physical_node_count)
             return;
 
-        const uint32_t links_base = physical * 4u;
-        const uint32_t logical = node_links[links_base + 3u];
-        if (logical == uniforms.invalid_page || logical >= uniforms.node_count)
+        const uint32_t chunk_splats = max(uniforms.chunk_splats, 1u);
+        const uint32_t page = physical / chunk_splats;
+        const uint32_t chunk = page_to_chunk[page];
+        if (chunk == uniforms.invalid_page)
+            return;
+        const uint32_t logical = chunk * chunk_splats + (physical - page * chunk_splats);
+        // Covers the last chunk's slack nodes: their derived logical lands
+        // past the tree.
+        if (logical >= uniforms.node_count)
             return;
 
+        const uint32_t links_base = physical * 3u;
         const uint32_t child_start = node_links[links_base + 0u];
         const uint32_t packed = node_links[links_base + 1u];
         const uint32_t child_count = packed & 0xffffu;
@@ -253,7 +270,7 @@ void append_node(uint32_t physical, uint32_t logical, float weight, uint32_t lev
                 touch_chunk(parent_logical, touch_priority(pixel_scale), uniforms);
                 return;
             }
-            const uint32_t parent_links_base = parent_physical * 4u;
+            const uint32_t parent_links_base = parent_physical * 3u;
             const uint32_t parent_child_start = node_links[parent_links_base + 0u];
             const uint32_t parent_packed = node_links[parent_links_base + 1u];
             const uint32_t parent_child_count = parent_packed & 0xffffu;
@@ -275,7 +292,6 @@ void append_node(uint32_t physical, uint32_t logical, float weight, uint32_t lev
             if (!children_resident) {
                 // Expansion blocked on residency: ask the pager for the child
                 // chunks at this node's priority and render the parent meanwhile.
-                const uint32_t chunk_splats = max(uniforms.chunk_splats, 1u);
                 const uint32_t first_chunk = child_start / chunk_splats;
                 const uint32_t last_chunk = (child_start + child_count - 1u) / chunk_splats;
                 const uint32_t priority = touch_priority(pixel_scale);
@@ -308,6 +324,6 @@ void append_node(uint32_t physical, uint32_t logical, float weight, uint32_t lev
         }
         // Unconditional append even at weight 0: append_node marks the chunk
         // PROTECTED, which a fading-in chunk must stay throughout the fade.
-        weight *= chunk_fade(logical / max(uniforms.chunk_splats, 1u), uniforms);
+        weight *= chunk_fade(chunk, uniforms);
         append_node(physical, logical, weight, level, uniforms);
     }

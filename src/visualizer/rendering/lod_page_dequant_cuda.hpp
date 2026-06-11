@@ -23,9 +23,9 @@ namespace lfs::vis {
         uint2* rotation = nullptr;    // f16x4, (w,x,y,z)
         uint2* scaling = nullptr;     // log-domain f16x3 + pad
         std::uint16_t* opacity = nullptr;
-        float4* page_frames = nullptr; // lodq::PageFrame per page
-        float4* meta_bounds = nullptr;
-        uint4* meta_links = nullptr;
+        float4* page_frames = nullptr;       // lodq::PageFrame per page
+        uint2* meta_bounds = nullptr;        // RadMetaBoundsQ passthrough
+        std::uint32_t* meta_links = nullptr; // RadMetaLinksQ, 3 words/node
         std::uint32_t dst_rest = 0;
         std::uint32_t dst_slots = 0;
     };

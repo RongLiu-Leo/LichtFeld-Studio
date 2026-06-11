@@ -240,7 +240,9 @@ public:
                                    const _VulkanBuffer& node_bounds,
                                    const _VulkanBuffer& node_links,
                                    const _VulkanBuffer& chunk_to_page,
-                                   const _VulkanBuffer& page_age);
+                                   const _VulkanBuffer& page_age,
+                                   const _VulkanBuffer& page_frames,
+                                   const _VulkanBuffer& page_to_chunk);
     void executeGenerateKeys(const VulkanGSRendererUniforms& uniforms, VulkanGSPipelineBuffers& buffers);
     void executeComputeTileRanges(const VulkanGSRendererUniforms& uniforms, VulkanGSPipelineBuffers& buffers);
     void executeRasterizeForward(const VulkanGSRendererUniforms& uniforms,
@@ -335,7 +337,7 @@ protected:
     _ComputePipeline pipeline_prepare_tile_sort = _ComputePipeline(3);
     _ComputePipeline pipeline_compact_visible_primitives = _ComputePipeline(5);
     _ComputePipeline pipeline_lod_map_indices = _ComputePipeline(3);
-    _ComputePipeline pipeline_lod_select_threshold = _ComputePipeline(10);
+    _ComputePipeline pipeline_lod_select_threshold = _ComputePipeline(12);
     // HiGS viewer chain
     _ComputePipeline pipeline_cull_splats = _ComputePipeline(10);
     _ComputePipeline pipeline_cull_prepare = _ComputePipeline(2);

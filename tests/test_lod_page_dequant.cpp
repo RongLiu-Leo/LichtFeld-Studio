@@ -187,8 +187,8 @@ namespace {
         DeviceBuffer d_scale(kPage * lfs::vis::lodq::kScalingBytes);
         DeviceBuffer d_opacity(kPage * lfs::vis::lodq::kOpacityBytes);
         DeviceBuffer d_frames(lfs::vis::lodq::kPageFrameBytes);
-        DeviceBuffer d_bounds(kPage * sizeof(float4));
-        DeviceBuffer d_links(kPage * sizeof(uint4));
+        DeviceBuffer d_bounds(kPage * lfs::vis::lodq::kMetaBoundsBytes);
+        DeviceBuffer d_links(kPage * lfs::vis::lodq::kMetaLinksBytes);
         DeviceBuffer d_slot(64u << 20);
 
         lfs::vis::LodPoolDeviceView pool{};
@@ -199,8 +199,8 @@ namespace {
         pool.scaling = static_cast<uint2*>(d_scale.ptr);
         pool.opacity = static_cast<std::uint16_t*>(d_opacity.ptr);
         pool.page_frames = static_cast<float4*>(d_frames.ptr);
-        pool.meta_bounds = static_cast<float4*>(d_bounds.ptr);
-        pool.meta_links = static_cast<uint4*>(d_links.ptr);
+        pool.meta_bounds = static_cast<uint2*>(d_bounds.ptr);
+        pool.meta_links = static_cast<std::uint32_t*>(d_links.ptr);
         pool.dst_rest = dst_rest;
         pool.dst_slots = dst_slots;
 
@@ -324,38 +324,38 @@ namespace {
                 }
             }
 
+            // Sidecar records pass through byte-exact; the per-page frame
+            // must carry the chunk's dequant frame for the selector.
             const std::size_t logical_start = c * kPage;
             const std::size_t run = std::min(kPage, view->node_count - logical_start);
-            std::vector<lfs::core::NodeBoundsRecord> ref_bounds(run);
-            std::vector<lfs::core::NodeLinksRecord> ref_links(run);
-            lfs::io::expand_rad_meta_page(*view, static_cast<std::uint32_t>(c), run,
-                                          ref_bounds.data(), ref_links.data());
-            const auto gpu_bounds = readDevice<float4>(d_bounds.ptr, kPage);
-            const auto gpu_links = readDevice<uint4>(d_links.ptr, kPage);
-            // Host code contracts bbox_min + q*inv*extent into FMA, the
-            // kernel does not (--fmad=false); with the cancellation in the
-            // sum that costs up to ~1 ULP at the extent's magnitude.
-            const auto& frame = view->chunks[c];
-            const float center_tol[3] = {
-                std::abs(frame.bbox_extent[0]) * 1e-6f + 1e-7f,
-                std::abs(frame.bbox_extent[1]) * 1e-6f + 1e-7f,
-                std::abs(frame.bbox_extent[2]) * 1e-6f + 1e-7f,
-            };
+            const auto gpu_bounds = readDevice<uint2>(d_bounds.ptr, kPage);
+            const auto gpu_links = readDevice<std::uint32_t>(d_links.ptr, kPage * 3u);
             for (std::size_t i = 0; i < run; ++i) {
-                EXPECT_EQ(gpu_links[i].x, ref_links[i].child_start);
-                EXPECT_EQ(gpu_links[i].y, ref_links[i].packed);
-                EXPECT_EQ(gpu_links[i].z, ref_links[i].parent);
-                EXPECT_EQ(gpu_links[i].w, ref_links[i].logical);
-                EXPECT_NEAR(gpu_bounds[i].x, ref_bounds[i].x, center_tol[0]);
-                EXPECT_NEAR(gpu_bounds[i].y, ref_bounds[i].y, center_tol[1]);
-                EXPECT_NEAR(gpu_bounds[i].z, ref_bounds[i].z, center_tol[2]);
-                EXPECT_NEAR(gpu_bounds[i].w, ref_bounds[i].size,
-                            std::abs(ref_bounds[i].size) * 1e-5f);
+                const auto& bq = view->bounds[logical_start + i];
+                EXPECT_EQ(gpu_bounds[i].x,
+                          static_cast<std::uint32_t>(bq.qx) |
+                              (static_cast<std::uint32_t>(bq.qy) << 16u));
+                EXPECT_EQ(gpu_bounds[i].y,
+                          static_cast<std::uint32_t>(bq.qz) |
+                              (static_cast<std::uint32_t>(bq.qsize) << 16u));
+                const auto& lq = view->links[logical_start + i];
+                EXPECT_EQ(gpu_links[i * 3u + 0u], lq.child_start);
+                EXPECT_EQ(gpu_links[i * 3u + 1u], lq.packed);
+                EXPECT_EQ(gpu_links[i * 3u + 2u], lq.parent);
             }
             for (std::size_t i = run; i < kPage; ++i) {
-                EXPECT_EQ(gpu_links[i].w, 0xFFFFFFFFu) << "slack link sentinel at " << i;
-                EXPECT_EQ(gpu_bounds[i].w, 0.0f) << "slack bounds at " << i;
+                EXPECT_EQ(gpu_links[i * 3u + 0u], 0xFFFFFFFFu) << "slack links at " << i;
+                EXPECT_EQ(gpu_bounds[i].x, 0u) << "slack bounds at " << i;
+                EXPECT_EQ(gpu_bounds[i].y, 0u) << "slack bounds at " << i;
             }
+            const auto frame_floats = readDevice<float>(d_frames.ptr, 16);
+            const auto& record = view->chunks[c];
+            for (std::size_t d = 0; d < 3; ++d) {
+                EXPECT_EQ(frame_floats[4 + d], record.bbox_min[d]);
+                EXPECT_EQ(frame_floats[8 + d], record.bbox_extent[d]);
+            }
+            EXPECT_EQ(frame_floats[7], record.log_size_min);
+            EXPECT_EQ(frame_floats[11], record.log_size_range);
             if (::testing::Test::HasFailure()) {
                 return;
             }

@@ -430,11 +430,14 @@ namespace lfs::vis {
         std::uint64_t gpu_lod_last_page_generation_ = 0;
         std::uint64_t gpu_lod_last_publish_frame_ = 0;
         struct GpuLodTreeStorage {
-            // Bounds layout: float4(center.xyz, size) per physical-page LoD node.
+            // Quantized sidecar records per physical-page node: RadMetaBoundsQ
+            // (2 words) and RadMetaLinksQ (3 words); the selector dequantizes
+            // against per-page frames and derives logical from page_to_chunk.
             Buffer<float> node_bounds;
-            // Link layout: uint4(child_start, packed(child_count:16, level:8, flags:8),
-            //                    parent_logical, logical).
             Buffer<std::uint32_t> node_links;
+            // Per-page dequant frames for the non-pool (in-core) path; pool
+            // models bind the page-input InputPageFrames region instead.
+            Buffer<float> page_frames;
             Buffer<std::uint32_t> page_to_chunk;
             Buffer<std::uint32_t> chunk_to_page;
             // Per-page publish frame stamps driving selector fade-in.

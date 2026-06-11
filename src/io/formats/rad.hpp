@@ -127,9 +127,9 @@ namespace lfs::io {
     // parents within a level (multi-bucket converter layouts).
     [[nodiscard]] std::expected<std::uint64_t, std::string> derive_rad_meta_parents_levels(
         std::span<lfs::core::RadMetaLinksQ> links);
-    // Dequantizes one chunk's sidecar records into the exact GPU node
-    // bounds/links layouts; the single source of v2-to-GPU expansion shared by
-    // the upload engine, the renderer bootstrap path, and tests.
+    // Dequantizes one chunk's sidecar records into expanded node bounds/links
+    // records. Production keeps the quantized records resident and dequantizes
+    // in the selector; this remains the CPU reference for tests.
     void expand_rad_meta_page(const lfs::core::SplatLodTree::NodeMetaView& view,
                               std::uint32_t chunk,
                               std::size_t node_count,

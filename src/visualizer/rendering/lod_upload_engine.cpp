@@ -236,8 +236,9 @@ namespace lfs::vis {
             if (layout_.meta_base != nullptr) {
                 auto* const meta_base = static_cast<std::uint8_t*>(layout_.meta_base);
                 view.meta_bounds =
-                    reinterpret_cast<float4*>(meta_base + layout_.meta_bounds_offset);
-                view.meta_links = reinterpret_cast<uint4*>(meta_base + layout_.meta_links_offset);
+                    reinterpret_cast<uint2*>(meta_base + layout_.meta_bounds_offset);
+                view.meta_links =
+                    reinterpret_cast<std::uint32_t*>(meta_base + layout_.meta_links_offset);
             }
             if (const cudaError_t status =
                     launchLodPageDequant(slot->device_data, desc, view, page,

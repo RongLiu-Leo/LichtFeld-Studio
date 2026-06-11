@@ -52,9 +52,9 @@ namespace {
             EXPECT_EQ(cudaMalloc(&base, offset), cudaSuccess);
             EXPECT_EQ(cudaMemset(base, 0, offset), cudaSuccess);
 
-            meta_links_offset = splat_capacity * sizeof(lfs::core::NodeBoundsRecord);
+            meta_links_offset = splat_capacity * lfs::vis::lodq::kMetaBoundsBytes;
             const std::size_t meta_bytes =
-                meta_links_offset + splat_capacity * sizeof(lfs::core::NodeLinksRecord);
+                meta_links_offset + splat_capacity * lfs::vis::lodq::kMetaLinksBytes;
             EXPECT_EQ(cudaMalloc(&meta_base, meta_bytes), cudaSuccess);
             EXPECT_EQ(cudaMemset(meta_base, 0, meta_bytes), cudaSuccess);
         }
@@ -187,17 +187,17 @@ namespace {
         EXPECT_FLOAT_EQ(means[0], 7000.0f);
         EXPECT_FLOAT_EQ(means.back(), 7000.0f + static_cast<float>(kCount * 3u - 1));
 
-        std::vector<lfs::core::NodeLinksRecord> links(4);
+        std::vector<lfs::core::RadMetaLinksQ> links(4);
         ASSERT_EQ(cudaMemcpy(links.data(),
                              static_cast<std::uint8_t*>(pool.meta_base) + pool.meta_links_offset +
-                                 dst_start * sizeof(lfs::core::NodeLinksRecord),
-                             links.size() * sizeof(lfs::core::NodeLinksRecord),
+                                 dst_start * lfs::vis::lodq::kMetaLinksBytes,
+                             links.size() * sizeof(lfs::core::RadMetaLinksQ),
                              cudaMemcpyDeviceToHost),
                   cudaSuccess);
         for (std::size_t i = 0; i < links.size(); ++i) {
+            // Records pass through untouched; logical is selector-derived.
             EXPECT_EQ(links[i].child_start, 7u);
-            // The kernel derives `logical` as chunk * page_splats + offset.
-            EXPECT_EQ(links[i].logical, 7u * kPageSplats + i);
+            EXPECT_EQ(links[i].parent, 0u);
         }
     }
 

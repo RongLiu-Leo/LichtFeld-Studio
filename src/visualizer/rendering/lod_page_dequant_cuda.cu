@@ -169,6 +169,12 @@ namespace lfs::vis {
                             ? radmath::shMaxAbs(prop->min_val, prop->max_val, prop->scale)
                             : 0.0f;
                 }
+                for (std::uint32_t d = 0; d < 3u; ++d) {
+                    frame.bbox_min[d] = desc.frame.bbox_min[d];
+                    frame.bbox_extent[d] = desc.frame.bbox_extent[d];
+                }
+                frame.log_size_min = desc.frame.log_size_min;
+                frame.log_size_range = desc.frame.log_size_range;
                 const auto* const src = reinterpret_cast<const float4*>(&frame);
                 float4* const out = pool.page_frames +
                                     static_cast<std::size_t>(page) * lodq::kPageFrameFloat4s;
@@ -267,33 +273,24 @@ namespace lfs::vis {
                 }
             }
 
+            // Sidecar records pass through untouched; the selector
+            // dequantizes against the page frame and derives logical from
+            // page_to_chunk (slack nodes decode to logical >= node_count).
             if (pool.meta_bounds != nullptr && pool.meta_links != nullptr) {
                 if (i < desc.meta_node_count) {
-                    constexpr float kInv = 1.0f / 65535.0f;
-                    const std::uint8_t* const bq =
-                        slot + desc.meta_bounds_offset + static_cast<std::size_t>(i) * 8u;
-                    ushort4 q;
-                    memcpy(&q, bq, 8u);
-                    float4 bounds;
-                    bounds.x = desc.frame.bbox_min[0] +
-                               static_cast<float>(q.x) * kInv * desc.frame.bbox_extent[0];
-                    bounds.y = desc.frame.bbox_min[1] +
-                               static_cast<float>(q.y) * kInv * desc.frame.bbox_extent[1];
-                    bounds.z = desc.frame.bbox_min[2] +
-                               static_cast<float>(q.z) * kInv * desc.frame.bbox_extent[2];
-                    bounds.w = std::exp(desc.frame.log_size_min +
-                                        static_cast<float>(q.w) * kInv * desc.frame.log_size_range);
-                    pool.meta_bounds[dst] = bounds;
-
-                    const std::uint8_t* const lq =
-                        slot + desc.meta_links_offset + static_cast<std::size_t>(i) * 12u;
-                    uint4 links;
-                    memcpy(&links, lq, 12u);
-                    links.w = desc.chunk * page_splats + i;
-                    pool.meta_links[dst] = links;
+                    uint2 bq;
+                    memcpy(&bq, slot + desc.meta_bounds_offset + static_cast<std::size_t>(i) * 8u, 8u);
+                    pool.meta_bounds[dst] = bq;
+                    std::uint32_t lq[3];
+                    memcpy(lq, slot + desc.meta_links_offset + static_cast<std::size_t>(i) * 12u, 12u);
+                    for (std::uint32_t w = 0; w < 3u; ++w) {
+                        pool.meta_links[dst * 3u + w] = lq[w];
+                    }
                 } else {
-                    pool.meta_bounds[dst] = float4{0.0f, 0.0f, 0.0f, 0.0f};
-                    pool.meta_links[dst] = uint4{0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+                    pool.meta_bounds[dst] = uint2{0u, 0u};
+                    for (std::uint32_t w = 0; w < 3u; ++w) {
+                        pool.meta_links[dst * 3u + w] = 0xFFFFFFFFu;
+                    }
                 }
             }
         }
@@ -425,8 +422,9 @@ namespace lfs::vis {
         constexpr std::uint32_t kBlock = 256;
         float4* const frame =
             pool.page_frames + static_cast<std::size_t>(page) * lodq::kPageFrameFloat4s;
-        if (const cudaError_t status = cudaMemsetAsync(
-                frame, 0, lodq::kPageFrameBytes, stream);
+        // Only float4 [0] (sh band maxima) belongs to this path; the render
+        // thread owns the bounds frame slots for sync-published pages.
+        if (const cudaError_t status = cudaMemsetAsync(frame, 0, 16u, stream);
             status != cudaSuccess) {
             return status;
         }

@@ -656,14 +656,18 @@ void VulkanGSRenderer::executeSelectLodThreshold(const VulkanGSLodSelectUniforms
                                                  const _VulkanBuffer& node_bounds,
                                                  const _VulkanBuffer& node_links,
                                                  const _VulkanBuffer& chunk_to_page,
-                                                 const _VulkanBuffer& page_age) {
+                                                 const _VulkanBuffer& page_age,
+                                                 const _VulkanBuffer& page_frames,
+                                                 const _VulkanBuffer& page_to_chunk) {
     if (uniforms.node_count == 0 ||
         uniforms.physical_node_count == 0 ||
         uniforms.output_capacity == 0 ||
         node_bounds.buffer == VK_NULL_HANDLE ||
         node_links.buffer == VK_NULL_HANDLE ||
         chunk_to_page.buffer == VK_NULL_HANDLE ||
-        page_age.buffer == VK_NULL_HANDLE) {
+        page_age.buffer == VK_NULL_HANDLE ||
+        page_frames.buffer == VK_NULL_HANDLE ||
+        page_to_chunk.buffer == VK_NULL_HANDLE) {
         return;
     }
 
@@ -691,6 +695,8 @@ void VulkanGSRenderer::executeSelectLodThreshold(const VulkanGSLodSelectUniforms
                             {chunk_touch, TRANSFER_WRITE},
                             {out_levels, TRANSFER_COMPUTE_SHADER_WRITE},
                             {page_age, TRANSFER_COMPUTE_SHADER_WRITE},
+                            {page_frames, TRANSFER_COMPUTE_SHADER_WRITE},
+                            {page_to_chunk, TRANSFER_COMPUTE_SHADER_WRITE},
                         },
                         COMPUTE_SHADER_READ_WRITE);
 
@@ -709,6 +715,8 @@ void VulkanGSRenderer::executeSelectLodThreshold(const VulkanGSLodSelectUniforms
             chunk_touch,
             out_levels,
             page_age,
+            page_frames,
+            page_to_chunk,
         });
 
     bufferMemoryBarrier({

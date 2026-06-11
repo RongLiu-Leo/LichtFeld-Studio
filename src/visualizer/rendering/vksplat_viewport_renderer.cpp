@@ -72,7 +72,7 @@ namespace lfs::vis {
                          ? 4u * sizeof(float)
                          : lfs::core::sh_swizzled_byte_count(page_splats, layout_rest) / 4u;
             bytes += lodq::kPageFrameBytes;
-            bytes += page_splats * 32u;
+            bytes += page_splats * (lodq::kMetaBoundsBytes + lodq::kMetaLinksBytes);
             return bytes;
         }
 
@@ -2081,8 +2081,8 @@ namespace lfs::vis {
                 lod_engine_layout_ = {};
                 lod_sink_model_ = nullptr;
                 std::array<std::size_t, 2> meta_bytes{
-                    physical_node_capacity * sizeof(lfs::core::NodeBoundsRecord),
-                    physical_node_capacity * sizeof(lfs::core::NodeLinksRecord)};
+                    physical_node_capacity * lodq::kMetaBoundsBytes,
+                    physical_node_capacity * lodq::kMetaLinksBytes};
                 std::array<std::size_t, 2> meta_offsets{};
                 const std::size_t meta_total =
                     layoutRegions(meta_bytes, meta_offsets, kRegionAlignment);
@@ -2106,6 +2106,9 @@ namespace lfs::vis {
                 gpu_lod_tree_.node_bounds.deviceBuffer.label = "lod_gpu_node_bounds";
                 gpu_lod_tree_.node_links.deviceBuffer.label = "lod_gpu_node_links";
             }
+            resize_buffer(gpu_lod_tree_.page_frames,
+                          (physical_node_capacity / kLodChunkSplats) *
+                              (lodq::kPageFrameBytes / sizeof(float)));
             resize_buffer(gpu_lod_tree_.page_to_chunk, page_to_chunk_upload.size());
             resize_buffer(gpu_lod_tree_.chunk_to_page, chunk_to_page_upload.size());
             resize_buffer(gpu_lod_tree_.page_age, page_age_upload.size());
@@ -2136,9 +2139,10 @@ namespace lfs::vis {
                     }
                 }
                 if (!meta_pages.empty()) {
-                    std::vector<float> page_bounds(kLodChunkSplats * 4u, 0.0f);
-                    std::vector<std::uint32_t> page_links(kLodChunkSplats * 4u,
+                    std::vector<std::uint32_t> page_bounds(kLodChunkSplats * 2u, 0u);
+                    std::vector<std::uint32_t> page_links(kLodChunkSplats * 3u,
                                                           lfs::core::SplatLodTree::kInvalidPage);
+                    std::array<float, 8> page_frame{};
                     const std::vector<std::uint32_t>* parent_indices =
                         rebuilt_parent_indices.empty() ? &gpu_lod_tree_.parent_indices : &rebuilt_parent_indices;
                     const bool has_cached_centers =
@@ -2157,18 +2161,15 @@ namespace lfs::vis {
                         scaling_cpu = splat_data.scaling_raw().cpu();
                         scales_ptr = scaling_cpu.ptr<float>();
                     }
-                    const auto write_page_node = [&](const std::size_t logical_node_index,
-                                                     const std::size_t page_node_index) {
-                        glm::vec3 center{};
+                    const auto node_center = [&](const std::size_t logical_node_index) {
                         if (has_cached_centers) {
-                            center = tree.centers[logical_node_index];
-                        } else {
-                            center = glm::vec3(
-                                means_ptr[logical_node_index * 3u + 0u],
-                                means_ptr[logical_node_index * 3u + 1u],
-                                means_ptr[logical_node_index * 3u + 2u]);
+                            return tree.centers[logical_node_index];
                         }
-
+                        return glm::vec3(means_ptr[logical_node_index * 3u + 0u],
+                                         means_ptr[logical_node_index * 3u + 1u],
+                                         means_ptr[logical_node_index * 3u + 2u]);
+                    };
+                    const auto node_size = [&](const std::size_t logical_node_index) {
                         float size = 0.0f;
                         if (has_cached_sizes) {
                             size = tree.sizes[logical_node_index];
@@ -2178,42 +2179,75 @@ namespace lfs::vis {
                             const float sz = std::exp(scales_ptr[logical_node_index * 3u + 2u]);
                             size = 2.0f * std::max({sx, sy, sz});
                         }
-
-                        const std::size_t bounds_offset = page_node_index * 4u;
-                        page_bounds[bounds_offset + 0u] = center.x;
-                        page_bounds[bounds_offset + 1u] = center.y;
-                        page_bounds[bounds_offset + 2u] = center.z;
-                        page_bounds[bounds_offset + 3u] = size;
-
-                        const std::uint32_t child_count = tree.child_count[logical_node_index];
-                        const std::uint32_t level =
-                            logical_node_index < tree.lod_level.size()
-                                ? static_cast<std::uint32_t>(tree.lod_level[logical_node_index])
-                                : 0u;
-                        std::uint32_t flags = 0u;
-                        if (child_count == 0u) {
-                            flags |= 1u;
+                        return std::max(size, 1.0e-8f);
+                    };
+                    // Quantize a chunk against its own frame, mirroring the
+                    // sidecar builder; pass A derives the frame, pass B emits
+                    // RadMetaBoundsQ / RadMetaLinksQ records.
+                    const auto quantize_chunk = [&](const std::size_t logical_start,
+                                                    const std::size_t node_run) {
+                        glm::vec3 lo(std::numeric_limits<float>::max());
+                        glm::vec3 hi(std::numeric_limits<float>::lowest());
+                        float log_lo = std::numeric_limits<float>::max();
+                        float log_hi = std::numeric_limits<float>::lowest();
+                        for (std::size_t offset = 0; offset < node_run; ++offset) {
+                            const glm::vec3 c = node_center(logical_start + offset);
+                            lo = glm::min(lo, c);
+                            hi = glm::max(hi, c);
+                            const float ls = std::log(node_size(logical_start + offset));
+                            log_lo = std::min(log_lo, ls);
+                            log_hi = std::max(log_hi, ls);
                         }
-                        if (logical_node_index == 0u) {
-                            flags |= 2u;
-                        }
-                        if (tree.lod_opacity_encoded) {
-                            flags |= 4u;
-                        }
+                        const glm::vec3 extent = glm::max(hi - lo, glm::vec3(0.0f));
+                        const float log_range = std::max(log_hi - log_lo, 0.0f);
+                        page_frame = {lo.x, lo.y, lo.z, log_lo,
+                                      extent.x, extent.y, extent.z, log_range};
+                        const auto quant = [](const float v, const float base, const float range) {
+                            if (range <= 0.0f) {
+                                return std::uint32_t{0};
+                            }
+                            const float t = std::clamp((v - base) / range, 0.0f, 1.0f);
+                            return static_cast<std::uint32_t>(std::lround(t * 65535.0f));
+                        };
+                        for (std::size_t offset = 0; offset < node_run; ++offset) {
+                            const std::size_t node = logical_start + offset;
+                            const glm::vec3 c = node_center(node);
+                            const std::uint32_t qx = quant(c.x, lo.x, extent.x);
+                            const std::uint32_t qy = quant(c.y, lo.y, extent.y);
+                            const std::uint32_t qz = quant(c.z, lo.z, extent.z);
+                            const std::uint32_t qsize =
+                                quant(std::log(node_size(node)), log_lo, log_range);
+                            page_bounds[offset * 2u + 0u] = qx | (qy << 16u);
+                            page_bounds[offset * 2u + 1u] = qz | (qsize << 16u);
 
-                        const std::size_t links_offset = page_node_index * 4u;
-                        page_links[links_offset + 0u] = tree.child_start[logical_node_index];
-                        page_links[links_offset + 1u] =
-                            (child_count & 0xffffu) |
-                            ((level & 0xffu) << 16u) |
-                            ((flags & 0xffu) << 24u);
-                        page_links[links_offset + 2u] = (*parent_indices)[logical_node_index];
-                        page_links[links_offset + 3u] = static_cast<std::uint32_t>(logical_node_index);
+                            const std::uint32_t child_count = tree.child_count[node];
+                            const std::uint32_t level =
+                                node < tree.lod_level.size()
+                                    ? static_cast<std::uint32_t>(tree.lod_level[node])
+                                    : 0u;
+                            std::uint32_t flags = 0u;
+                            if (child_count == 0u) {
+                                flags |= 1u;
+                            }
+                            if (node == 0u) {
+                                flags |= 2u;
+                            }
+                            if (tree.lod_opacity_encoded) {
+                                flags |= 4u;
+                            }
+                            page_links[offset * 3u + 0u] = tree.child_start[node];
+                            page_links[offset * 3u + 1u] =
+                                (child_count & 0xffffu) |
+                                ((level & 0xffu) << 16u) |
+                                ((flags & 0xffu) << 24u);
+                            page_links[offset * 3u + 2u] = (*parent_indices)[node];
+                        }
                     };
 
                     for (const std::uint32_t page : meta_pages) {
-                        std::fill(page_bounds.begin(), page_bounds.end(), 0.0f);
+                        std::fill(page_bounds.begin(), page_bounds.end(), 0u);
                         std::fill(page_links.begin(), page_links.end(), lfs::core::SplatLodTree::kInvalidPage);
+                        page_frame = {};
                         if (page < page_snapshot->page_to_chunk.size()) {
                             const std::uint32_t chunk = page_snapshot->page_to_chunk[page];
                             if (chunk != lfs::core::SplatLodTree::kInvalidPage &&
@@ -2226,18 +2260,19 @@ namespace lfs::vis {
                                     const std::size_t node_run =
                                         std::min(kLodChunkSplats, node_count - logical_start);
                                     if (tree_view_backed) {
-                                        lfs::io::expand_rad_meta_page(
-                                            tree.meta_view,
-                                            chunk,
-                                            node_run,
-                                            reinterpret_cast<lfs::core::NodeBoundsRecord*>(
-                                                page_bounds.data()),
-                                            reinterpret_cast<lfs::core::NodeLinksRecord*>(
-                                                page_links.data()));
+                                        std::memcpy(page_bounds.data(),
+                                                    tree.meta_view.bounds + logical_start,
+                                                    node_run * lodq::kMetaBoundsBytes);
+                                        std::memcpy(page_links.data(),
+                                                    tree.meta_view.links + logical_start,
+                                                    node_run * lodq::kMetaLinksBytes);
+                                        const auto& record = tree.meta_view.chunks[chunk];
+                                        page_frame = {record.bbox_min[0], record.bbox_min[1],
+                                                      record.bbox_min[2], record.log_size_min,
+                                                      record.bbox_extent[0], record.bbox_extent[1],
+                                                      record.bbox_extent[2], record.log_size_range};
                                     } else {
-                                        for (std::size_t offset = 0; offset < node_run; ++offset) {
-                                            write_page_node(logical_start + offset, offset);
-                                        }
+                                        quantize_chunk(logical_start, node_run);
                                     }
                                 }
                             }
@@ -2245,13 +2280,33 @@ namespace lfs::vis {
                         recordUpdateBufferChunks(renderer_.activeCommandBuffer(),
                                                  gpu_lod_tree_.node_bounds.deviceBuffer,
                                                  page_bounds.data(),
-                                                 page_bounds.size() * sizeof(float),
-                                                 static_cast<std::size_t>(page) * kLodChunkSplats * 4u * sizeof(float));
+                                                 page_bounds.size() * sizeof(std::uint32_t),
+                                                 static_cast<std::size_t>(page) * kLodChunkSplats * lodq::kMetaBoundsBytes);
                         recordUpdateBufferChunks(renderer_.activeCommandBuffer(),
                                                  gpu_lod_tree_.node_links.deviceBuffer,
                                                  page_links.data(),
                                                  page_links.size() * sizeof(std::uint32_t),
-                                                 static_cast<std::size_t>(page) * kLodChunkSplats * 4u * sizeof(std::uint32_t));
+                                                 static_cast<std::size_t>(page) * kLodChunkSplats * lodq::kMetaLinksBytes);
+                        // The selector binds the pool's frame region when the
+                        // quant pool is wired and the tree-storage buffer
+                        // otherwise; keep both current for sync pages.
+                        const std::size_t frame_offset =
+                            static_cast<std::size_t>(page) * lodq::kPageFrameBytes +
+                            lodq::kPageFrameBoundsOffset;
+                        if (gpu_lod_tree_.page_frames.deviceBuffer.buffer != VK_NULL_HANDLE) {
+                            recordUpdateBufferChunks(renderer_.activeCommandBuffer(),
+                                                     gpu_lod_tree_.page_frames.deviceBuffer,
+                                                     page_frame.data(),
+                                                     page_frame.size() * sizeof(float),
+                                                     frame_offset);
+                        }
+                        if (buffers_.page_frames.deviceBuffer.buffer != VK_NULL_HANDLE) {
+                            recordUpdateBufferChunks(renderer_.activeCommandBuffer(),
+                                                     buffers_.page_frames.deviceBuffer,
+                                                     page_frame.data(),
+                                                     page_frame.size() * sizeof(float),
+                                                     frame_offset);
+                        }
                     }
                 }
                 if (!page_to_chunk_upload.empty()) {
@@ -3199,6 +3254,7 @@ namespace lfs::vis {
 
         release(gpu_lod_tree_.node_bounds);
         release(gpu_lod_tree_.node_links);
+        release(gpu_lod_tree_.page_frames);
         release(gpu_lod_tree_.page_to_chunk);
         release(gpu_lod_tree_.chunk_to_page);
         gpu_lod_tree_ = {};
@@ -6633,7 +6689,11 @@ namespace lfs::vis {
                             gpu_lod_tree_.node_bounds.deviceBuffer,
                             gpu_lod_tree_.node_links.deviceBuffer,
                             gpu_lod_tree_.chunk_to_page.deviceBuffer,
-                            gpu_lod_tree_.page_age.deviceBuffer);
+                            gpu_lod_tree_.page_age.deviceBuffer,
+                            buffers_.page_frames.deviceBuffer.buffer != VK_NULL_HANDLE
+                                ? buffers_.page_frames.deviceBuffer
+                                : gpu_lod_tree_.page_frames.deviceBuffer,
+                            gpu_lod_tree_.page_to_chunk.deviceBuffer);
                         static std::uint32_t gpu_lod_select_log_counter = 0;
                         const std::uint32_t gpu_lod_log_counter = ++gpu_lod_select_log_counter;
                         if (gpu_lod_log_counter <= 5u || (gpu_lod_log_counter % 120u) == 0u) {
