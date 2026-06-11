@@ -1261,13 +1261,35 @@ namespace lfs::io {
                 }
             };
 
+            // Adaptive admission: the in-flight count was sized from memory
+            // available at phase start, but co-tenants (and zram swap, which
+            // consumes physical RAM as it fills) move that floor over a long
+            // build. Each worker re-checks before claiming a bucket and
+            // drains instead of launching under pressure; the active counter
+            // guarantees forward progress - one bucket always runs.
+            std::atomic<std::size_t> active_builds{0};
+            const std::size_t per_splat_estimate =
+                record_floats * sizeof(float) + 240 + static_cast<std::size_t>(rest_coeffs) * 30;
+            const std::size_t admission_floor =
+                target_bucket * per_splat_estimate + (std::size_t{2} << 30);
             const auto worker = [&]() {
                 while (true) {
+                    while (active_builds.load(std::memory_order_relaxed) > 0 &&
+                           available_memory_bytes() < admission_floor &&
+                           !failed.load(std::memory_order_relaxed) &&
+                           !cancel_requested.load(std::memory_order_relaxed)) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                    }
                     const std::size_t b = next_bucket.fetch_add(1);
                     if (b >= bucket_count || failed.load(std::memory_order_relaxed) ||
                         cancel_requested.load(std::memory_order_relaxed)) {
                         return;
                     }
+                    ++active_builds;
+                    struct ActiveGuard {
+                        std::atomic<std::size_t>& count;
+                        ~ActiveGuard() { --count; }
+                    } active_guard{active_builds};
 
                     const std::size_t count = static_cast<std::size_t>(bucket_counts[b]);
                     std::vector<float> records(count * record_floats);
