@@ -202,6 +202,59 @@ TEST(PlyToRadLod, SingleBucketRoundtrip) {
     run_roundtrip(50'000, 4'000'000);
 }
 
+TEST(PlyToRadLod, TileGridDoublesLeaves) {
+    const auto temp_dir = std::filesystem::temp_directory_path() / "ply_to_rad_lod_tiles";
+    std::filesystem::remove_all(temp_dir);
+    std::filesystem::create_directories(temp_dir);
+    const auto ply_path = temp_dir / "synthetic.ply";
+    const auto rad_path = temp_dir / "synthetic.rad";
+
+    constexpr std::size_t kSplats = 20'000;
+    const auto splats = make_synthetic_splats(kSplats);
+    write_synthetic_ply(ply_path, splats);
+
+    lfs::io::PlyToRadLodOptions options;
+    options.target_bucket_splats = 65'536;
+    options.temp_dir = temp_dir / "scratch";
+    options.tiles_x = 2;
+    options.tiles_y = 1;
+    const auto convert_result = lfs::io::convert_ply_to_rad_lod(ply_path, rad_path, options);
+    ASSERT_TRUE(convert_result.has_value()) << convert_result.error().message;
+
+    auto loaded = lfs::io::load_rad(rad_path);
+    ASSERT_TRUE(loaded.has_value()) << loaded.error();
+    ASSERT_TRUE(loaded->lod_tree && loaded->lod_tree->has_tree());
+
+    TreeCheckResult check;
+    check_tree_invariants(*loaded, check);
+    if (::testing::Test::HasFatalFailure()) {
+        return;
+    }
+    EXPECT_EQ(check.leaf_count, 2 * kSplats);
+
+    // Tile 1 replicates every source splat at +X by the exact scene extent
+    // plus the 1% margin, computed the same way the converter does.
+    float min_x = std::numeric_limits<float>::max();
+    float max_x = std::numeric_limits<float>::lowest();
+    for (const auto& s : splats) {
+        min_x = std::min(min_x, s.x);
+        max_x = std::max(max_x, s.x);
+    }
+    const float step_x = (max_x - min_x) * 1.01f;
+    std::vector<std::array<float, 3>> expected_positions;
+    expected_positions.reserve(2 * kSplats);
+    for (const auto& s : splats) {
+        expected_positions.push_back({s.x, s.y, s.z});
+        expected_positions.push_back({s.x + step_x, s.y, s.z});
+    }
+    auto actual_positions = check.leaf_positions;
+    std::sort(expected_positions.begin(), expected_positions.end());
+    std::sort(actual_positions.begin(), actual_positions.end());
+    EXPECT_EQ(expected_positions, actual_positions);
+
+    std::filesystem::remove_all(temp_dir);
+}
+
 TEST(PlyToRadLod, SweepsStaleTempDirsFromCrashedRuns) {
     const auto temp_dir = std::filesystem::temp_directory_path() / "ply_to_rad_lod_stale";
     std::filesystem::remove_all(temp_dir);

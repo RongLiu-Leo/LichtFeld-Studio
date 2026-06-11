@@ -1021,8 +1021,25 @@ namespace lfs::io {
         const int rest_coeffs = layout.rest_coeffs;
         const std::size_t record_floats = kBaseRecordFloats + static_cast<std::size_t>(rest_coeffs) * 3;
 
+        if (options.tiles_x == 0 || options.tiles_y == 0) {
+            return make_error(ErrorCode::INVALID_DATASET, "tile grid must be at least 1x1", input_path);
+        }
+        const std::size_t tile_count =
+            static_cast<std::size_t>(options.tiles_x) * options.tiles_y;
+        const std::uint64_t total_leaves = static_cast<std::uint64_t>(N) * tile_count;
+        if (total_leaves > std::numeric_limits<std::uint32_t>::max()) {
+            return make_error(ErrorCode::INVALID_DATASET,
+                              std::format("{}x{} tiling of {} splats exceeds the RAD node limit",
+                                          options.tiles_x, options.tiles_y, N),
+                              input_path);
+        }
+
         LOG_INFO("ply_to_rad_lod: {} splats, SH degree {}, stride {} bytes",
                  N, layout.sh_degree, layout.stride);
+        if (tile_count > 1) {
+            LOG_INFO("ply_to_rad_lod: instancing {}x{} ground-plane tiles -> {} splats",
+                     options.tiles_x, options.tiles_y, total_leaves);
+        }
 
         // Scratch space lives next to the output by default (same drive). The
         // PID suffix keeps concurrent conversions of the same output from
@@ -1097,6 +1114,57 @@ namespace lfs::io {
                 bounds.max[a] = q_hi + margin;
             }
         }
+
+        // Tile offsets come from the exact X/Y extent (not the robust box):
+        // instances must never overlap, and outliers the Morton grid clamps
+        // away would otherwise leak into the neighboring tile.
+        std::vector<std::array<float, 2>> tile_offsets(tile_count, {0.0f, 0.0f});
+        if (tile_count > 1) {
+            struct XYExtent {
+                float min_x = std::numeric_limits<float>::max();
+                float max_x = std::numeric_limits<float>::lowest();
+                float min_y = std::numeric_limits<float>::max();
+                float max_y = std::numeric_limits<float>::lowest();
+            };
+            const XYExtent extent = tbb::parallel_reduce(
+                tbb::blocked_range<std::size_t>(0, N, 1 << 18), XYExtent{},
+                [&](const tbb::blocked_range<std::size_t>& range, XYExtent acc) {
+                    for (std::size_t i = range.begin(); i != range.end(); ++i) {
+                        const std::uint8_t* const vertex = vertex_base + i * layout.stride;
+                        const float x = read_f32(vertex, layout.pos[0]);
+                        const float y = read_f32(vertex, layout.pos[1]);
+                        if (std::isfinite(x)) {
+                            acc.min_x = std::min(acc.min_x, x);
+                            acc.max_x = std::max(acc.max_x, x);
+                        }
+                        if (std::isfinite(y)) {
+                            acc.min_y = std::min(acc.min_y, y);
+                            acc.max_y = std::max(acc.max_y, y);
+                        }
+                    }
+                    return acc;
+                },
+                [](const XYExtent& a, const XYExtent& b) {
+                    return XYExtent{
+                        .min_x = std::min(a.min_x, b.min_x),
+                        .max_x = std::max(a.max_x, b.max_x),
+                        .min_y = std::min(a.min_y, b.min_y),
+                        .max_y = std::max(a.max_y, b.max_y),
+                    };
+                });
+            const float step_x = (extent.max_x - extent.min_x) * 1.01f;
+            const float step_y = (extent.max_y - extent.min_y) * 1.01f;
+            for (std::uint32_t iy = 0; iy < options.tiles_y; ++iy) {
+                for (std::uint32_t ix = 0; ix < options.tiles_x; ++ix) {
+                    tile_offsets[static_cast<std::size_t>(iy) * options.tiles_x + ix] = {
+                        static_cast<float>(ix) * step_x,
+                        static_cast<float>(iy) * step_y,
+                    };
+                }
+            }
+            bounds.max[0] += static_cast<float>(options.tiles_x - 1) * step_x;
+            bounds.max[1] += static_cast<float>(options.tiles_y - 1) * step_y;
+        }
         bounds.finalize();
 
         if (!report(0.03f, "Computing spatial histogram")) {
@@ -1108,18 +1176,22 @@ namespace lfs::io {
         // ------------------------------------------------------------------
         std::unique_ptr<std::atomic<std::uint32_t>[]> cell_hist(
             new std::atomic<std::uint32_t>[kCellCount]());
-        tbb::parallel_for(
-            tbb::blocked_range<std::size_t>(0, N, 1 << 18),
-            [&](const tbb::blocked_range<std::size_t>& range) {
-                for (std::size_t i = range.begin(); i != range.end(); ++i) {
-                    const std::uint8_t* const vertex = vertex_base + i * layout.stride;
-                    const std::uint32_t cell = cell_of_position(bounds,
-                                                                read_f32(vertex, layout.pos[0]),
-                                                                read_f32(vertex, layout.pos[1]),
-                                                                read_f32(vertex, layout.pos[2]));
-                    cell_hist[cell].fetch_add(1, std::memory_order_relaxed);
-                }
-            });
+        for (std::size_t t = 0; t < tile_count; ++t) {
+            const float tile_x = tile_offsets[t][0];
+            const float tile_y = tile_offsets[t][1];
+            tbb::parallel_for(
+                tbb::blocked_range<std::size_t>(0, N, 1 << 18),
+                [&](const tbb::blocked_range<std::size_t>& range) {
+                    for (std::size_t i = range.begin(); i != range.end(); ++i) {
+                        const std::uint8_t* const vertex = vertex_base + i * layout.stride;
+                        const std::uint32_t cell = cell_of_position(bounds,
+                                                                    read_f32(vertex, layout.pos[0]) + tile_x,
+                                                                    read_f32(vertex, layout.pos[1]) + tile_y,
+                                                                    read_f32(vertex, layout.pos[2]));
+                        cell_hist[cell].fetch_add(1, std::memory_order_relaxed);
+                    }
+                });
+        }
 
         const std::size_t target_bucket = std::max<std::size_t>(options.target_bucket_splats, 65536);
         std::vector<std::uint32_t> cell_to_bucket(kCellCount, 0);
@@ -1219,46 +1291,50 @@ namespace lfs::io {
                 buf.clear();
             };
 
-            tbb::parallel_for(
-                tbb::blocked_range<std::size_t>(0, N, 1 << 16),
-                [&](const tbb::blocked_range<std::size_t>& range) {
-                    auto& state = states.local();
-                    for (std::size_t i = range.begin(); i != range.end(); ++i) {
-                        const std::uint8_t* const vertex = vertex_base + i * layout.stride;
-                        const float x = read_f32(vertex, layout.pos[0]);
-                        const float y = read_f32(vertex, layout.pos[1]);
-                        const float z = read_f32(vertex, layout.pos[2]);
-                        const std::uint32_t bucket = cell_to_bucket[cell_of_position(bounds, x, y, z)];
-                        auto& buf = state.pending[bucket];
+            for (std::size_t t = 0; t < tile_count; ++t) {
+                const float tile_x = tile_offsets[t][0];
+                const float tile_y = tile_offsets[t][1];
+                tbb::parallel_for(
+                    tbb::blocked_range<std::size_t>(0, N, 1 << 16),
+                    [&](const tbb::blocked_range<std::size_t>& range) {
+                        auto& state = states.local();
+                        for (std::size_t i = range.begin(); i != range.end(); ++i) {
+                            const std::uint8_t* const vertex = vertex_base + i * layout.stride;
+                            const float x = read_f32(vertex, layout.pos[0]) + tile_x;
+                            const float y = read_f32(vertex, layout.pos[1]) + tile_y;
+                            const float z = read_f32(vertex, layout.pos[2]);
+                            const std::uint32_t bucket = cell_to_bucket[cell_of_position(bounds, x, y, z)];
+                            auto& buf = state.pending[bucket];
 
-                        buf.push_back(x);
-                        buf.push_back(y);
-                        buf.push_back(z);
-                        buf.push_back(read_f32(vertex, layout.dc[0]));
-                        buf.push_back(read_f32(vertex, layout.dc[1]));
-                        buf.push_back(read_f32(vertex, layout.dc[2]));
-                        buf.push_back(read_f32(vertex, layout.opacity));
-                        buf.push_back(read_f32(vertex, layout.scale[0]));
-                        buf.push_back(read_f32(vertex, layout.scale[1]));
-                        buf.push_back(read_f32(vertex, layout.scale[2]));
-                        buf.push_back(read_f32(vertex, layout.rot[0]));
-                        buf.push_back(read_f32(vertex, layout.rot[1]));
-                        buf.push_back(read_f32(vertex, layout.rot[2]));
-                        buf.push_back(read_f32(vertex, layout.rot[3]));
-                        // f_rest is channel-major in the file; records store
-                        // canonical [coeff][channel] order.
-                        for (int coeff = 0; coeff < rest_coeffs; ++coeff) {
-                            for (int ch = 0; ch < 3; ++ch) {
-                                buf.push_back(read_f32(
-                                    vertex, layout.rest[static_cast<std::size_t>(ch) * rest_coeffs + coeff]));
+                            buf.push_back(x);
+                            buf.push_back(y);
+                            buf.push_back(z);
+                            buf.push_back(read_f32(vertex, layout.dc[0]));
+                            buf.push_back(read_f32(vertex, layout.dc[1]));
+                            buf.push_back(read_f32(vertex, layout.dc[2]));
+                            buf.push_back(read_f32(vertex, layout.opacity));
+                            buf.push_back(read_f32(vertex, layout.scale[0]));
+                            buf.push_back(read_f32(vertex, layout.scale[1]));
+                            buf.push_back(read_f32(vertex, layout.scale[2]));
+                            buf.push_back(read_f32(vertex, layout.rot[0]));
+                            buf.push_back(read_f32(vertex, layout.rot[1]));
+                            buf.push_back(read_f32(vertex, layout.rot[2]));
+                            buf.push_back(read_f32(vertex, layout.rot[3]));
+                            // f_rest is channel-major in the file; records store
+                            // canonical [coeff][channel] order.
+                            for (int coeff = 0; coeff < rest_coeffs; ++coeff) {
+                                for (int ch = 0; ch < 3; ++ch) {
+                                    buf.push_back(read_f32(
+                                        vertex, layout.rest[static_cast<std::size_t>(ch) * rest_coeffs + coeff]));
+                                }
+                            }
+
+                            if (buf.size() >= kFlushFloats) {
+                                flush_bucket(bucket, buf);
                             }
                         }
-
-                        if (buf.size() >= kFlushFloats) {
-                            flush_bucket(bucket, buf);
-                        }
-                    }
-                });
+                    });
+            }
 
             for (auto& state : states) {
                 for (std::size_t b = 0; b < bucket_count; ++b) {
@@ -1528,7 +1604,7 @@ namespace lfs::io {
             }
         }
         LOG_INFO("ply_to_rad_lod: {} total LOD nodes ({} leaves, {} top-level)",
-                 total_nodes, N, top_count);
+                 total_nodes, total_leaves, top_count);
 
         const auto local_levels = [&](const std::size_t b) {
             return summaries[b].level_starts.size() - 1;
@@ -1736,7 +1812,7 @@ namespace lfs::io {
         const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::high_resolution_clock::now() - t_start);
         LOG_INFO("ply_to_rad_lod: wrote {} ({} nodes from {} splats) in {}s",
-                 lfs::core::path_to_utf8(output_path), total_nodes, N, elapsed.count());
+                 lfs::core::path_to_utf8(output_path), total_nodes, total_leaves, elapsed.count());
 
         if (!report(1.0f, "Conversion complete")) {
             return cancelled();

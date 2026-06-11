@@ -319,12 +319,15 @@ namespace lfs::app {
 
         bool streamLodConvertFile(
             const std::filesystem::path& input,
-            const std::filesystem::path& output) {
+            const std::filesystem::path& output,
+            const param::ConvertParameters& params) {
             std::println("Converting (out-of-core LOD): {} -> {}",
                          path_to_utf8(input), path_to_utf8(output));
 
             ConvertProgressBar bar;
             lfs::io::PlyToRadLodOptions options;
+            options.tiles_x = params.tiles_x;
+            options.tiles_y = params.tiles_y;
             options.progress = [&bar](const float progress, const std::string& stage) {
                 return bar.report(progress, stage);
             };
@@ -346,6 +349,13 @@ namespace lfs::app {
             const std::filesystem::path& output,
             const param::ConvertParameters& params) {
 
+            const bool tiled = params.tiles_x > 1 || params.tiles_y > 1;
+            if (tiled && (params.format != param::OutputFormat::RAD || !isPlyExtension(input))) {
+                LOG_ERROR("--tiles requires a PLY input and RAD output: {}", path_to_utf8(input));
+                std::println(stderr, "  Error: --tiles requires a PLY input and RAD output");
+                return false;
+            }
+
             if (params.format == param::OutputFormat::RAD && isRadExtension(input)) {
                 const auto needs_rechunk = lfs::io::rad_lod_needs_rechunk(input);
                 if (!needs_rechunk) {
@@ -361,8 +371,8 @@ namespace lfs::app {
             }
 
             if (params.format == param::OutputFormat::RAD && isPlyExtension(input) &&
-                shouldStreamLodConvert(input)) {
-                return streamLodConvertFile(input, output);
+                (tiled || shouldStreamLodConvert(input))) {
+                return streamLodConvertFile(input, output, params);
             }
 
             std::println("Converting: {} -> {}", path_to_utf8(input), path_to_utf8(output));

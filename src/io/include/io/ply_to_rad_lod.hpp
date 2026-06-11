@@ -38,6 +38,12 @@ namespace lfs::io {
         std::size_t max_concurrent_buckets = 0;
         float lod_base = 1.25f;
         int compression_level = 6;
+        // Replicates the source across a tiles_x by tiles_y grid on the X/Y
+        // ground plane, offsetting each instance by the scene extent plus a
+        // 1% margin. The source PLY is replayed once per tile, so no tiled
+        // intermediate file is needed; total splats multiply accordingly.
+        std::uint32_t tiles_x = 1;
+        std::uint32_t tiles_y = 1;
         ExportProgressCallback progress = nullptr;
     };
 

@@ -309,6 +309,10 @@ namespace lfs::core {
             OutputFormat format = OutputFormat::PLY;
             int sh_degree = 3; // 0-3, -1 = keep original
             int sog_iterations = 10;
+            // PLY -> RAD only: replicate the source across an AxB ground-plane
+            // grid instead of pre-tiling the input file.
+            std::uint32_t tiles_x = 1;
+            std::uint32_t tiles_y = 1;
             bool overwrite = false; // Skip overwrite prompts
         };
 
