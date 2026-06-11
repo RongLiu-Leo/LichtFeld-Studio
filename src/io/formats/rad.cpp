@@ -71,7 +71,7 @@ namespace lfs::io {
 
         constexpr uint32_t RAD_MAGIC = 0x30444152;       // "RAD0" in little-endian
         constexpr uint32_t RAD_CHUNK_MAGIC = 0x43444152; // "RADC" in little-endian
-        constexpr uint32_t CHUNK_SIZE = 8192;            // Splats per chunk
+        constexpr uint32_t CHUNK_SIZE = 2048;            // Splats per chunk
         static_assert(CHUNK_SIZE == lfs::core::SplatLodTree::kChunkSplats,
                       "RAD chunk size and LOD page size are the same unit");
         constexpr int GZ_LEVEL = 6;                   // Default gzip compression level
@@ -3513,7 +3513,7 @@ namespace lfs::io {
                                   available_host_memory_bytes() / 2;
                 }
                 if (out_of_core) {
-                    std::size_t preview = 512 * CHUNK_SIZE;
+                    std::size_t preview = 2048 * CHUNK_SIZE;
                     if (const char* const env = std::getenv("LFS_RAD_PREVIEW_SPLATS");
                         env != nullptr && env[0] != '\0') {
                         try {

@@ -104,7 +104,7 @@ namespace lfs::vis {
                 // hold the cut's whole working set or streaming thrashes. Size
                 // it from VRAM headroom; the splat-count budget setting was
                 // tuned for host-resident streaming and is far too small here.
-                constexpr std::size_t kMinPoolPages = 512;
+                constexpr std::size_t kMinPoolPages = 2048;
                 const std::size_t page_bytes = std::max<std::size_t>(lodPageDeviceBytes(splat_data), 1);
                 std::size_t free_bytes = 0;
                 std::size_t total_bytes = 0;
@@ -122,13 +122,13 @@ namespace lfs::vis {
                     // reconfigure-loops (each pool reset moves free VRAM,
                     // landing on a new count, resetting again). Page-quantum
                     // steps absorb the wobble so the re-derive is idempotent.
-                    constexpr std::size_t kPoolPageQuantum = 128;
+                    constexpr std::size_t kPoolPageQuantum = 512;
                     budget_pages -= budget_pages % kPoolPageQuantum;
                     return std::clamp(budget_pages,
                                       std::min(kMinPoolPages, logical_chunks),
                                       logical_chunks);
                 }
-                constexpr std::size_t kOutOfCoreFallbackPages = 2048;
+                constexpr std::size_t kOutOfCoreFallbackPages = 8192;
                 return std::min(kOutOfCoreFallbackPages, logical_chunks);
             }
             if (!host_resident_leaves || pool_budget_splats == 0) {
@@ -137,7 +137,7 @@ namespace lfs::vis {
                 // streaming would only add double residency. Budget 0 = full.
                 return logical_chunks;
             }
-            constexpr std::size_t kMinPoolPages = 512;
+            constexpr std::size_t kMinPoolPages = 2048;
             const std::size_t budget_pages =
                 (pool_budget_splats + LodPageCache::kChunkSplats - 1) / LodPageCache::kChunkSplats;
             return std::clamp(budget_pages, std::min(kMinPoolPages, logical_chunks), logical_chunks);

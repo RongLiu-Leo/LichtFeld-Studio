@@ -29,7 +29,7 @@ namespace lfs::vis {
     inline constexpr float DEFAULT_LOD_OUTSIDE_VIEW_FOVEATION = 0.05f;
     inline constexpr float DEFAULT_LOD_PREFETCH_PIXEL_SCALE_RATIO = 0.65f;
     inline constexpr std::size_t DEFAULT_LOD_PAGE_POOL_SPLATS = 0; // 0 = auto (derived from lod_max_splats)
-    inline constexpr float DEFAULT_LOD_POOL_VRAM_FRACTION = 0.5f;  // out-of-core page pool share of free VRAM
+    inline constexpr float DEFAULT_LOD_POOL_VRAM_FRACTION = 0.15f; // out-of-core page pool share of free VRAM
     inline constexpr int DEFAULT_LOD_FADE_FRAMES = 12;             // fade-in of newly streamed pages (0 = off)
 
     enum class SplitViewMode {

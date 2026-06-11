@@ -87,7 +87,7 @@ namespace lfs::core {
     static_assert(sizeof(RadMetaChunkRecord) == 48);
 
     struct SplatLodTree {
-        static constexpr std::size_t kChunkSplats = 8'192;
+        static constexpr std::size_t kChunkSplats = 2'048;
         static constexpr uint32_t kInvalidPage = 0xFFFFFFFFu;
 
         struct ChunkFileRange {

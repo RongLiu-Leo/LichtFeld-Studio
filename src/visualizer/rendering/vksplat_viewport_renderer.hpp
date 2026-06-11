@@ -424,7 +424,7 @@ namespace lfs::vis {
         const lfs::core::SplatData* lod_page_cache_model_ = nullptr;
         LodPageCache lod_page_cache_;
         std::size_t lod_page_pool_splats_ = 0;
-        float lod_pool_vram_fraction_ = 0.5f;
+        float lod_pool_vram_fraction_ = 0.15f;
         bool lod_pool_sizing_dirty_ = false;
         std::uint32_t lod_fade_frames_ = 12;
         std::uint64_t gpu_lod_last_page_generation_ = 0;
