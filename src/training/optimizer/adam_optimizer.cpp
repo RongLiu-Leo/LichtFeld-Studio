@@ -838,18 +838,21 @@ namespace lfs::training {
 
         auto new_exp_avg = lfs::core::Tensor::empty(tensor_shape, param.device(), lfs::core::DataType::UInt8);
         auto new_exp_avg_sq = lfs::core::Tensor::empty(tensor_shape, param.device(), lfs::core::DataType::UInt8);
+        const cudaStream_t stream = lfs::core::getCurrentCUDAStream();
 
         const size_t row_size = shape[0] == 0 ? 0 : param.numel() / shape[0];
         if (state.size > 0 && state.exp_avg.numel() > 0) {
             const size_t old_bytes = state.exp_avg.numel() * sizeof(uint8_t);
-            CHECK_CUDA(cudaMemcpyAsync(new_exp_avg.ptr<uint8_t>(), state.exp_avg.ptr<uint8_t>(), old_bytes, cudaMemcpyDeviceToDevice, nullptr));
-            CHECK_CUDA(cudaMemcpyAsync(new_exp_avg_sq.ptr<uint8_t>(), state.exp_avg_sq.ptr<uint8_t>(), old_bytes, cudaMemcpyDeviceToDevice, nullptr));
+            CHECK_CUDA(cudaMemcpyAsync(new_exp_avg.ptr<uint8_t>(), state.exp_avg.ptr<uint8_t>(), old_bytes, cudaMemcpyDeviceToDevice, stream));
+            CHECK_CUDA(cudaMemcpyAsync(new_exp_avg_sq.ptr<uint8_t>(), state.exp_avg_sq.ptr<uint8_t>(), old_bytes, cudaMemcpyDeviceToDevice, stream));
         }
         const size_t offset = state.exp_avg.numel() * sizeof(uint8_t);
         const size_t new_bytes = growth * row_size * sizeof(uint8_t);
-        CHECK_CUDA(cudaMemsetAsync(reinterpret_cast<char*>(new_exp_avg.ptr<uint8_t>()) + offset, QUANTIZED_MOMENT_ZERO_POINT, new_bytes, nullptr));
-        CHECK_CUDA(cudaMemsetAsync(reinterpret_cast<char*>(new_exp_avg_sq.ptr<uint8_t>()) + offset, 0, new_bytes, nullptr));
+        CHECK_CUDA(cudaMemsetAsync(reinterpret_cast<char*>(new_exp_avg.ptr<uint8_t>()) + offset, QUANTIZED_MOMENT_ZERO_POINT, new_bytes, stream));
+        CHECK_CUDA(cudaMemsetAsync(reinterpret_cast<char*>(new_exp_avg_sq.ptr<uint8_t>()) + offset, 0, new_bytes, stream));
 
+        new_exp_avg.set_stream(stream);
+        new_exp_avg_sq.set_stream(stream);
         state.exp_avg = std::move(new_exp_avg);
         state.exp_avg_sq = std::move(new_exp_avg_sq);
 
@@ -857,9 +860,11 @@ namespace lfs::training {
         auto new_m_scale = lfs::core::Tensor::zeros(scale_shape, param.device());
         auto new_v_scale = lfs::core::Tensor::zeros(scale_shape, param.device());
         if (scale_cur > 0 && state.exp_avg_scale.numel() > 0) {
-            CHECK_CUDA(cudaMemcpyAsync(new_m_scale.ptr<float>(), state.exp_avg_scale.ptr<float>(), scale_cur * sizeof(float), cudaMemcpyDeviceToDevice, nullptr));
-            CHECK_CUDA(cudaMemcpyAsync(new_v_scale.ptr<float>(), state.exp_avg_sq_scale.ptr<float>(), scale_cur * sizeof(float), cudaMemcpyDeviceToDevice, nullptr));
+            CHECK_CUDA(cudaMemcpyAsync(new_m_scale.ptr<float>(), state.exp_avg_scale.ptr<float>(), scale_cur * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+            CHECK_CUDA(cudaMemcpyAsync(new_v_scale.ptr<float>(), state.exp_avg_sq_scale.ptr<float>(), scale_cur * sizeof(float), cudaMemcpyDeviceToDevice, stream));
         }
+        new_m_scale.set_stream(stream);
+        new_v_scale.set_stream(stream);
         state.exp_avg_scale = std::move(new_m_scale);
         state.exp_avg_sq_scale = std::move(new_v_scale);
 

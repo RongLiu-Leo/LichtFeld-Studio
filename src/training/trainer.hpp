@@ -162,6 +162,16 @@ namespace lfs::training {
 
         // Allow viewer to lock for rendering
         std::shared_mutex& getRenderMutex() const { return render_mutex_; }
+        // Held shared by viewer/metric readers around their model read and
+        // exclusive by the trainer around the non-refining in-place optimizer
+        // step, so a reader can never observe a half-written model. Distinct from
+        // render_mutex_ (taken only on refining/topology steps) and never held
+        // across a synchronous readback, so it avoids the startup deadlock that
+        // gating render_mutex_ every step would hit. The GPU edges still order the
+        // actual reads/writes; this lock just makes their setup mutually
+        // exclusive. Disable via LFS_NO_MODEL_ACCESS_LOCK=1 (GPU-handshake only).
+        std::shared_mutex& getModelAccessMutex() const { return model_access_mutex_; }
+        [[nodiscard]] static bool modelAccessLockEnabled();
 
         // GPU-side model-read handshake. Call both under a shared lock on
         // getRenderMutex(), bracketing every GPU read of the live model enqueued
@@ -472,6 +482,7 @@ namespace lfs::training {
 
         // Single mutex that protects the model during training
         mutable std::shared_mutex render_mutex_;
+        mutable std::shared_mutex model_access_mutex_;
 
         // Mutex for initialization to ensure thread safety
         mutable std::mutex init_mutex_;

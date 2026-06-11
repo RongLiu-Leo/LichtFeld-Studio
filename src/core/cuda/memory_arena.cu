@@ -76,8 +76,12 @@ namespace lfs::core {
         active_training_frames_ = other.active_training_frames_;
         last_frame_event_ = other.last_frame_event_;
         last_frame_event_valid_ = other.last_frame_event_valid_;
+        external_release_semaphore_ = other.external_release_semaphore_;
+        external_release_value_ = other.external_release_value_;
         other.last_frame_event_ = nullptr;
         other.last_frame_event_valid_ = false;
+        other.external_release_semaphore_ = nullptr;
+        other.external_release_value_ = 0;
     }
 
     RasterizerMemoryArena& RasterizerMemoryArena::operator=(RasterizerMemoryArena&& other) noexcept {
@@ -106,8 +110,12 @@ namespace lfs::core {
             }
             last_frame_event_ = other.last_frame_event_;
             last_frame_event_valid_ = other.last_frame_event_valid_;
+            external_release_semaphore_ = other.external_release_semaphore_;
+            external_release_value_ = other.external_release_value_;
             other.last_frame_event_ = nullptr;
             other.last_frame_event_valid_ = false;
+            other.external_release_semaphore_ = nullptr;
+            other.external_release_value_ = 0;
         }
         return *this;
     }
@@ -248,6 +256,12 @@ namespace lfs::core {
             const cudaStream_t wait_stream = (stream && !legacy_sync) ? stream : nullptr;
             if (cudaWaitExternalSemaphoresAsync(&release_semaphore, &wait_params, 1, wait_stream) != cudaSuccess) {
                 LOG_WARN("RasterizerMemoryArena: external release wait failed (value {})", release_value);
+                // The GPU-side wait wasn't enqueued; host-block on the fence so the
+                // arena isn't reset/reused while the Vulkan batch still reads it
+                // (the device-sync fallback below only covers in-flight CUDA work).
+                if (cudaWaitExternalSemaphoresAsync(&release_semaphore, &wait_params, 1, nullptr) == cudaSuccess) {
+                    cudaStreamSynchronize(nullptr);
+                }
                 chain_ok = false;
             } else if (wait_stream != nullptr) {
                 // The Vulkan tenant device-synced all prior CUDA work at its own

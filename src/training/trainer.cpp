@@ -1758,6 +1758,14 @@ namespace lfs::training {
         return {};
     }
 
+    bool Trainer::modelAccessLockEnabled() {
+        static const bool enabled = [] {
+            const char* v = std::getenv("LFS_NO_MODEL_ACCESS_LOCK");
+            return !(v && v[0] == '1');
+        }();
+        return enabled;
+    }
+
     void Trainer::beginModelRead(cudaStream_t reader_stream) {
         std::lock_guard<std::mutex> lock(stream_sync_mutex_);
         if (params_ready_event_ && params_ready_recorded_) {
@@ -2577,6 +2585,12 @@ namespace lfs::training {
         lfs::core::Tensor rendered;
         {
             const std::shared_lock lock(render_mutex_);
+            // Exclude the non-refining optimizer writes for the metric read window
+            // so the live model can't be mutated mid-render (see getModelAccessMutex).
+            std::optional<std::shared_lock<std::shared_mutex>> model_read_lock;
+            if (modelAccessLockEnabled()) {
+                model_read_lock.emplace(model_access_mutex_);
+            }
             // Run the metric render on the dedicated metrics stream (its kernels
             // and tensor ops overlap training; item() readbacks drain it). Cap
             // arena acquisition so a refining iteration holding the arena can't
@@ -4166,8 +4180,15 @@ namespace lfs::training {
                     // the interop semaphore (the render waits for the step's signal before
                     // reading), so the CPU write-lock is needed only for reallocation.
                     std::unique_lock<std::shared_mutex> lock(render_mutex_, std::defer_lock);
+                    std::unique_lock<std::shared_mutex> model_write_lock(model_access_mutex_, std::defer_lock);
                     if (strategy_->is_refining(iter)) {
                         lock.lock();
+                    } else if (modelAccessLockEnabled()) {
+                        // Non-refining in-place writes: hold the model-access lock
+                        // exclusive across the optimizer step so viewer/metric
+                        // readers (which take it shared) cannot enter mid-write and
+                        // tear the model. Refining excludes them via render_mutex_.
+                        model_write_lock.lock();
                     }
                     // Drain in-flight reader events immediately before the optimizer
                     // step's in-place writes — not only at the loop top — so the

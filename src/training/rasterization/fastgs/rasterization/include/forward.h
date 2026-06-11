@@ -45,6 +45,6 @@ namespace fast_lfs::rasterization {
         const float near,
         const float far,
         bool mip_filter,
-        cudaStream_t stream = nullptr);
+        cudaStream_t stream);
 
 } // namespace fast_lfs::rasterization

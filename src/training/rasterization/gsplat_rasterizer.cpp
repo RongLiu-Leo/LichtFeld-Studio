@@ -512,7 +512,10 @@ namespace lfs::training {
             if (flatten_ids_to_free != nullptr) {
                 cudaFree(flatten_ids_to_free);
             }
-            arena.end_frame(frame_id);
+            // End on the same stream begin_frame used (same guard → same value),
+            // not the streamless device-sync path, so the arena frame chain stays
+            // intact for the next frame instead of falling back to a full sync.
+            arena.end_frame(frame_id, core::getCurrentCUDAStream());
             throw;
         }
     }
@@ -528,11 +531,15 @@ namespace lfs::training {
         // Get arena for temporary allocations
         auto& arena = core::GlobalArenaManager::instance().get_arena();
         auto arena_allocator = arena.get_allocator(ctx.frame_id);
-        // The stream the backward work + arena frame release run on (also needed
-        // by the catch handler), hoisted above the try.
-        const cudaStream_t stream = core::getCurrentCUDAStream()
-                                        ? core::getCurrentCUDAStream()
-                                        : ctx.means.stream();
+        // Run the backward work + arena frame release on the exact stream the
+        // forward began the frame on (ctx.stream), so begin_frame and end_frame
+        // chain on the same stream rather than relying on the caller's guard
+        // matching. Falls back to the current/tensor stream only if unset.
+        const cudaStream_t stream = ctx.stream
+                                        ? ctx.stream
+                                        : (core::getCurrentCUDAStream()
+                                               ? core::getCurrentCUDAStream()
+                                               : ctx.means.stream());
         try {
 
             const uint32_t N = ctx.N;

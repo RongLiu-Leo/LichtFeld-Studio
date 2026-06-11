@@ -228,7 +228,10 @@ namespace lfs::core {
             for (size_t i = 0; i < NUM_BUCKETS; ++i) {
                 std::lock_guard<std::mutex> lock(buckets_[i].mutex);
                 for (const CachedBlock& block : buckets_[i].cache) {
-                    cudaFree(block.ptr);
+                    // Stream-ordered free: these were cudaMallocAsync'd and a block
+                    // last used on a non-default stream may still have pending work,
+                    // which a plain cudaFree would not be ordered against.
+                    cudaFreeAsync(block.ptr, block.stream);
                 }
                 buckets_[i].cache.clear();
                 buckets_[i].cached_bytes = 0;

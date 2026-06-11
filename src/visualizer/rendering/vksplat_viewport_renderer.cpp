@@ -1702,6 +1702,10 @@ namespace lfs::vis {
         render_complete_external_ = {};
         render_complete_timeline_ = VK_NULL_HANDLE;
         render_complete_value_ = 0;
+        // The fresh timeline restarts at 0; clear the published value too, else
+        // renderCompleteValue() would hand the trainer a stale value from the old
+        // timeline that the new CUDA semaphore will never signal.
+        last_signaled_render_value_ = 0;
         last_lod_page_borrow_value_ = 0;
         retired_input_storages_.clear();
         latest_output_ring_slot_ = {};
@@ -3991,9 +3995,9 @@ namespace lfs::vis {
     // not waiting would let the trainer reuse arena scratch a partially
     // submitted batch still reads — so block (bounded) until the value lands
     // or the timeout proves the submit never happened.
-    void VksplatViewportRenderer::waitCompletionValueBounded(const std::uint64_t value) noexcept {
+    bool VksplatViewportRenderer::waitCompletionValueBounded(const std::uint64_t value) noexcept {
         if (context_ == nullptr || render_complete_timeline_ == VK_NULL_HANDLE || value == 0) {
-            return;
+            return false;
         }
         VkSemaphoreWaitInfo wait_info{};
         wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
@@ -4005,7 +4009,9 @@ namespace lfs::vis {
         if (result != VK_SUCCESS) {
             LOG_WARN("VkSplat completion wait after failed pass returned {} (value {})",
                      static_cast<int>(result), value);
+            return false;
         }
+        return true;
     }
 
     std::expected<void, std::string> VksplatViewportRenderer::waitForRingSlot(
@@ -5932,12 +5938,18 @@ namespace lfs::vis {
                 }
             }
         } catch (const std::exception& e) {
-            waitCompletionValueBounded(completion_value);
-            if (overlay_arena_guard) {
-                overlay_arena_guard->noteVulkanRelease(render_complete_cuda_.handle(), completion_value);
+            // Only hand the release to the arena if the timeline signal actually
+            // landed; a failed submit never signals completion_value, and waiting
+            // it later would hang the arena/trainer.
+            if (waitCompletionValueBounded(completion_value)) {
+                last_signaled_render_value_ = completion_value;
+                if (overlay_arena_guard) {
+                    overlay_arena_guard->noteVulkanRelease(render_complete_cuda_.handle(), completion_value);
+                }
             }
             return std::unexpected(std::format("VkSplat selection overlay pass failed: {}", e.what()));
         }
+        last_signaled_render_value_ = completion_value;
         if (overlay_arena_guard) {
             overlay_arena_guard->noteVulkanRelease(render_complete_cuda_.handle(), completion_value);
         }
@@ -6936,15 +6948,21 @@ namespace lfs::vis {
             // On try-block exit: `batch` destructs (endCommandBatch fence wait),
             // then batch_total timer logs.
         } catch (const std::exception& e) {
-            waitCompletionValueBounded(completion_value);
-            if (shared_arena_guard) {
-                shared_arena_guard->noteVulkanRelease(render_complete_cuda_.handle(), completion_value);
+            // Only hand the release to the arena if the timeline signal actually
+            // landed; a failed submit never signals completion_value, and waiting
+            // it later would hang the arena/trainer after this frame.
+            if (waitCompletionValueBounded(completion_value)) {
+                last_signaled_render_value_ = completion_value;
+                if (shared_arena_guard) {
+                    shared_arena_guard->noteVulkanRelease(render_complete_cuda_.handle(), completion_value);
+                }
             }
             return std::unexpected(std::format("VkSplat forward pass failed: {}", e.what()));
         }
         // The batch (and its timeline signal) is submitted; hand the release to
         // the arena and the trainer before the guard/locks let them reuse the
         // scratch this batch still reads.
+        last_signaled_render_value_ = completion_value;
         if (shared_arena_guard) {
             shared_arena_guard->noteVulkanRelease(render_complete_cuda_.handle(), completion_value);
         }

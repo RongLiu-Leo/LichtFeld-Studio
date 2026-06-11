@@ -134,7 +134,7 @@ namespace lfs::vis {
         [[nodiscard]] cudaExternalSemaphore_t renderCompleteFence() const {
             return render_complete_cuda_.handle();
         }
-        [[nodiscard]] std::uint64_t renderCompleteValue() const { return render_complete_value_; }
+        [[nodiscard]] std::uint64_t renderCompleteValue() const { return last_signaled_render_value_; }
 
         // Eagerly create the render stream + completion fence so the trainer↔viewer
         // handshake can be installed before the first live frame submits (covers
@@ -214,7 +214,9 @@ namespace lfs::vis {
         };
 
         [[nodiscard]] std::expected<void, std::string> ensureInitialized(VulkanContext& context);
-        void waitCompletionValueBounded(std::uint64_t value) noexcept;
+        // Returns true iff the timeline reached `value` within the bound (i.e. the
+        // submit that would signal it actually completed); false on timeout.
+        [[nodiscard]] bool waitCompletionValueBounded(std::uint64_t value) noexcept;
         [[nodiscard]] std::expected<InputBindingResult, std::string> prepareInputs(
             VulkanContext& context,
             const lfs::core::SplatData& splat_data,
@@ -481,6 +483,11 @@ namespace lfs::vis {
         std::array<std::uint64_t, kOutputSlotCount> output_generations_{};
         VkSemaphore render_complete_timeline_ = VK_NULL_HANDLE;
         std::uint64_t render_complete_value_ = 0;
+        // The latest completion value a submit actually signaled (or is guaranteed
+        // to signal). renderCompleteValue() returns this — never the reserved
+        // counter — so the trainer/arena never wait a value a failed frame left
+        // unsignaled.
+        std::uint64_t last_signaled_render_value_ = 0;
         std::array<std::uint64_t, kFrameRingSize> ring_completion_values_{};
         std::size_t next_ring_slot_ = 0;
         // Whether the last main render used the macro-tile chain; the

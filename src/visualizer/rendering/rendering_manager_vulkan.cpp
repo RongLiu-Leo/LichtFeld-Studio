@@ -714,6 +714,10 @@ namespace lfs::vis {
                         trainer->setViewerReleaseFence(nullptr);
                     }
                 }
+                // reset() destroys render_stream_; drop it from the TLS current
+                // stream first so the rest of the frame doesn't enqueue work on a
+                // stale handle. Re-installed after the handshake re-init below.
+                frame_stream_guard.reset();
                 vksplat_viewport_renderer_->reset();
             }
             viewport_artifact_service_.clearViewportOutput();
@@ -747,10 +751,31 @@ namespace lfs::vis {
                 LOG_WARN("VkSplat handshake pre-init skipped: {}", ok.error());
             }
         }
+        // ensureHandshakeReady() may have reset()/recreated render_stream_ — on a
+        // model change above, or on a VulkanContext switch inside ensureInitialized
+        // — invalidating any handle installed earlier this frame. Re-sync the guard
+        // unconditionally to the renderer's current stream (not only when empty).
+        frame_stream_guard.reset();
+        if (vksplat_viewport_renderer_ && vksplat_viewport_renderer_->renderStream()) {
+            frame_stream_guard.emplace(vksplat_viewport_renderer_->renderStream());
+        }
         lfs::training::Trainer* live_trainer = nullptr;
         if (is_training && trainer_manager && vksplat_viewport_renderer_ &&
-            vksplat_viewport_renderer_->renderStream()) {
+            vksplat_viewport_renderer_->renderStream() &&
+            vksplat_viewport_renderer_->renderCompleteFence()) {
+            // Gate on a live release fence too: a failed/partial ensureHandshakeReady
+            // leaves render_stream_ created but render_complete_cuda_ uninitialized,
+            // and installing that null fence would silently drop the trainer's borrow
+            // wait (racing any in-flight Vulkan read). render() also fails without it,
+            // so skipping the handshake this frame is correct.
             live_trainer = trainer_manager->getTrainer();
+        }
+        // Held shared for the whole frame so the trainer's non-refining optimizer
+        // step (which takes it exclusive) cannot mutate the live model while this
+        // frame is reading it. Released at function exit (after the readback).
+        std::optional<std::shared_lock<std::shared_mutex>> model_read_lock;
+        if (live_trainer && lfs::training::Trainer::modelAccessLockEnabled()) {
+            model_read_lock.emplace(live_trainer->getModelAccessMutex());
         }
         if (live_trainer) {
             live_trainer->setViewerReleaseFence(vksplat_viewport_renderer_->renderCompleteFence());

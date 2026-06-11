@@ -870,12 +870,12 @@ namespace lfs::training::mcmc {
 
         const float u = curand_uniform(&state) * prob_sum;
 
-        int left = 0;
-        int right = n_alive - 1;
-        int selected_idx = n_alive - 1;
+        int64_t left = 0;
+        int64_t right = static_cast<int64_t>(n_alive) - 1;
+        int64_t selected_idx = static_cast<int64_t>(n_alive) - 1;
 
         while (left <= right) {
-            const int mid = (left + right) / 2;
+            const int64_t mid = (left + right) / 2;
             if (cumsum[mid] >= u) {
                 selected_idx = mid;
                 right = mid - 1;
@@ -982,12 +982,12 @@ namespace lfs::training::mcmc {
 
         const float u = curand_uniform(&state) * prob_sum;
 
-        int left = 0;
-        int right = N - 1;
-        int64_t selected_idx = N - 1;
+        int64_t left = 0;
+        int64_t right = static_cast<int64_t>(N) - 1;
+        int64_t selected_idx = static_cast<int64_t>(N) - 1;
 
         while (left <= right) {
-            const int mid = (left + right) / 2;
+            const int64_t mid = (left + right) / 2;
             if (cumsum[mid] >= u) {
                 selected_idx = mid;
                 right = mid - 1;
