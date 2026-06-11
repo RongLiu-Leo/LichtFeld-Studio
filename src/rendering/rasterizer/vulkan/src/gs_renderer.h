@@ -40,6 +40,13 @@ PACK_STRUCT(struct VulkanGSRendererUniforms {
 });
 static_assert(sizeof(VulkanGSRendererUniforms) == 176);
 
+PACK_STRUCT(struct VulkanGSLodCompactUniforms {
+    uint32_t chunk_count;
+    uint32_t protected_capacity;
+    uint32_t miss_capacity;
+    uint32_t pad0;
+});
+
 PACK_STRUCT(struct VulkanGSLodSelectUniforms {
     uint32_t node_count;
     uint32_t output_capacity;
@@ -108,6 +115,9 @@ PACK_STRUCT(struct VulkanGSSelectionPolygonRasterizeUniforms {
     uint32_t pad2;
 });
 
+inline constexpr uint32_t kLodCompactProtectedCap = 98304;
+inline constexpr uint32_t kLodCompactMissCap = 16384;
+
 class VulkanGSRenderer : public VulkanGSPipeline {
 public:
     struct PrimitiveVisibilityStats {
@@ -123,10 +133,13 @@ public:
         size_t candidate_count = 0;
         size_t rendered_capacity = 0;
         size_t overflow_count = 0;
-        // Per-logical-chunk traversal interest: 0 = untouched, 0xffffffff =
-        // rendered from this frame, otherwise float bits of the touching
+        // GPU-compacted traversal interest: chunks the cut renders from, and
+        // (chunk, priority) misses with priority = float bits of the touching
         // node's pixel scale (orderable as uint).
-        std::vector<uint32_t> chunk_touch;
+        std::vector<uint32_t> protected_chunks;
+        std::vector<std::pair<uint32_t, uint32_t>> miss_candidates;
+        uint32_t protected_overflow = 0;
+        uint32_t miss_overflow = 0;
     };
 
     VulkanGSRenderer();
@@ -338,6 +351,7 @@ protected:
     _ComputePipeline pipeline_compact_visible_primitives = _ComputePipeline(5);
     _ComputePipeline pipeline_lod_map_indices = _ComputePipeline(3);
     _ComputePipeline pipeline_lod_select_threshold = _ComputePipeline(12);
+    _ComputePipeline pipeline_lod_compact_touch = _ComputePipeline(4);
     // HiGS viewer chain
     _ComputePipeline pipeline_cull_splats = _ComputePipeline(10);
     _ComputePipeline pipeline_cull_prepare = _ComputePipeline(2);
@@ -443,6 +457,5 @@ protected:
     void ensureLodSelectionReadback(size_t chunk_capacity);
     void destroyLodSelectionReadback();
     void recordLodSelectionReadback(VulkanGSPipelineBuffers& buffers,
-                                    size_t rendered_capacity,
-                                    size_t chunk_count);
+                                    size_t rendered_capacity);
 };

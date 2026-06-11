@@ -466,6 +466,7 @@ namespace lfs::vis {
                 {"compact_visible_primitives", (root / "generated/compact_visible_primitives.spv").string()},
                 {"lod_map_indices", (root / "generated/lod_map_indices.spv").string()},
                 {"lod_select_threshold", (root / "generated/lod_select_threshold.spv").string()},
+                {"lod_compact_touch", (root / "generated/lod_compact_touch.spv").string()},
                 {"cull_splats", (root / "generated/cull_splats.spv").string()},
                 {"cull_prepare", (root / "generated/cull_prepare.spv").string()},
                 {"projection_forward_survivors",
@@ -5956,42 +5957,24 @@ namespace lfs::vis {
                 lod_stats->candidate_count > lod_stats->rendered_capacity;
 
             std::size_t miss_count = 0;
-            if (!lod_stats->chunk_touch.empty()) {
-                const auto touch_scan_start = std::chrono::steady_clock::now();
-                constexpr std::uint32_t kChunkTouchProtected = 0xffffffffu;
-                gpu_lod_protected_chunks_.clear();
+            if (!lod_stats->protected_chunks.empty() || !lod_stats->miss_candidates.empty()) {
+                gpu_lod_protected_chunks_ = lod_stats->protected_chunks;
                 gpu_lod_prefetch_requests_.clear();
-                std::vector<std::pair<std::uint32_t, std::uint32_t>> miss_candidates;
-                for (std::uint32_t chunk = 0;
-                     chunk < static_cast<std::uint32_t>(lod_stats->chunk_touch.size());
-                     ++chunk) {
-                    const std::uint32_t value = lod_stats->chunk_touch[chunk];
-                    if (value == 0u) {
-                        continue;
-                    }
-                    if (value == kChunkTouchProtected) {
-                        gpu_lod_protected_chunks_.push_back(chunk);
-                    } else {
-                        miss_candidates.emplace_back(value, chunk);
-                    }
-                }
+                // GPU compaction order is nondeterministic; restore the
+                // priority-descending order the pager's budget gate expects.
+                auto miss_candidates = lod_stats->miss_candidates;
                 std::sort(miss_candidates.begin(),
                           miss_candidates.end(),
-                          [](const auto& a, const auto& b) { return a.first > b.first; });
+                          [](const auto& a, const auto& b) { return a.second > b.second; });
                 gpu_lod_prefetch_requests_.reserve(miss_candidates.size());
-                for (const auto& [priority, chunk] : miss_candidates) {
+                for (const auto& [chunk, priority] : miss_candidates) {
                     gpu_lod_prefetch_requests_.push_back({.chunk = chunk, .priority = priority});
                 }
                 miss_count = miss_candidates.size();
                 gpu_lod_prefetch_valid_ = true;
-                const double touch_ms = std::chrono::duration<double, std::milli>(
-                                            std::chrono::steady_clock::now() - touch_scan_start)
-                                            .count();
-                if (touch_ms > 2.0) {
-                    LOG_PERF("vksplat.lod_touch_scan_slow ms={:.2f} entries={} protected={} "
-                             "misses={}",
-                             touch_ms, lod_stats->chunk_touch.size(),
-                             gpu_lod_protected_chunks_.size(), miss_candidates.size());
+                if (lod_stats->protected_overflow > 0 || lod_stats->miss_overflow > 0) {
+                    LOG_PERF("vksplat.lod_compact_overflow protected_dropped={} miss_dropped={}",
+                             lod_stats->protected_overflow, lod_stats->miss_overflow);
                 }
                 static std::uint32_t gpu_lod_prefetch_log_counter = 0;
                 const std::uint32_t prefetch_log_counter = ++gpu_lod_prefetch_log_counter;
