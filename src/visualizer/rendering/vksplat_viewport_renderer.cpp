@@ -5901,6 +5901,7 @@ namespace lfs::vis {
 
             std::size_t miss_count = 0;
             if (!lod_stats->chunk_touch.empty()) {
+                const auto touch_scan_start = std::chrono::steady_clock::now();
                 constexpr std::uint32_t kChunkTouchProtected = 0xffffffffu;
                 gpu_lod_protected_chunks_.clear();
                 gpu_lod_prefetch_requests_.clear();
@@ -5927,6 +5928,15 @@ namespace lfs::vis {
                 }
                 miss_count = miss_candidates.size();
                 gpu_lod_prefetch_valid_ = true;
+                const double touch_ms = std::chrono::duration<double, std::milli>(
+                                            std::chrono::steady_clock::now() - touch_scan_start)
+                                            .count();
+                if (touch_ms > 2.0) {
+                    LOG_PERF("vksplat.lod_touch_scan_slow ms={:.2f} entries={} protected={} "
+                             "misses={}",
+                             touch_ms, lod_stats->chunk_touch.size(),
+                             gpu_lod_protected_chunks_.size(), miss_candidates.size());
+                }
                 static std::uint32_t gpu_lod_prefetch_log_counter = 0;
                 const std::uint32_t prefetch_log_counter = ++gpu_lod_prefetch_log_counter;
                 if (!miss_candidates.empty() &&

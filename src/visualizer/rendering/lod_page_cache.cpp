@@ -8,6 +8,7 @@
 #include "core/path_utils.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <expected>
@@ -363,6 +364,7 @@ namespace lfs::vis {
         if (!configured()) {
             return;
         }
+        const auto submit_start = std::chrono::steady_clock::now();
         collectFinishedDecodes();
 
         std::vector<std::uint8_t> protected_pages;
@@ -490,6 +492,19 @@ namespace lfs::vis {
                          snapshot_.physical_pages,
                          frozen ? " FROZEN" : "");
             }
+        }
+
+        // Render-thread cost spike log: chooseEvictionSlot is O(pages) per
+        // admission, so streaming frames at large pools are the suspect for
+        // stutter. Fires only when this call actually got expensive.
+        const double submit_ms = std::chrono::duration<double, std::milli>(
+                                     std::chrono::steady_clock::now() - submit_start)
+                                     .count();
+        if (submit_ms > 2.0) {
+            LOG_PERF("vksplat.lod_submit_slow ms={:.2f} requests={} wants={} admitted={} "
+                     "no_slot={} margin={} pages={}",
+                     submit_ms, requests.size(), wants, new_requests,
+                     refused_no_slot, refused_margin, pages_.size());
         }
     }
 
