@@ -396,15 +396,24 @@ namespace lfs::vis {
             }
         }
 
+        const std::size_t request_budget = requestBudgetPages();
+
         // Reprioritize queued decodes from this frame's interest; expire
         // requests nothing asked for recently and release their reservations.
+        // Requests arrive priority-descending and the queue only ever holds
+        // budget-recent admissions, so the top few-budgets prefix carries
+        // every entry the queue could match; chunks past it expire as stale,
+        // which is the wanted outcome when the view moved that far.
         if (scheduler_) {
+            const std::size_t interest_cap =
+                std::min(requests.size(), request_budget * 4);
             std::unordered_map<std::uint32_t, std::uint32_t> interest;
-            interest.reserve(requests.size());
-            for (const auto& request : requests) {
-                auto [it, inserted] = interest.try_emplace(request.chunk, request.priority);
+            interest.reserve(interest_cap);
+            for (std::size_t i = 0; i < interest_cap; ++i) {
+                auto [it, inserted] =
+                    interest.try_emplace(requests[i].chunk, requests[i].priority);
                 if (!inserted) {
-                    it->second = std::max(it->second, request.priority);
+                    it->second = std::max(it->second, requests[i].priority);
                 }
             }
             for (const auto& dropped : scheduler_->reprioritize(interest, frame_, staleRequestFrames())) {
@@ -415,7 +424,6 @@ namespace lfs::vis {
             }
         }
 
-        const std::size_t request_budget = requestBudgetPages();
         eviction_scratch_enabled_ = true;
         eviction_scratch_dirty_ = true;
         std::size_t new_requests = 0;
@@ -453,6 +461,17 @@ namespace lfs::vis {
                 snapshot_.chunk_to_page[chunk] != kInvalidPage;
             if (resident && stamp_resident_requests) {
                 stampProtection(chunk, request.priority);
+            }
+            // Once the budget is gone no later request can admit (the list is
+            // priority-descending); resident stamps above stay complete, the
+            // rest is deferral bookkeeping only — skip the hash work.
+            if (!resident &&
+                (new_requests >= request_budget ||
+                 outstanding_base + new_requests >= request_budget)) {
+                ++wants;
+                ++deferred_requests_;
+                ++budget_deferred;
+                continue;
             }
             const bool active_request = resident || active_chunks.count(chunk) > 0;
             if (!active_request) {
