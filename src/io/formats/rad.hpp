@@ -117,6 +117,10 @@ namespace lfs::io {
     // splats-per-chunk: decodes each source chunk to display-space values and
     // streams them back out through the current encoders at CHUNK_SIZE. Node
     // order, tree links, and logical indices are unchanged.
+    // True when the file is a RAD LOD written with a different
+    // splats-per-chunk than this build (header probe only, no decode).
+    [[nodiscard]] std::expected<bool, std::string> rad_lod_needs_rechunk(
+        const std::filesystem::path& input);
     using RechunkProgressCallback = std::function<bool(float)>;
     [[nodiscard]] Result<void> rechunk_rad_lod(
         const std::filesystem::path& input,

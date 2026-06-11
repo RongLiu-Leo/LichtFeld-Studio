@@ -351,7 +351,17 @@ namespace lfs::app {
             const param::ConvertParameters& params) {
 
             if (params.format == param::OutputFormat::RAD && isRadExtension(input)) {
-                return rechunkRadFile(input, output);
+                const auto needs_rechunk = lfs::io::rad_lod_needs_rechunk(input);
+                if (!needs_rechunk) {
+                    LOG_ERROR("RAD probe failed: {}", needs_rechunk.error());
+                    std::println(stderr, "  Error: {}", needs_rechunk.error());
+                    return false;
+                }
+                // Only stale-chunk LOD files take the migration path; current
+                // LOD and flat RADs round-trip through the generic pipeline.
+                if (*needs_rechunk) {
+                    return rechunkRadFile(input, output);
+                }
             }
 
             if (params.format == param::OutputFormat::RAD && isPlyExtension(input) &&

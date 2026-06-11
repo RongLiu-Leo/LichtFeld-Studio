@@ -4871,6 +4871,17 @@ namespace lfs::io {
         return {};
     }
 
+    std::expected<bool, std::string> rad_lod_needs_rechunk(const std::filesystem::path& input) {
+        auto info = read_rad_file_info(input);
+        if (!info) {
+            return std::unexpected(info.error());
+        }
+        if (!info->meta.lod_tree.value_or(false)) {
+            return false;
+        }
+        return info->meta.chunk_size.value_or(0) != CHUNK_SIZE;
+    }
+
     Result<void> rechunk_rad_lod(const std::filesystem::path& input,
                                  const std::filesystem::path& output,
                                  const RechunkProgressCallback& progress) {
