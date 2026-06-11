@@ -154,6 +154,7 @@ namespace lfs::vis {
                                     std::span<const std::uint8_t> protected_pages = {});
         [[nodiscard]] std::size_t chooseEvictionSlot(
             std::span<const std::uint8_t> protected_pages = {}) const;
+        void buildEvictionScratch(std::span<const std::uint8_t> protected_pages) const;
         void reserveUpload(std::size_t page, std::uint32_t chunk, bool pin, std::uint32_t priority);
         void publishPage(std::size_t page, std::uint32_t chunk, bool pin);
         void invalidateResidentPage(std::size_t page);
@@ -162,6 +163,21 @@ namespace lfs::vis {
         void stampProtection(std::uint32_t chunk, std::uint32_t priority = 0);
         [[nodiscard]] std::uint32_t effectivePriority(const PageSlot& slot) const;
         [[nodiscard]] std::size_t requestBudgetPages() const;
+
+        // Per-submit eviction scratch: one O(pages) candidate pass amortized
+        // over all of a frame's admissions, replacing an O(pages) scan per
+        // admission (measured 50 ms/frame at 20K pages x 330 admits). Built
+        // lazily on the first chooseEvictionSlot inside submitInternal;
+        // outside a submit the legacy linear scan runs.
+        struct EvictionCandidate {
+            std::uint32_t priority = 0;
+            std::uint64_t last_used = 0;
+            std::uint32_t page = 0;
+        };
+        mutable std::vector<std::uint32_t> eviction_free_scratch_;
+        mutable std::vector<EvictionCandidate> eviction_heap_;
+        mutable bool eviction_scratch_enabled_ = false;
+        mutable bool eviction_scratch_dirty_ = false;
 
         std::vector<PageSlot> pages_;
         std::vector<PendingUpload> pending_uploads_;

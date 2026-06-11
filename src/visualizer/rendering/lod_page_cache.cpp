@@ -402,6 +402,8 @@ namespace lfs::vis {
         }
 
         const std::size_t request_budget = requestBudgetPages();
+        eviction_scratch_enabled_ = true;
+        eviction_scratch_dirty_ = true;
         std::size_t new_requests = 0;
         std::size_t wants = 0;
         std::size_t budget_deferred = 0;
@@ -458,6 +460,8 @@ namespace lfs::vis {
                 }
             }
         }
+
+        eviction_scratch_enabled_ = false;
 
         // Admission telemetry: a frozen pool (wants but zero admissions with
         // margin/no-slot refusals) is indistinguishable from healthy flow
@@ -665,8 +669,74 @@ namespace lfs::vis {
         return age > kIdleFreeFrames ? 0u : slot.last_priority;
     }
 
+    void LodPageCache::buildEvictionScratch(
+        const std::span<const std::uint8_t> protected_pages) const {
+        eviction_free_scratch_.clear();
+        eviction_heap_.clear();
+        const auto heap_after = [](const EvictionCandidate& a, const EvictionCandidate& b) {
+            return a.priority > b.priority ||
+                   (a.priority == b.priority && a.last_used > b.last_used);
+        };
+        for (std::size_t page = pages_.size(); page-- > 0;) {
+            if (page < protected_pages.size() && protected_pages[page] != 0) {
+                continue;
+            }
+            const auto& slot = pages_[page];
+            if (slot.loading_chunk != kInvalidPage) {
+                continue;
+            }
+            if (slot.chunk == kInvalidPage) {
+                // Descending so back() pops the lowest index, matching the
+                // legacy first-free-by-index choice.
+                eviction_free_scratch_.push_back(static_cast<std::uint32_t>(page));
+                continue;
+            }
+            if (slot.pinned || slot.protected_until_frame > frame_) {
+                continue;
+            }
+            eviction_heap_.push_back({
+                .priority = frame_ > 0 ? effectivePriority(slot) : 0u,
+                .last_used = slot.last_used,
+                .page = static_cast<std::uint32_t>(page),
+            });
+        }
+        std::make_heap(eviction_heap_.begin(), eviction_heap_.end(), heap_after);
+    }
+
     std::size_t LodPageCache::chooseEvictionSlot(
         const std::span<const std::uint8_t> protected_pages) const {
+        if (eviction_scratch_enabled_) {
+            if (eviction_scratch_dirty_) {
+                buildEvictionScratch(protected_pages);
+                eviction_scratch_dirty_ = false;
+            }
+            while (!eviction_free_scratch_.empty()) {
+                const std::uint32_t page = eviction_free_scratch_.back();
+                eviction_free_scratch_.pop_back();
+                if (pages_[page].chunk == kInvalidPage &&
+                    pages_[page].loading_chunk == kInvalidPage) {
+                    return page;
+                }
+            }
+            const auto heap_after = [](const EvictionCandidate& a, const EvictionCandidate& b) {
+                return a.priority > b.priority ||
+                       (a.priority == b.priority && a.last_used > b.last_used);
+            };
+            while (!eviction_heap_.empty()) {
+                std::pop_heap(eviction_heap_.begin(), eviction_heap_.end(), heap_after);
+                const EvictionCandidate candidate = eviction_heap_.back();
+                eviction_heap_.pop_back();
+                // Revalidate: an earlier admission this submit may have made
+                // the slot loading, or a resident-want stamp protected it.
+                const auto& slot = pages_[candidate.page];
+                if (slot.pinned || slot.loading_chunk != kInvalidPage ||
+                    slot.chunk == kInvalidPage || slot.protected_until_frame > frame_) {
+                    continue;
+                }
+                return candidate.page;
+            }
+            return pages_.size();
+        }
         for (std::size_t page = 0; page < pages_.size(); ++page) {
             if (page < protected_pages.size() && protected_pages[page] != 0) {
                 continue;
