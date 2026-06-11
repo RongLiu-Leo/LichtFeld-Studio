@@ -567,6 +567,11 @@ void VulkanGSRenderer::initializeExternal(const std::map<std::string, std::strin
     create_optional(pipeline_cull_splats, "cull_splats");
     create_optional(pipeline_cull_prepare, "cull_prepare");
     create_optional(pipeline_projection_forward_survivors, "projection_forward_survivors");
+    // Quant-pool projection variants exist only where the viewer registers
+    // them; a quant pool with a missing pipeline is a hard dispatch error.
+    create_optional(pipeline_projection_forward_quant, "projection_forward_quant");
+    create_optional(pipeline_projection_forward_quant_3dgut, "projection_forward_quant_3dgut");
+    create_optional(pipeline_projection_forward_quant_survivors, "projection_forward_quant_survivors");
     create_optional(pipeline_prepare_visible_chain, "prepare_visible_chain");
     create_optional(pipeline_copy_visible_indices, "copy_visible_indices");
     create_optional(pipeline_cumsum_indirect.block_scan, "cumsum_block_scan_indirect");
@@ -827,10 +832,19 @@ void VulkanGSRenderer::executeProjectionForward(
         lod_counts_binding,
     };
 
+    VulkanGSRendererUniforms projection_uniforms = uniforms;
+    if (buffers.quant_pool) {
+        projection_uniforms.lod_page_splats = buffers.pool_page_splats;
+        projection_buffers.push_back(buffers.page_frames.deviceBuffer);
+    }
     executeCompute(
         {{num_splats, SUBGROUP_SIZE}},
-        &uniforms, sizeof(uniforms),
-        use_gut_projection ? pipeline_projection_forward_3dgut : pipeline_projection_forward,
+        &projection_uniforms, sizeof(projection_uniforms),
+        buffers.quant_pool
+            ? (use_gut_projection ? pipeline_projection_forward_quant_3dgut
+                                  : pipeline_projection_forward_quant)
+            : (use_gut_projection ? pipeline_projection_forward_3dgut
+                                  : pipeline_projection_forward),
         projection_buffers);
 }
 
@@ -2087,6 +2101,9 @@ void VulkanGSRenderer::executeProjectionForwardSurvivors(
     survivor_uniforms.sort_capacity = static_cast<uint32_t>(
         std::min<size_t>(visible_capacity,
                          static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+    if (buffers.quant_pool) {
+        survivor_uniforms.lod_page_splats = buffers.pool_page_splats;
+    }
 
     auto& unsorted_keys = resizeDeviceBuffer(buffers.unsorted_keys(), visible_capacity);
     auto& unsorted_idx = resizeDeviceBuffer(buffers.unsorted_gauss_idx(), visible_capacity);
@@ -2102,45 +2119,50 @@ void VulkanGSRenderer::executeProjectionForwardSurvivors(
     const _VulkanBuffer lod_counts_binding =
         (lod_counts.buffer != VK_NULL_HANDLE) ? lod_counts : unsorted_keys;
 
+    std::vector<_VulkanBuffer> projection_buffers = {
+        // inputs
+        buffers.xyz_ws.deviceBuffer,
+        buffers.sh0.deviceBuffer,
+        buffers.shN.deviceBuffer,
+        buffers.rotations.deviceBuffer,
+        buffers.scaling_raw.deviceBuffer,
+        buffers.opacity_raw.deviceBuffer,
+        // compact-slot outputs (slots 6 and 8 are absent from the
+        // pipeline layout; the entries are placeholders)
+        unsorted_keys,
+        resizeDeviceBuffer(buffers.rect_tile_space, visible_capacity),
+        unsorted_keys,
+        resizeDeviceBuffer(buffers.xy_vs, 2 * visible_capacity),
+        resizeDeviceBuffer(buffers.depths, visible_capacity),
+        resizeDeviceBuffer(buffers.inv_cov_vs_opacity, 4 * visible_capacity),
+        resizeDeviceBuffer(buffers.rgb, 3 * visible_capacity),
+        resizeDeviceBuffer(buffers.overlay_flags, visible_capacity),
+        transform_indices,
+        node_mask,
+        overlay_params,
+        model_transforms,
+        unsorted_keys,
+        lod_indices_binding,
+        lod_logical_indices_binding,
+        lod_levels_binding,
+        lod_weights_binding,
+        lod_counts_binding,
+        buffers.survivors.deviceBuffer,
+        buffers.survivor_state.deviceBuffer,
+        unsorted_idx,
+        buffers.visible_emit_count.deviceBuffer,
+        resizeDeviceBuffer(buffers.orig_ids, visible_capacity),
+    };
+    if (buffers.quant_pool) {
+        projection_buffers.push_back(buffers.page_frames.deviceBuffer);
+    }
     executeComputeIndirect(
         buffers.survivor_state.deviceBuffer,
         sizeof(uint32_t),
         &survivor_uniforms, sizeof(survivor_uniforms),
-        pipeline_projection_forward_survivors,
-        {
-            // inputs
-            buffers.xyz_ws.deviceBuffer,
-            buffers.sh0.deviceBuffer,
-            buffers.shN.deviceBuffer,
-            buffers.rotations.deviceBuffer,
-            buffers.scaling_raw.deviceBuffer,
-            buffers.opacity_raw.deviceBuffer,
-            // compact-slot outputs (slots 6 and 8 are absent from the
-            // pipeline layout; the entries are placeholders)
-            unsorted_keys,
-            resizeDeviceBuffer(buffers.rect_tile_space, visible_capacity),
-            unsorted_keys,
-            resizeDeviceBuffer(buffers.xy_vs, 2 * visible_capacity),
-            resizeDeviceBuffer(buffers.depths, visible_capacity),
-            resizeDeviceBuffer(buffers.inv_cov_vs_opacity, 4 * visible_capacity),
-            resizeDeviceBuffer(buffers.rgb, 3 * visible_capacity),
-            resizeDeviceBuffer(buffers.overlay_flags, visible_capacity),
-            transform_indices,
-            node_mask,
-            overlay_params,
-            model_transforms,
-            unsorted_keys,
-            lod_indices_binding,
-            lod_logical_indices_binding,
-            lod_levels_binding,
-            lod_weights_binding,
-            lod_counts_binding,
-            buffers.survivors.deviceBuffer,
-            buffers.survivor_state.deviceBuffer,
-            unsorted_idx,
-            buffers.visible_emit_count.deviceBuffer,
-            resizeDeviceBuffer(buffers.orig_ids, visible_capacity),
-        });
+        buffers.quant_pool ? pipeline_projection_forward_quant_survivors
+                           : pipeline_projection_forward_survivors,
+        projection_buffers);
 }
 
 void VulkanGSRenderer::executeSortPrimitivesByDepthVisible(

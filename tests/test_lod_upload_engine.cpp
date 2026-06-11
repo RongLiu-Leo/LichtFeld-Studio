@@ -2,6 +2,7 @@
  *
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
+#include "rendering/lod_pool_quant.hpp"
 #include "rendering/lod_upload_engine.hpp"
 
 #include "core/cuda/sh_layout.cuh"
@@ -27,21 +28,22 @@ namespace {
     struct DevicePool {
         void* base = nullptr;
         void* meta_base = nullptr;
-        std::array<std::size_t, 6> region_offset{};
+        std::array<std::size_t, 7> region_offset{};
         std::size_t splat_capacity = 0;
         std::size_t meta_links_offset = 0;
 
         explicit DevicePool(const std::size_t pages, const std::uint32_t dst_rest) {
             splat_capacity = pages * kPageSplats;
-            std::array<std::size_t, 6> region_bytes{};
-            region_bytes[0] = splat_capacity * 3u * sizeof(float);
-            region_bytes[1] = splat_capacity * 3u * sizeof(float);
+            std::array<std::size_t, 7> region_bytes{};
+            region_bytes[0] = splat_capacity * lfs::vis::lodq::kXyzBytes;
+            region_bytes[1] = splat_capacity * lfs::vis::lodq::kSh0Bytes;
             region_bytes[2] = dst_rest == 0u
                                   ? 4u * sizeof(float)
-                                  : lfs::core::sh_swizzled_byte_count(splat_capacity, dst_rest);
-            region_bytes[3] = splat_capacity * 4u * sizeof(float);
-            region_bytes[4] = splat_capacity * 3u * sizeof(float);
-            region_bytes[5] = splat_capacity * sizeof(float);
+                                  : lfs::core::sh_swizzled_byte_count(splat_capacity, dst_rest) / 4u;
+            region_bytes[3] = splat_capacity * lfs::vis::lodq::kRotationBytes;
+            region_bytes[4] = splat_capacity * lfs::vis::lodq::kScalingBytes;
+            region_bytes[5] = splat_capacity * lfs::vis::lodq::kOpacityBytes;
+            region_bytes[6] = pages * lfs::vis::lodq::kPageFrameBytes;
             std::size_t offset = 0;
             for (std::size_t i = 0; i < region_bytes.size(); ++i) {
                 region_offset[i] = offset;

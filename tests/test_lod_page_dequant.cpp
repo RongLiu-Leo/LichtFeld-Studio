@@ -10,6 +10,7 @@
 
 #include "core/cuda/sh_layout.cuh"
 #include "io/formats/rad.hpp"
+#include "io/formats/rad_dequant_math.hpp"
 #include "io/ply_to_rad_lod.hpp"
 #include "rendering/lod_page_dequant_cuda.hpp"
 
@@ -168,23 +169,26 @@ namespace {
             }
             ~DeviceBuffer() { (void)cudaFree(ptr); }
         };
-        DeviceBuffer d_means(kPage * 3 * sizeof(float));
-        DeviceBuffer d_sh0(kPage * 3 * sizeof(float));
-        DeviceBuffer d_shN(sh_floats * sizeof(float));
-        DeviceBuffer d_rot(kPage * 4 * sizeof(float));
-        DeviceBuffer d_scale(kPage * 3 * sizeof(float));
-        DeviceBuffer d_opacity(kPage * sizeof(float));
+        const std::size_t sh_slot_count = sh_floats / 4u;
+        DeviceBuffer d_means(kPage * lfs::vis::lodq::kXyzBytes);
+        DeviceBuffer d_sh0(kPage * lfs::vis::lodq::kSh0Bytes);
+        DeviceBuffer d_shN(sh_slot_count * lfs::vis::lodq::kShNSlotBytes);
+        DeviceBuffer d_rot(kPage * lfs::vis::lodq::kRotationBytes);
+        DeviceBuffer d_scale(kPage * lfs::vis::lodq::kScalingBytes);
+        DeviceBuffer d_opacity(kPage * lfs::vis::lodq::kOpacityBytes);
+        DeviceBuffer d_frames(lfs::vis::lodq::kPageFrameBytes);
         DeviceBuffer d_bounds(kPage * sizeof(float4));
         DeviceBuffer d_links(kPage * sizeof(uint4));
         DeviceBuffer d_slot(64u << 20);
 
         lfs::vis::LodPoolDeviceView pool{};
         pool.means = static_cast<float*>(d_means.ptr);
-        pool.sh0 = static_cast<float*>(d_sh0.ptr);
-        pool.shN = static_cast<float*>(d_shN.ptr);
-        pool.rotation = static_cast<float*>(d_rot.ptr);
-        pool.scaling = static_cast<float*>(d_scale.ptr);
-        pool.opacity = static_cast<float*>(d_opacity.ptr);
+        pool.sh0 = static_cast<uint2*>(d_sh0.ptr);
+        pool.shN = static_cast<std::uint32_t*>(d_shN.ptr);
+        pool.rotation = static_cast<uint2*>(d_rot.ptr);
+        pool.scaling = static_cast<uint2*>(d_scale.ptr);
+        pool.opacity = static_cast<std::uint16_t*>(d_opacity.ptr);
+        pool.page_frames = static_cast<float4*>(d_frames.ptr);
         pool.meta_bounds = static_cast<float4*>(d_bounds.ptr);
         pool.meta_links = static_cast<uint4*>(d_links.ptr);
         pool.dst_rest = dst_rest;
@@ -250,18 +254,66 @@ namespace {
             for (std::size_t i = 0; i < count * 3; ++i) {
                 ASSERT_EQ(gpu_means[i], ref_means[i]) << "means bit-parity at " << i;
             }
-            expectClose(readDevice<float>(d_sh0.ptr, count * 3),
-                        std::span<const float>(ref_sh0.data(), count * 3), "sh0");
-            expectClose(readDevice<float>(d_scale.ptr, count * 3),
-                        std::span<const float>(ref_scale.data(), count * 3), "scaling");
-            expectClose(readDevice<float>(d_opacity.ptr, count),
-                        std::span<const float>(ref_opacity.data(), count), "opacity");
-            // Reference rotation layout is (w,x,y,z) in pool order already.
-            expectClose(readDevice<float>(d_rot.ptr, count * 4),
-                        std::span<const float>(ref_rot.data(), count * 4), "rotation",
-                        1e-4, 1e-5);
-            expectClose(readDevice<float>(d_shN.ptr, sh_floats),
-                        std::span<const float>(ref_shN.data(), sh_floats), "shN");
+            namespace radmath = lfs::io::radmath;
+            // sh0 reaches f16 through bit-exact fp32 on both sides: the GPU
+            // halves must equal floatToHalf(reference) exactly.
+            const auto gpu_sh0 = readDevice<uint2>(d_sh0.ptr, count);
+            for (std::size_t i = 0; i < count; ++i) {
+                const std::uint16_t h[3] = {
+                    static_cast<std::uint16_t>(gpu_sh0[i].x & 0xFFFFu),
+                    static_cast<std::uint16_t>(gpu_sh0[i].x >> 16),
+                    static_cast<std::uint16_t>(gpu_sh0[i].y & 0xFFFFu)};
+                for (std::size_t d = 0; d < 3; ++d) {
+                    ASSERT_EQ(h[d], radmath::floatToHalf(ref_sh0[i * 3 + d]))
+                        << "sh0 half-parity at " << i << "," << d;
+                }
+            }
+            // log-f16 scales pass through from the file; the fp32 reference
+            // went f16->exp->log, so allow one f16 step.
+            const auto gpu_scale = readDevice<uint2>(d_scale.ptr, count);
+            const auto gpu_rot = readDevice<uint2>(d_rot.ptr, count);
+            const auto gpu_opacity = readDevice<std::uint16_t>(d_opacity.ptr, count);
+            for (std::size_t i = 0; i < count && i < 4096; ++i) {
+                const float s[3] = {
+                    radmath::halfToFloat(static_cast<std::uint16_t>(gpu_scale[i].x & 0xFFFFu)),
+                    radmath::halfToFloat(static_cast<std::uint16_t>(gpu_scale[i].x >> 16)),
+                    radmath::halfToFloat(static_cast<std::uint16_t>(gpu_scale[i].y & 0xFFFFu))};
+                for (std::size_t d = 0; d < 3; ++d) {
+                    ASSERT_NEAR(s[d], ref_scale[i * 3 + d],
+                                std::max(2e-3, 2e-3 * std::abs(ref_scale[i * 3 + d])))
+                        << "scaling at " << i << "," << d;
+                }
+                const float r[4] = {
+                    radmath::halfToFloat(static_cast<std::uint16_t>(gpu_rot[i].x & 0xFFFFu)),
+                    radmath::halfToFloat(static_cast<std::uint16_t>(gpu_rot[i].x >> 16)),
+                    radmath::halfToFloat(static_cast<std::uint16_t>(gpu_rot[i].y & 0xFFFFu)),
+                    radmath::halfToFloat(static_cast<std::uint16_t>(gpu_rot[i].y >> 16))};
+                for (std::size_t d = 0; d < 4; ++d) {
+                    ASSERT_NEAR(r[d], ref_rot[i * 4 + d], 2e-3) << "rotation at " << i << "," << d;
+                }
+                ASSERT_NEAR(radmath::halfToFloat(gpu_opacity[i]), ref_opacity[i],
+                            std::max(2e-3, 2e-3 * std::abs(ref_opacity[i])))
+                    << "opacity at " << i;
+            }
+            // s8 SH bytes pass through bit-exact; decoding them with the
+            // frame scales must reproduce the reference floats exactly.
+            const auto gpu_frames = readDevice<float>(d_frames.ptr, 4);
+            const auto gpu_shN = readDevice<std::uint32_t>(d_shN.ptr, sh_slot_count);
+            for (std::size_t k = 0; k < sh_floats; ++k) {
+                const std::uint32_t slot_idx = static_cast<std::uint32_t>(k / 4u);
+                const std::uint32_t comp = static_cast<std::uint32_t>(k % 4u);
+                // Swizzled float4 layout is [block][slot][lane].
+                const std::uint32_t slot_in_block =
+                    (slot_idx % (dst_slots * lfs::core::kShReorderSize)) /
+                    lfs::core::kShReorderSize;
+                const std::uint32_t c = slot_in_block * 4u + comp;
+                const std::uint32_t band = c / 3u < 3u ? 0u : (c / 3u < 8u ? 1u : 2u);
+                const auto b = static_cast<std::int8_t>(
+                    (gpu_shN[slot_idx] >> (comp * 8u)) & 0xFFu);
+                const float decoded =
+                    c < 45u ? radmath::dequantS8(b, std::max(gpu_frames[band], 1e-6f)) : 0.0f;
+                ASSERT_EQ(decoded, ref_shN[k]) << "shN at float " << k;
+            }
 
             const std::size_t logical_start = c * kPage;
             const std::size_t run = std::min(kPage, view->node_count - logical_start);

@@ -1132,7 +1132,9 @@ struct Uniforms {
     // HiGS raster/compose wave window start (batch index); occupies what was
     // implicit alignment padding before dist_coeffs, so the layout is unchanged.
     uint wave_base;
-    uint higs_pad0;
+    // Splats per LOD pool page (quant-pool projection: page = g_idx / this);
+    // occupies the former higs_pad0 padding slot.
+    uint lod_page_splats;
     float4 dist_coeffs;
     float4x4 world_view_transform;
 }

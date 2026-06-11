@@ -7,6 +7,7 @@
 #include "core/exportable_storage.hpp"
 #include "core/splat_data.hpp"
 #include "lod_page_cache.hpp"
+#include "lod_pool_quant.hpp"
 #include "lod_upload_engine.hpp"
 #include "rendering/cuda_vulkan_interop.hpp"
 #include "rendering/rasterizer/vulkan/src/gs_renderer.h"
@@ -262,7 +263,7 @@ namespace lfs::vis {
         // Fallback coalesced CUDA-imported VkBuffer per ring slot, holding raw
         // SplatData input regions back-to-back. Training tensors created as
         // Vulkan-external buffers bypass this allocation and are bound directly.
-        static constexpr std::size_t kInputRegionCount = 6;
+        static constexpr std::size_t kInputRegionCount = 7;
         static constexpr std::size_t kOverlayRegionCount = 7;
         static constexpr std::size_t kSelectionQueryRegionCount = 7;
         static constexpr std::size_t kRegionAlignment = 256; // VK minStorageBufferOffsetAlignment upper bound on common HW

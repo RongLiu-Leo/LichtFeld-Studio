@@ -225,11 +225,12 @@ namespace lfs::vis {
             auto* const device_base = static_cast<std::uint8_t*>(layout_.device_base);
             LodPoolDeviceView view{};
             view.means = reinterpret_cast<float*>(device_base + layout_.region_offset[0]);
-            view.sh0 = reinterpret_cast<float*>(device_base + layout_.region_offset[1]);
-            view.shN = reinterpret_cast<float*>(device_base + layout_.region_offset[2]);
-            view.rotation = reinterpret_cast<float*>(device_base + layout_.region_offset[3]);
-            view.scaling = reinterpret_cast<float*>(device_base + layout_.region_offset[4]);
-            view.opacity = reinterpret_cast<float*>(device_base + layout_.region_offset[5]);
+            view.sh0 = reinterpret_cast<uint2*>(device_base + layout_.region_offset[1]);
+            view.shN = reinterpret_cast<std::uint32_t*>(device_base + layout_.region_offset[2]);
+            view.rotation = reinterpret_cast<uint2*>(device_base + layout_.region_offset[3]);
+            view.scaling = reinterpret_cast<uint2*>(device_base + layout_.region_offset[4]);
+            view.opacity = reinterpret_cast<std::uint16_t*>(device_base + layout_.region_offset[5]);
+            view.page_frames = reinterpret_cast<float4*>(device_base + layout_.region_offset[6]);
             view.dst_rest = layout_.dst_rest;
             view.dst_slots = layout_.dst_slots;
             if (layout_.meta_base != nullptr) {

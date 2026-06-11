@@ -69,6 +69,51 @@ namespace lfs::io::radmath {
         return bitsToFloat(f32);
     }
 
+    LFS_RAD_HD std::uint32_t floatToBits(const float v) {
+#if defined(__CUDA_ARCH__)
+        return __float_as_uint(v);
+#else
+        std::uint32_t bits;
+        std::memcpy(&bits, &v, sizeof(bits));
+        return bits;
+#endif
+    }
+
+    // IEEE binary32 -> binary16, round-to-nearest-even with flush-to-zero on
+    // underflow — the same convention as rad.cpp's file encoder. One bit
+    // algorithm on host and device (NOT __float2half_rn, which emits
+    // subnormals the CPU side flushes): the canonical pool stores f16 and
+    // parity tests compare the bits.
+    LFS_RAD_HD std::uint16_t floatToHalf(const float value) {
+        const std::uint32_t f32 = floatToBits(value);
+        const std::uint32_t sign = (f32 >> 31) & 0x1u;
+        const std::uint32_t exponent = (f32 >> 23) & 0xFFu;
+        const std::uint32_t mantissa = f32 & 0x7FFFFFu;
+        if (exponent == 0u) {
+            return static_cast<std::uint16_t>(sign << 15);
+        }
+        if (exponent == 0xFFu) {
+            return static_cast<std::uint16_t>((sign << 15) | 0x7C00u | (mantissa >> 13));
+        }
+        const std::int32_t new_exp = static_cast<std::int32_t>(exponent) - 127 + 15;
+        if (new_exp >= 31) {
+            return static_cast<std::uint16_t>((sign << 15) | 0x7C00u);
+        }
+        if (new_exp <= 0) {
+            return static_cast<std::uint16_t>(sign << 15);
+        }
+        std::uint32_t new_mantissa = mantissa >> 13;
+        if ((mantissa & 0x1FFFu) > 0x1000u ||
+            ((mantissa & 0x1FFFu) == 0x1000u && (new_mantissa & 1u))) {
+            ++new_mantissa;
+        }
+        // ADD, not OR: a rounding carry (mantissa 0x400) must propagate into
+        // the exponent or values crossing a power of two get halved.
+        return static_cast<std::uint16_t>((sign << 15) +
+                                          (static_cast<std::uint32_t>(new_exp) << 10) +
+                                          new_mantissa);
+    }
+
     LFS_RAD_HD float dequantR8(const std::uint8_t v, const float min_val, const float range) {
         return min_val + (static_cast<float>(v) / 255.0f) * range;
     }

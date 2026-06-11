@@ -30,10 +30,11 @@ namespace lfs::vis {
     class LodUploadEngine {
     public:
         struct DeviceLayout {
-            // Payload pool (page-input regions, InputRegion order):
-            // xyz_ws, sh0, shN, rotations, scaling_raw, opacity_raw.
+            // Payload pool (page-input regions, InputRegion order): xyz_ws,
+            // sh0, shN, rotations, scaling_raw, opacity_raw, page_frames —
+            // canonical quantized layout per lod_pool_quant.hpp.
             void* device_base = nullptr;
-            std::array<std::size_t, 6> region_offset{};
+            std::array<std::size_t, 7> region_offset{};
             std::size_t splat_capacity = 0;
             // Destination SH-rest coefficient count and float4 slot count.
             std::uint32_t dst_rest = 0;

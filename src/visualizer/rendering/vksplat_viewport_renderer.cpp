@@ -4,6 +4,8 @@
 
 #include "vksplat_viewport_renderer.hpp"
 
+#include "lod_page_dequant_cuda.hpp"
+
 #include "core/cuda/memory_arena.hpp"
 #include "core/cuda/sh_layout.cuh"
 #include "core/executable_path.hpp"
@@ -56,17 +58,20 @@ namespace lfs::vis {
         // only a genuinely unevictable pool qualifies.
         constexpr std::uint32_t kLodAdmissionFrozenFrames = 30u;
 
-        // Bytes one pool page occupies on the GPU: page-input regions for one
-        // chunk of splats (mirrors ensureLodPageInputStorage's layout) plus
-        // the per-node traversal metadata (bounds 16 B + links 16 B).
+        // Bytes one pool page occupies on the GPU: canonical quantized
+        // page-input regions (mirrors ensureLodPageInputStorage's layout)
+        // plus the per-node traversal metadata (bounds 16 B + links 16 B).
         std::size_t lodPageDeviceBytes(const lfs::core::SplatData& splat_data) {
             const std::size_t page_splats = LodPageCache::kChunkSplats;
             const std::uint32_t layout_rest =
                 static_cast<std::uint32_t>(splat_data.max_sh_coeffs_rest());
-            std::size_t bytes = page_splats * (3u + 3u + 4u + 3u + 1u) * sizeof(float);
+            std::size_t bytes = page_splats * (lodq::kXyzBytes + lodq::kSh0Bytes +
+                                               lodq::kRotationBytes + lodq::kScalingBytes +
+                                               lodq::kOpacityBytes);
             bytes += layout_rest == 0u
                          ? 4u * sizeof(float)
-                         : lfs::core::sh_swizzled_byte_count(page_splats, layout_rest);
+                         : lfs::core::sh_swizzled_byte_count(page_splats, layout_rest) / 4u;
+            bytes += lodq::kPageFrameBytes;
             bytes += page_splats * 32u;
             return bytes;
         }
@@ -416,6 +421,9 @@ namespace lfs::vis {
             return {
                 {"projection_forward", (root / "generated/projection_forward.spv").string()},
                 {"projection_forward_3dgut", (root / "generated/projection_forward_3dgut.spv").string()},
+                {"projection_forward_quant", (root / "generated/projection_forward_quant.spv").string()},
+                {"projection_forward_quant_3dgut",
+                 (root / "generated/projection_forward_quant_3dgut.spv").string()},
                 {"selection_mask", (root / "generated/selection_mask.spv").string()},
                 {"selection_polygon_rasterize",
                  (root / "generated/selection_polygon_rasterize.spv").string()},
@@ -462,6 +470,8 @@ namespace lfs::vis {
                 {"cull_prepare", (root / "generated/cull_prepare.spv").string()},
                 {"projection_forward_survivors",
                  (root / "generated/projection_forward_survivors.spv").string()},
+                {"projection_forward_quant_survivors",
+                 (root / "generated/projection_forward_quant_survivors.spv").string()},
                 {"prepare_visible_chain", (root / "generated/prepare_visible_chain.spv").string()},
                 {"copy_visible_indices", (root / "generated/copy_visible_indices.spv").string()},
                 {"cumsum_block_scan_indirect",
@@ -725,6 +735,7 @@ namespace lfs::vis {
             InputRotations = 3,
             InputScalingRaw = 4,
             InputOpacityRaw = 5,
+            InputPageFrames = 6,
         };
 
         enum OverlayRegion : std::size_t {
@@ -2330,15 +2341,20 @@ namespace lfs::vis {
             source_rest,
             lfs::core::sh_rest_coefficients_for_degree(effective_upload_sh_degree));
 
+        // Canonical quantized regions (lod_pool_quant.hpp): xyz stays f32 for
+        // the quant-unaware cull/selection shaders; the swizzled SH region
+        // shrinks 4x (s8 per component); per-page dequant frames ride last.
         std::array<std::size_t, kInputRegionCount> region_bytes{};
-        region_bytes[InputXyzWs] = splat_capacity * 3u * sizeof(float);
-        region_bytes[InputSh0] = splat_capacity * 3u * sizeof(float);
-        region_bytes[InputShN] = layout_rest == 0u
-                                     ? 4u * sizeof(float)
-                                     : lfs::core::sh_swizzled_byte_count(splat_capacity, layout_rest);
-        region_bytes[InputRotations] = splat_capacity * 4u * sizeof(float);
-        region_bytes[InputScalingRaw] = splat_capacity * 3u * sizeof(float);
-        region_bytes[InputOpacityRaw] = splat_capacity * sizeof(float);
+        region_bytes[InputXyzWs] = splat_capacity * lodq::kXyzBytes;
+        region_bytes[InputSh0] = splat_capacity * lodq::kSh0Bytes;
+        region_bytes[InputShN] =
+            layout_rest == 0u
+                ? 4u * sizeof(float)
+                : lfs::core::sh_swizzled_byte_count(splat_capacity, layout_rest) / 4u;
+        region_bytes[InputRotations] = splat_capacity * lodq::kRotationBytes;
+        region_bytes[InputScalingRaw] = splat_capacity * lodq::kScalingBytes;
+        region_bytes[InputOpacityRaw] = splat_capacity * lodq::kOpacityBytes;
+        region_bytes[InputPageFrames] = snapshot->physical_pages * lodq::kPageFrameBytes;
 
         std::array<std::size_t, kInputRegionCount> region_offset{};
         const std::size_t total_bytes = layoutRegions(region_bytes, region_offset, kRegionAlignment);
@@ -2406,6 +2422,9 @@ namespace lfs::vis {
         buffers_.rotations.deviceBuffer = view(InputRotations);
         buffers_.scaling_raw.deviceBuffer = view(InputScalingRaw);
         buffers_.opacity_raw.deviceBuffer = view(InputOpacityRaw);
+        buffers_.page_frames.deviceBuffer = view(InputPageFrames);
+        buffers_.quant_pool = true;
+        buffers_.pool_page_splats = static_cast<std::uint32_t>(LodPageCache::kChunkSplats);
         buffers_.scales_opacs.deviceBuffer = {};
         buffers_.sh_coeffs.deviceBuffer = {};
         releaseInputHostStorage(buffers_);
@@ -2452,12 +2471,14 @@ namespace lfs::vis {
         const auto region_ptr = [&](const std::size_t region) -> std::uint8_t* {
             return base + lod_page_inputs_.region_offset[region];
         };
-        auto* const means_dst = reinterpret_cast<float*>(region_ptr(InputXyzWs));
-        auto* const sh0_dst = reinterpret_cast<float*>(region_ptr(InputSh0));
-        auto* const shN_dst = reinterpret_cast<float*>(region_ptr(InputShN));
-        auto* const rotations_dst = reinterpret_cast<float*>(region_ptr(InputRotations));
-        auto* const scaling_dst = reinterpret_cast<float*>(region_ptr(InputScalingRaw));
-        auto* const opacity_dst = reinterpret_cast<float*>(region_ptr(InputOpacityRaw));
+        LodPoolDeviceView pool_view{};
+        pool_view.means = reinterpret_cast<float*>(region_ptr(InputXyzWs));
+        pool_view.sh0 = reinterpret_cast<uint2*>(region_ptr(InputSh0));
+        pool_view.shN = reinterpret_cast<std::uint32_t*>(region_ptr(InputShN));
+        pool_view.rotation = reinterpret_cast<uint2*>(region_ptr(InputRotations));
+        pool_view.scaling = reinterpret_cast<uint2*>(region_ptr(InputScalingRaw));
+        pool_view.opacity = reinterpret_cast<std::uint16_t*>(region_ptr(InputOpacityRaw));
+        pool_view.page_frames = reinterpret_cast<float4*>(region_ptr(InputPageFrames));
 
         // RAD page payloads stream through LodUploadEngine; the only
         // pending uploads left are pinned-root/in-core pages whose data
@@ -2466,6 +2487,8 @@ namespace lfs::vis {
         if (!raw_layout) {
             return std::unexpected(raw_layout.error());
         }
+        pool_view.dst_rest = raw_layout->shN_layout_rest;
+        pool_view.dst_slots = lfs::core::sh_float4_slots_for_rest(raw_layout->shN_layout_rest);
 
         const Tensor& means = splat_data.means_raw();
         const Tensor& sh0 = splat_data.sh0_raw();
@@ -2536,56 +2559,27 @@ namespace lfs::vis {
                 continue;
             }
 
-            if (auto ok = copyCudaBytes(means_src + logical_start * 3u,
-                                        means_dst + dst_start * 3u,
-                                        count * 3u * sizeof(float),
-                                        stream,
-                                        "means");
-                !ok) {
-                return std::unexpected(ok.error());
-            }
-            if (auto ok = copyCudaBytes(sh0_src + logical_start * 3u,
-                                        sh0_dst + dst_start * 3u,
-                                        count * 3u * sizeof(float),
-                                        stream,
-                                        "sh0");
-                !ok) {
-                return std::unexpected(ok.error());
-            }
-            if (!raw_layout->omits_shN) {
-                lfs::core::shN_swizzled_copy_range(
-                    shN_src,
-                    shN_dst,
-                    logical_start,
-                    count,
-                    dst_start,
-                    static_cast<std::uint32_t>(splat_data.max_sh_coeffs_rest()),
-                    raw_layout->shN_layout_rest,
-                    stream);
-            }
-            if (auto ok = copyCudaBytes(rotations_src + logical_start * 4u,
-                                        rotations_dst + dst_start * 4u,
-                                        count * 4u * sizeof(float),
-                                        stream,
-                                        "rotation");
-                !ok) {
-                return std::unexpected(ok.error());
-            }
-            if (auto ok = copyCudaBytes(scaling_src + logical_start * 3u,
-                                        scaling_dst + dst_start * 3u,
-                                        count * 3u * sizeof(float),
-                                        stream,
-                                        "scaling");
-                !ok) {
-                return std::unexpected(ok.error());
-            }
-            if (auto ok = copyCudaBytes(opacity_src + logical_start,
-                                        opacity_dst + dst_start,
-                                        count * sizeof(float),
-                                        stream,
-                                        "opacity");
-                !ok) {
-                return std::unexpected(ok.error());
+            const std::uint32_t src_rest =
+                static_cast<std::uint32_t>(splat_data.max_sh_coeffs_rest());
+            const LodPageTensorSources sources{
+                .means = means_src + logical_start * 3u,
+                .sh0 = sh0_src + logical_start * 3u,
+                .shN = raw_layout->omits_shN
+                           ? nullptr
+                           : shN_src + logical_start * static_cast<std::size_t>(src_rest) * 3u,
+                .rotation = rotations_src + logical_start * 4u,
+                .scaling = scaling_src + logical_start * 3u,
+                .opacity = opacity_src + logical_start,
+                .src_rest = src_rest,
+                .count = static_cast<std::uint32_t>(count),
+            };
+            if (const cudaError_t status = launchLodPageQuantizeFromTensors(
+                    sources, pool_view, upload.page,
+                    static_cast<std::uint32_t>(LodPageCache::kChunkSplats), stream);
+                status != cudaSuccess) {
+                return std::unexpected(std::format(
+                    "VkSplat LOD page quantize failed: {} ({})",
+                    cudaGetErrorName(status), cudaGetErrorString(status)));
             }
             queued_upload = true;
             uploaded_splats += count;
@@ -4194,6 +4188,9 @@ namespace lfs::vis {
                     scaling_storage->vkBuffer(), scaling_storage->bytes(), layout->scaling_bytes, scaling_storage->vkOffset());
                 buffers_.scales_opacs.deviceBuffer = {};
                 buffers_.sh_coeffs.deviceBuffer = {};
+                buffers_.page_frames.deviceBuffer = {};
+                buffers_.quant_pool = false;
+                buffers_.pool_page_splats = 0;
                 update_input_metadata(input_snapshot_changed);
             }
 
