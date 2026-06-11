@@ -637,6 +637,116 @@ namespace lfs::io {
             return true;
         }
 
+        // Treelet layout (Phase C): global order stays band-major (a coarse
+        // cut is still a file prefix), but inside a band each subtree's nodes
+        // are grouped per band-root treelet so a chunk holds spatially local,
+        // depth-adjacent nodes instead of a level-major slice of everything.
+        constexpr std::size_t kTreeletBandLevels = 4;
+
+        // Pass 1 input: one sequential batched scan of a bucket nodes file
+        // extracting only the link tail of each fixed-size record.
+        [[nodiscard]] bool read_bucket_links(const std::filesystem::path& path,
+                                             const std::uint64_t expected_nodes,
+                                             const int rest_coeffs,
+                                             const bool skip_root,
+                                             std::vector<std::uint16_t>& child_count,
+                                             std::vector<std::uint32_t>& child_start) {
+            FilePtr f(std::fopen(path.string().c_str(), "rb"));
+            std::uint64_t n = 0;
+            if (!f || !read_exact(f.get(), &n, sizeof(n)) || n != expected_nodes) {
+                return false;
+            }
+            const std::size_t record_bytes = bucket_node_record_bytes(rest_coeffs);
+            const std::size_t link_offset = record_bytes - sizeof(std::uint16_t) - sizeof(std::uint32_t);
+            std::size_t first = 0;
+            std::size_t total = static_cast<std::size_t>(expected_nodes);
+            if (skip_root) {
+                if (std::fseek(f.get(), static_cast<long>(record_bytes), SEEK_CUR) != 0) {
+                    return false;
+                }
+                total -= 1;
+            }
+            child_count.resize(total);
+            child_start.resize(total);
+            constexpr std::size_t kBatch = 65536;
+            std::vector<std::uint8_t> buffer(kBatch * record_bytes);
+            while (first < total) {
+                const std::size_t take = std::min(kBatch, total - first);
+                if (!read_exact(f.get(), buffer.data(), take * record_bytes)) {
+                    return false;
+                }
+                for (std::size_t i = 0; i < take; ++i) {
+                    const std::uint8_t* const rec = buffer.data() + i * record_bytes + link_offset;
+                    std::memcpy(&child_count[first + i], rec, sizeof(std::uint16_t));
+                    std::memcpy(&child_start[first + i], rec + sizeof(std::uint16_t), sizeof(std::uint32_t));
+                }
+                first += take;
+            }
+            return true;
+        }
+
+        // Band-BFS ranks over one subtree's local level layout. Nodes of each
+        // global band [k*B, (k+1)*B) get contiguous in-block ranks: every
+        // band-first-level node roots a treelet and its in-band descendants
+        // follow in BFS order, so sibling groups stay contiguous. `depth`
+        // aligns local levels to global bands; levels below `min_local` are
+        // not emitted (multi-bucket roots live in the top tree).
+        struct TreeletRanks {
+            std::vector<std::uint32_t> rank;       // [local] in-block rank
+            std::vector<std::uint64_t> band_count; // nodes per global band
+        };
+        [[nodiscard]] TreeletRanks build_treelet_ranks(
+            const std::vector<std::uint32_t>& level_starts,
+            const std::vector<std::uint16_t>& child_count,
+            const std::vector<std::uint32_t>& child_start,
+            const std::size_t depth,
+            const std::size_t min_local,
+            const std::size_t global_bands) {
+            TreeletRanks out;
+            const std::size_t levels = level_starts.size() - 1;
+            const std::size_t total = level_starts.back();
+            out.rank.assign(total, 0u);
+            out.band_count.assign(global_bands, 0u);
+            std::vector<std::uint32_t> queue;
+            for (std::size_t band = 0; band < global_bands; ++band) {
+                const std::size_t g_lo = band * kTreeletBandLevels;
+                const std::size_t g_hi = g_lo + kTreeletBandLevels;
+                const std::size_t l_lo = std::max<std::size_t>(g_lo > depth ? g_lo - depth : 0, min_local);
+                if (l_lo >= levels || depth + l_lo >= g_hi) {
+                    continue;
+                }
+                const std::size_t l_hi = std::min<std::size_t>(levels, g_hi - depth);
+                // Roots first, in old (sibling-contiguous) order: cross-band
+                // child groups point at roots and must stay contiguous. Each
+                // root's in-band descendants follow treelet-by-treelet.
+                std::uint32_t next = 0;
+                for (std::uint32_t root = level_starts[l_lo]; root < level_starts[l_lo + 1]; ++root) {
+                    out.rank[root] = next++;
+                }
+                for (std::uint32_t root = level_starts[l_lo]; root < level_starts[l_lo + 1]; ++root) {
+                    queue.clear();
+                    queue.push_back(root);
+                    std::size_t head = 0;
+                    while (head < queue.size()) {
+                        const std::uint32_t node = queue[head++];
+                        if (node != root) {
+                            out.rank[node] = next++;
+                        }
+                        const std::size_t node_level =
+                            std::upper_bound(level_starts.begin(), level_starts.end(), node) -
+                            level_starts.begin() - 1;
+                        if (node_level + 1 < l_hi && child_count[node] > 0) {
+                            for (std::uint32_t c = 0; c < child_count[node]; ++c) {
+                                queue.push_back(child_start[node] + c);
+                            }
+                        }
+                    }
+                }
+                out.band_count[band] = next;
+            }
+            return out;
+        }
+
         [[nodiscard]] bool read_node_slice(std::FILE* f, const std::size_t count, const int rest_coeffs,
                                            BucketNodes& nodes) {
             const std::size_t record_bytes = bucket_node_record_bytes(rest_coeffs);
@@ -1461,43 +1571,72 @@ namespace lfs::io {
             }
         }
 
-        // slice_start[L][b]: global index of bucket b's slice within level L.
-        const auto top_count_at = [&](const std::size_t L) -> std::size_t {
-            if (bucket_count == 1 || L + 1 >= top_level_starts.size()) {
-                return 0;
+        // Treelet band layout: pass 1 reads links only, ranks every node
+        // within its (band, source) block, and lays blocks out band-major —
+        // top tree first, then each bucket's treelets. Band 0 is the file
+        // prefix, preserving the coarse-cut-as-prefix property.
+        const std::size_t global_bands =
+            (global_levels + kTreeletBandLevels - 1) / kTreeletBandLevels;
+        const std::size_t min_local_all = bucket_count == 1 ? 0 : 1;
+        TreeletRanks top_ranks;
+        if (bucket_count > 1) {
+            top_ranks = build_treelet_ranks(top_level_starts,
+                                            top_nodes.child_count,
+                                            top_nodes.child_start,
+                                            0, 0, global_bands);
+        }
+        std::vector<TreeletRanks> bucket_ranks(bucket_count);
+        for (std::size_t b = 0; b < bucket_count; ++b) {
+            std::vector<std::uint16_t> link_count;
+            std::vector<std::uint32_t> link_start;
+            // Root-inclusive scan keeps array index == local node id (level
+            // 0 is the root); min_local excludes the root from ranks when the
+            // top tree carries it.
+            if (!read_bucket_links(bucket_nodes_path(b), summaries[b].node_count,
+                                   rest_coeffs, /*skip_root=*/false, link_count, link_start)) {
+                return make_error(ErrorCode::READ_FAILURE, "Failed to scan bucket links",
+                                  bucket_nodes_path(b));
             }
-            return top_level_starts[L + 1] - top_level_starts[L];
-        };
-        std::vector<std::uint64_t> global_level_start(global_levels + 1, 0);
-        std::vector<std::vector<std::uint64_t>> slice_start(global_levels);
+            bucket_ranks[b] = build_treelet_ranks(summaries[b].level_starts,
+                                                  link_count, link_start,
+                                                  summaries[b].root_depth,
+                                                  min_local_all, global_bands);
+        }
+        // band_base[band][0] = top block, [band][1 + b] = bucket b's block.
+        std::vector<std::vector<std::uint64_t>> band_base(
+            global_bands, std::vector<std::uint64_t>(bucket_count + 1, 0));
         {
             std::uint64_t cursor = 0;
-            for (std::size_t L = 0; L < global_levels; ++L) {
-                global_level_start[L] = cursor;
-                cursor += top_count_at(L);
-                slice_start[L].assign(bucket_count, 0);
+            for (std::size_t band = 0; band < global_bands; ++band) {
+                band_base[band][0] = cursor;
+                if (bucket_count > 1) {
+                    cursor += top_ranks.band_count[band];
+                }
                 for (std::size_t b = 0; b < bucket_count; ++b) {
-                    const std::size_t depth = summaries[b].root_depth;
-                    const std::size_t min_local = bucket_count == 1 ? 0 : 1;
-                    if (L < depth + min_local) {
-                        continue;
-                    }
-                    const std::size_t l = L - depth;
-                    const std::size_t count = local_level_count(b, l);
-                    if (count == 0) {
-                        continue;
-                    }
-                    slice_start[L][b] = cursor;
-                    cursor += count;
+                    band_base[band][1 + b] = cursor;
+                    cursor += bucket_ranks[b].band_count[band];
                 }
             }
-            global_level_start[global_levels] = cursor;
             if (cursor != total_nodes) {
                 return make_error(ErrorCode::CORRUPTED_DATA,
-                                  std::format("level layout mismatch: {} != {}", cursor, total_nodes),
+                                  std::format("treelet layout mismatch: {} != {}", cursor, total_nodes),
                                   output_path);
             }
         }
+        const auto band_of_global_level = [&](const std::size_t L) {
+            return L / kTreeletBandLevels;
+        };
+        // New global position of a top-tree node / a bucket-local node.
+        const auto top_global = [&](const std::uint32_t i, const std::size_t level) {
+            return band_base[band_of_global_level(level)][0] + top_ranks.rank[i];
+        };
+        const auto bucket_global = [&](const std::size_t b,
+                                       const std::uint32_t local,
+                                       const std::size_t local_level) {
+            const std::size_t band =
+                band_of_global_level(summaries[b].root_depth + local_level);
+            return band_base[band][1 + b] + bucket_ranks[b].rank[local];
+        };
 
         if (!report(0.78f, "Writing RAD chunks")) {
             return cancelled();
@@ -1521,9 +1660,11 @@ namespace lfs::io {
                 const std::uint32_t b = top_leaf_bucket[i];
                 if (b == std::numeric_limits<std::uint32_t>::max()) {
                     if (top_nodes.child_count[i] > 0) {
+                        // Sibling runs keep consecutive ranks in the child's
+                        // band block, so the first child's position addresses
+                        // the whole group.
                         top_nodes.child_start[i] = static_cast<std::uint32_t>(
-                            global_level_start[level + 1] +
-                            (top_nodes.child_start[i] - top_level_starts[level + 1]));
+                            top_global(top_nodes.child_start[i], level + 1));
                     }
                     continue;
                 }
@@ -1552,8 +1693,7 @@ namespace lfs::io {
                 top_nodes.child_start[i] =
                     summary.root_child_count > 0
                         ? static_cast<std::uint32_t>(
-                              slice_start[summary.root_depth + 1][b] +
-                              (summary.root_child_start - summary.level_starts[1]))
+                              bucket_global(b, summary.root_child_start, 1))
                         : 0;
             }
         }
@@ -1580,56 +1720,113 @@ namespace lfs::io {
             }
         }
 
-        BucketNodes slice;
-        for (std::size_t L = 0; L < global_levels; ++L) {
-            if (bucket_count > 1) {
-                const std::size_t top_at_level = top_count_at(L);
-                if (top_at_level > 0) {
-                    if (auto ok = accumulator.push_span(top_nodes, top_level_starts[L], top_at_level); !ok) {
-                        return make_error(ErrorCode::WRITE_FAILURE, ok.error(), output_path);
+        // Banded emission: buffer a source's whole band, remap child_start
+        // through the treelet mapping, then emit rows in rank order. Bucket
+        // files are still consumed strictly sequentially.
+        const auto gather_rows = [&](const BucketNodes& src, const std::uint32_t src_base,
+                                     const std::vector<std::uint32_t>& order, BucketNodes& dst) {
+            const std::size_t n = order.size();
+            const std::size_t sh_floats = static_cast<std::size_t>(rest_coeffs) * 3;
+            dst.count = n;
+            dst.means.resize(n * 3);
+            dst.rgb.resize(n * 3);
+            dst.alpha.resize(n);
+            dst.scales.resize(n * 3);
+            dst.rotation.resize(n * 4);
+            dst.shN.resize(n * sh_floats);
+            dst.child_count.resize(n);
+            dst.child_start.resize(n);
+            tbb::parallel_for(
+                tbb::blocked_range<std::size_t>(0, n),
+                [&](const tbb::blocked_range<std::size_t>& range) {
+                    for (std::size_t k = range.begin(); k != range.end(); ++k) {
+                        const std::size_t j = order[k] - src_base;
+                        std::memcpy(dst.means.data() + k * 3, src.means.data() + j * 3, 12);
+                        std::memcpy(dst.rgb.data() + k * 3, src.rgb.data() + j * 3, 12);
+                        dst.alpha[k] = src.alpha[j];
+                        std::memcpy(dst.scales.data() + k * 3, src.scales.data() + j * 3, 12);
+                        std::memcpy(dst.rotation.data() + k * 4, src.rotation.data() + j * 4, 16);
+                        if (sh_floats > 0) {
+                            std::memcpy(dst.shN.data() + k * sh_floats,
+                                        src.shN.data() + j * sh_floats, sh_floats * 4);
+                        }
+                        dst.child_count[k] = src.child_count[j];
+                        dst.child_start[k] = src.child_start[j];
                     }
+                });
+        };
+        // Per-band emit order (old indices sorted by rank), rebuilt per block.
+        const auto block_order = [&](const TreeletRanks& ranks, const std::uint32_t lo,
+                                     const std::uint32_t hi, const std::size_t count) {
+            std::vector<std::uint32_t> order(count);
+            for (std::uint32_t i = lo; i < hi; ++i) {
+                order[ranks.rank[i]] = i;
+            }
+            return order;
+        };
+
+        BucketNodes band_nodes;
+        BucketNodes emit_nodes;
+        for (std::size_t band = 0; band < global_bands; ++band) {
+            const std::size_t g_lo = band * kTreeletBandLevels;
+            const std::size_t g_hi = g_lo + kTreeletBandLevels;
+            if (bucket_count > 1 && top_ranks.band_count[band] > 0) {
+                const std::size_t lvl_lo = g_lo;
+                const std::size_t lvl_hi =
+                    std::min<std::size_t>(top_level_starts.size() - 1, g_hi);
+                const std::uint32_t lo = top_level_starts[lvl_lo];
+                const std::uint32_t hi = top_level_starts[lvl_hi];
+                const auto order = block_order(top_ranks, lo, hi,
+                                               static_cast<std::size_t>(top_ranks.band_count[band]));
+                gather_rows(top_nodes, 0, order, emit_nodes);
+                if (auto ok = accumulator.push_span(emit_nodes, 0, emit_nodes.count); !ok) {
+                    return make_error(ErrorCode::WRITE_FAILURE, ok.error(), output_path);
                 }
             }
             for (std::size_t b = 0; b < bucket_count; ++b) {
                 const auto& summary = summaries[b];
+                if (bucket_ranks[b].band_count[band] == 0) {
+                    continue;
+                }
                 const std::size_t depth = summary.root_depth;
-                const std::size_t min_local = bucket_count == 1 ? 0 : 1;
-                if (L < depth + min_local) {
-                    continue;
-                }
-                const std::size_t l = L - depth;
-                const std::size_t count = local_level_count(b, l);
-                if (count == 0) {
-                    continue;
-                }
-                if (!read_node_slice(node_files[b].get(), count, rest_coeffs, slice)) {
-                    return make_error(ErrorCode::READ_FAILURE, "Failed to read bucket node slice",
+                const std::size_t levels = summary.level_starts.size() - 1;
+                const std::size_t l_lo =
+                    std::max<std::size_t>(g_lo > depth ? g_lo - depth : 0, min_local_all);
+                const std::size_t l_hi = std::min<std::size_t>(levels, g_hi - depth);
+                const std::uint32_t lo = summary.level_starts[l_lo];
+                const std::uint32_t hi = summary.level_starts[l_hi];
+                if (!read_node_slice(node_files[b].get(), hi - lo, rest_coeffs, band_nodes)) {
+                    return make_error(ErrorCode::READ_FAILURE, "Failed to read bucket node band",
                                       bucket_nodes_path(b));
                 }
-                if (l + 1 < summary.level_starts.size() - 1 ||
-                    local_level_count(b, l + 1) > 0) {
-                    const std::uint64_t child_slice_start =
-                        L + 1 < global_levels ? slice_start[L + 1][b] : 0;
-                    const std::uint32_t child_local_start =
-                        l + 2 < summary.level_starts.size() ? summary.level_starts[l + 1] : 0;
-                    tbb::parallel_for(
-                        tbb::blocked_range<std::size_t>(0, count),
-                        [&](const tbb::blocked_range<std::size_t>& range) {
-                            for (std::size_t k = range.begin(); k != range.end(); ++k) {
-                                if (slice.child_count[k] > 0) {
-                                    slice.child_start[k] = static_cast<std::uint32_t>(
-                                        child_slice_start +
-                                        (slice.child_start[k] - child_local_start));
-                                }
+                // Remap child pointers: a child group lives either deeper in
+                // this band or roots a next-band treelet; bucket_global covers
+                // both. Child level = node level + 1, derived per row.
+                tbb::parallel_for(
+                    tbb::blocked_range<std::size_t>(0, band_nodes.count),
+                    [&](const tbb::blocked_range<std::size_t>& range) {
+                        for (std::size_t k = range.begin(); k != range.end(); ++k) {
+                            if (band_nodes.child_count[k] == 0) {
+                                continue;
                             }
-                        });
-                }
-                if (auto ok = accumulator.push_span(slice, 0, count); !ok) {
+                            const std::uint32_t local = lo + static_cast<std::uint32_t>(k);
+                            const std::size_t node_level =
+                                std::upper_bound(summary.level_starts.begin(),
+                                                 summary.level_starts.end(), local) -
+                                summary.level_starts.begin() - 1;
+                            band_nodes.child_start[k] = static_cast<std::uint32_t>(
+                                bucket_global(b, band_nodes.child_start[k], node_level + 1));
+                        }
+                    });
+                const auto order = block_order(bucket_ranks[b], lo, hi,
+                                               static_cast<std::size_t>(bucket_ranks[b].band_count[band]));
+                gather_rows(band_nodes, lo, order, emit_nodes);
+                if (auto ok = accumulator.push_span(emit_nodes, 0, emit_nodes.count); !ok) {
                     return make_error(ErrorCode::WRITE_FAILURE, ok.error(), output_path);
                 }
             }
-            const float p = 0.78f + 0.2f * static_cast<float>(L + 1) / static_cast<float>(global_levels);
-            if (!report(p, std::format("Writing RAD chunks (level {}/{})", L + 1, global_levels))) {
+            const float p = 0.78f + 0.2f * static_cast<float>(band + 1) / static_cast<float>(global_bands);
+            if (!report(p, std::format("Writing RAD chunks (band {}/{})", band + 1, global_bands))) {
                 return cancelled();
             }
         }

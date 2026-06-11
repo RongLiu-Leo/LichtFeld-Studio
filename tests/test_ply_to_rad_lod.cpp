@@ -139,8 +139,12 @@ namespace {
                 level[cs + c] = static_cast<std::uint8_t>(level[i] + 1);
             }
         }
+        // Treelet layout: globally band-major (a coarse cut is still a file
+        // prefix), level order only holds within a 4-level band per treelet.
+        constexpr std::size_t kBandLevels = 4;
         for (std::size_t i = 1; i < n; ++i) {
-            ASSERT_GE(level[i], level[i - 1]) << "layout is not level-ordered at node " << i;
+            ASSERT_GE(level[i] / kBandLevels, level[i - 1] / kBandLevels)
+                << "layout is not band-ordered at node " << i;
         }
     }
 
