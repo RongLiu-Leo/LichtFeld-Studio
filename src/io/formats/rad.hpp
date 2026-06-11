@@ -113,6 +113,15 @@ namespace lfs::io {
     [[nodiscard]] Result<void> build_rad_meta_sidecar(
         const std::filesystem::path& rad_path,
         const ExportProgressCallback& progress = nullptr);
+    // One-time migration for RAD LOD files written with a different
+    // splats-per-chunk: decodes each source chunk to display-space values and
+    // streams them back out through the current encoders at CHUNK_SIZE. Node
+    // order, tree links, and logical indices are unchanged.
+    using RechunkProgressCallback = std::function<bool(float)>;
+    [[nodiscard]] Result<void> rechunk_rad_lod(
+        const std::filesystem::path& input,
+        const std::filesystem::path& output,
+        const RechunkProgressCallback& progress = nullptr);
     // Exposed for tests: scatter-derive parent/level over a BFS level-ordered,
     // children-contiguous links plane. child_start may be non-monotone across
     // parents within a level (multi-bucket converter layouts).

@@ -114,8 +114,20 @@ namespace lfs::io::radmath {
                                           new_mantissa);
     }
 
+    // Explicit fused multiply-add: host GCC contracts a*b+c into fma while
+    // the kernel (--fmad=false) would not, and the 1-ULP difference flips
+    // values sitting on an f16 rounding boundary. Forcing the fused form on
+    // both sides keeps r8-derived pool values bit-exact.
+    LFS_RAD_HD float fmaExact(const float a, const float b, const float c) {
+#if defined(__CUDA_ARCH__)
+        return __fmaf_rn(a, b, c);
+#else
+        return std::fma(a, b, c);
+#endif
+    }
+
     LFS_RAD_HD float dequantR8(const std::uint8_t v, const float min_val, const float range) {
-        return min_val + (static_cast<float>(v) / 255.0f) * range;
+        return fmaExact(static_cast<float>(v) / 255.0f, range, min_val);
     }
 
     LFS_RAD_HD float dequantS8(const std::int8_t v, const float max_abs) {

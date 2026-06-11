@@ -364,8 +364,8 @@ namespace {
     TEST(LodPageCache, UploadDrainHonorsByteBudget) {
         LodPageCache cache;
         constexpr std::size_t kPageBytes = 1024;
-        // 80 pages -> request budget clamp(80/16, 4, 16) = 5 admits all wants.
         cache.configure(100, 80, 1, kPageBytes);
+        cache.ensureRootResidency();
         (void)drainAndComplete(cache);
 
         cache.beginFrame();

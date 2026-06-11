@@ -566,10 +566,15 @@ namespace lfs::vis {
                 return std::min<std::size_t>(static_cast<std::size_t>(parsed), pages_.size());
             }
         }
-        // Decode workers (≤8) starve below ~4 queued chunks each; 16 capped
-        // the fill rate at ~830 chunks/s and a paused view took seconds to
-        // finish reallocating its pool.
-        return std::clamp<std::size_t>(pages_.size() / 16, std::min<std::size_t>(4, pages_.size()), 32);
+        // Decode workers (≤8) starve when the queue runs dry, so the depth
+        // must track page size: smaller pages decode proportionally faster.
+        // The byte cap equals the old 32-page ceiling at 65K-splat pages.
+        constexpr std::size_t kRequestBudgetBytes = 180u << 20;
+        const std::size_t byte_cap =
+            std::max<std::size_t>(kRequestBudgetBytes / page_payload_bytes_, 32);
+        return std::clamp<std::size_t>(pages_.size() / 16,
+                                       std::min<std::size_t>(32, pages_.size()),
+                                       byte_cap);
     }
 
     LodPageCache::AdmitResult LodPageCache::requestResident(
