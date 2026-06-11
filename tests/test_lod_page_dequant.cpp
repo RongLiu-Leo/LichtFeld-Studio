@@ -7,6 +7,8 @@
 // decode_rad_chunk_packed + the CUDA kernel as through the CPU reference
 // decode_rad_chunk_into (+ swizzle + expand_rad_meta_page). Pure-arithmetic
 // encodings must match bit-exactly; libm paths (exp/log/trig) within ULPs.
+// Fixtures span SH degree 0-3 and both Auto-profile alpha encodings (r8 for
+// chunks whose alpha stays <=1, f16 for merged-interior chunks above 1).
 
 #include "core/cuda/sh_layout.cuh"
 #include "io/formats/rad.hpp"
@@ -23,6 +25,7 @@
 #include <filesystem>
 #include <fstream>
 #include <random>
+#include <set>
 #include <span>
 #include <vector>
 
@@ -32,7 +35,17 @@ namespace {
 
     constexpr std::size_t kPage = SplatLodTree::kChunkSplats;
 
-    void writeSyntheticShPly(const std::filesystem::path& path, const std::size_t count) {
+    using EncodingKey = std::pair<std::uint32_t, std::uint32_t>;
+    using EncodingSet = std::set<EncodingKey>;
+
+    EncodingKey kindEnc(const lfs::io::RadPackedKind kind, const lfs::io::RadPackedEncoding enc) {
+        return {static_cast<std::uint32_t>(kind), static_cast<std::uint32_t>(enc)};
+    }
+
+    void writeSyntheticShPly(const std::filesystem::path& path,
+                             const std::size_t count,
+                             const int rest_props,
+                             const float opacity_raw) {
         std::mt19937 rng(1234);
         std::uniform_real_distribution<float> pos(-40.0f, 40.0f);
         std::uniform_real_distribution<float> sh(-0.4f, 0.4f);
@@ -46,7 +59,7 @@ namespace {
         for (const char* name : {"x", "y", "z", "nx", "ny", "nz", "f_dc_0", "f_dc_1", "f_dc_2"}) {
             out << "property float " << name << "\n";
         }
-        for (int i = 0; i < 45; ++i) {
+        for (int i = 0; i < rest_props; ++i) {
             out << "property float f_rest_" << i << "\n";
         }
         for (const char* name : {"opacity", "scale_0", "scale_1", "scale_2",
@@ -55,7 +68,8 @@ namespace {
         }
         out << "end_header\n";
 
-        std::vector<float> row(62);
+        const std::size_t rest = static_cast<std::size_t>(rest_props);
+        std::vector<float> row(17 + rest);
         for (std::size_t i = 0; i < count; ++i) {
             row[0] = pos(rng);
             row[1] = pos(rng);
@@ -64,15 +78,15 @@ namespace {
             row[6] = 0.1f + sh(rng);
             row[7] = 0.2f + sh(rng);
             row[8] = 0.3f + sh(rng);
-            for (int c = 0; c < 45; ++c) {
-                row[9 + static_cast<std::size_t>(c)] = sh(rng) * 0.25f;
+            for (std::size_t c = 0; c < rest; ++c) {
+                row[9 + c] = sh(rng) * 0.25f;
             }
-            row[54] = 2.0f;
-            row[55] = row[56] = row[57] = log_scale(rng);
-            row[58] = 1.0f + quat(rng);
-            row[59] = quat(rng) * 0.3f;
-            row[60] = quat(rng) * 0.3f;
-            row[61] = quat(rng) * 0.3f;
+            row[9 + rest] = opacity_raw;
+            row[10 + rest] = row[11 + rest] = row[12 + rest] = log_scale(rng);
+            row[13 + rest] = 1.0f + quat(rng);
+            row[14 + rest] = quat(rng) * 0.3f;
+            row[15 + rest] = quat(rng) * 0.3f;
+            row[16 + rest] = quat(rng) * 0.3f;
             out.write(reinterpret_cast<const char*>(row.data()),
                       static_cast<std::streamsize>(row.size() * sizeof(float)));
         }
@@ -108,23 +122,6 @@ namespace {
         }
     }
 
-    void expectClose(const std::span<const float> gpu,
-                     const std::span<const float> cpu,
-                     const char* const label,
-                     const double rel = 1e-5,
-                     const double abs = 1e-6) {
-        ASSERT_EQ(gpu.size(), cpu.size()) << label;
-        std::size_t mismatches = 0;
-        for (std::size_t i = 0; i < gpu.size() && mismatches < 8; ++i) {
-            const double tolerance = abs + rel * std::abs(static_cast<double>(cpu[i]));
-            if (std::abs(static_cast<double>(gpu[i]) - static_cast<double>(cpu[i])) > tolerance) {
-                ADD_FAILURE() << label << " mismatch at " << i << ": gpu=" << gpu[i]
-                              << " cpu=" << cpu[i];
-                ++mismatches;
-            }
-        }
-    }
-
     template <typename T>
     std::vector<T> readDevice(const void* const ptr, const std::size_t count) {
         std::vector<T> host(count);
@@ -133,13 +130,29 @@ namespace {
         return host;
     }
 
-    TEST(LodPageDequant, KernelMatchesCpuDecodeOnConvertedFile) {
-        const auto temp_dir = std::filesystem::temp_directory_path() / "lod_page_dequant";
+    struct DeviceBuffer {
+        void* ptr = nullptr;
+        explicit DeviceBuffer(const std::size_t bytes) {
+            EXPECT_EQ(cudaMalloc(&ptr, bytes), cudaSuccess);
+            EXPECT_EQ(cudaMemset(ptr, 0xCD, bytes), cudaSuccess);
+        }
+        ~DeviceBuffer() { (void)cudaFree(ptr); }
+    };
+
+    // Converts a synthetic PLY with `rest_props` f_rest properties, then runs
+    // CPU-vs-kernel parity on every chunk. Records each (kind, encoding) the
+    // converter emitted so callers can assert matrix coverage.
+    void runConvertedFileParity(const std::string& name,
+                                const std::size_t splat_count,
+                                const int rest_props,
+                                const float opacity_raw,
+                                EncodingSet& encodings_seen) {
+        const auto temp_dir = std::filesystem::temp_directory_path() / "lod_page_dequant" / name;
         std::filesystem::remove_all(temp_dir);
         std::filesystem::create_directories(temp_dir);
-        const auto ply_path = temp_dir / "dequant.ply";
-        const auto rad_path = temp_dir / "dequant.rad";
-        writeSyntheticShPly(ply_path, 150'000);
+        const auto ply_path = temp_dir / (name + ".ply");
+        const auto rad_path = temp_dir / (name + ".rad");
+        writeSyntheticShPly(ply_path, splat_count, rest_props, opacity_raw);
         lfs::io::PlyToRadLodOptions options;
         options.target_bucket_splats = 65'536;
         options.temp_dir = temp_dir / "scratch";
@@ -152,27 +165,24 @@ namespace {
         const auto& source = loaded->lod_tree->rad_source;
         const bool lod_opacity = loaded->lod_tree->lod_opacity_encoded;
         const int max_sh = loaded->get_max_sh_degree();
-        ASSERT_EQ(max_sh, 3);
+        const int expected_sh =
+            rest_props == 45 ? 3 : (rest_props == 24 ? 2 : (rest_props == 9 ? 1 : 0));
+        ASSERT_EQ(max_sh, expected_sh);
 
         auto view = lfs::io::open_rad_meta_sidecar(rad_path);
         ASSERT_TRUE(view.has_value()) << view.error();
 
-        const std::uint32_t dst_rest = 15;
+        const auto dst_rest =
+            static_cast<std::uint32_t>((max_sh + 1) * (max_sh + 1) - 1);
         const std::uint32_t dst_slots = lfs::core::sh_float4_slots_for_rest(dst_rest);
-        const std::size_t sh_floats = lfs::core::sh_swizzled_byte_count(kPage, dst_rest) / sizeof(float);
+        const std::size_t sh_floats =
+            dst_rest > 0u ? lfs::core::sh_swizzled_byte_count(kPage, dst_rest) / sizeof(float)
+                          : 0u;
 
-        struct DeviceBuffer {
-            void* ptr = nullptr;
-            explicit DeviceBuffer(const std::size_t bytes) {
-                EXPECT_EQ(cudaMalloc(&ptr, bytes), cudaSuccess);
-                EXPECT_EQ(cudaMemset(ptr, 0xCD, bytes), cudaSuccess);
-            }
-            ~DeviceBuffer() { (void)cudaFree(ptr); }
-        };
         const std::size_t sh_slot_count = sh_floats / 4u;
         DeviceBuffer d_means(kPage * lfs::vis::lodq::kXyzBytes);
         DeviceBuffer d_sh0(kPage * lfs::vis::lodq::kSh0Bytes);
-        DeviceBuffer d_shN(sh_slot_count * lfs::vis::lodq::kShNSlotBytes);
+        DeviceBuffer d_shN(std::max<std::size_t>(sh_slot_count * lfs::vis::lodq::kShNSlotBytes, 16));
         DeviceBuffer d_rot(kPage * lfs::vis::lodq::kRotationBytes);
         DeviceBuffer d_scale(kPage * lfs::vis::lodq::kScalingBytes);
         DeviceBuffer d_opacity(kPage * lfs::vis::lodq::kOpacityBytes);
@@ -184,7 +194,7 @@ namespace {
         lfs::vis::LodPoolDeviceView pool{};
         pool.means = static_cast<float*>(d_means.ptr);
         pool.sh0 = static_cast<uint2*>(d_sh0.ptr);
-        pool.shN = static_cast<std::uint32_t*>(d_shN.ptr);
+        pool.shN = dst_rest > 0u ? static_cast<std::uint32_t*>(d_shN.ptr) : nullptr;
         pool.rotation = static_cast<uint2*>(d_rot.ptr);
         pool.scaling = static_cast<uint2*>(d_scale.ptr);
         pool.opacity = static_cast<std::uint16_t*>(d_opacity.ptr);
@@ -204,16 +214,7 @@ namespace {
         std::vector<float> shN_canonical;
         std::vector<float> ref_shN(sh_floats);
 
-        // First, a middle, and the (slack-bearing) last chunk.
-        std::vector<std::size_t> chunks{0};
-        if (source.chunks.size() > 2) {
-            chunks.push_back(source.chunks.size() / 2);
-        }
-        if (source.chunks.size() > 1) {
-            chunks.push_back(source.chunks.size() - 1);
-        }
-
-        for (const std::size_t c : chunks) {
+        for (std::size_t c = 0; c < source.chunks.size(); ++c) {
             const auto& range = source.chunks[c];
             chunk_bytes.resize(range.file_bytes);
             in.seekg(static_cast<std::streamoff>(range.file_offset), std::ios::beg);
@@ -240,6 +241,9 @@ namespace {
                 *view, static_cast<std::uint32_t>(c), std::span<std::uint8_t>(slot));
             ASSERT_TRUE(desc.has_value()) << desc.error();
             ASSERT_EQ(desc->count, info->count);
+            for (std::uint32_t p = 0; p < desc->property_count; ++p) {
+                encodings_seen.insert({desc->props[p].kind, desc->props[p].encoding});
+            }
 
             ASSERT_EQ(cudaMemcpy(d_slot.ptr, slot.data(), desc->used_bytes,
                                  cudaMemcpyHostToDevice),
@@ -297,22 +301,27 @@ namespace {
             }
             // s8 SH bytes pass through bit-exact; decoding them with the
             // frame scales must reproduce the reference floats exactly.
-            const auto gpu_frames = readDevice<float>(d_frames.ptr, 4);
-            const auto gpu_shN = readDevice<std::uint32_t>(d_shN.ptr, sh_slot_count);
-            for (std::size_t k = 0; k < sh_floats; ++k) {
-                const std::uint32_t slot_idx = static_cast<std::uint32_t>(k / 4u);
-                const std::uint32_t comp = static_cast<std::uint32_t>(k % 4u);
-                // Swizzled float4 layout is [block][slot][lane].
-                const std::uint32_t slot_in_block =
-                    (slot_idx % (dst_slots * lfs::core::kShReorderSize)) /
-                    lfs::core::kShReorderSize;
-                const std::uint32_t c = slot_in_block * 4u + comp;
-                const std::uint32_t band = c / 3u < 3u ? 0u : (c / 3u < 8u ? 1u : 2u);
-                const auto b = static_cast<std::int8_t>(
-                    (gpu_shN[slot_idx] >> (comp * 8u)) & 0xFFu);
-                const float decoded =
-                    c < 45u ? radmath::dequantS8(b, std::max(gpu_frames[band], 1e-6f)) : 0.0f;
-                ASSERT_EQ(decoded, ref_shN[k]) << "shN at float " << k;
+            if (dst_rest > 0u) {
+                const std::uint32_t valid_floats = info->sh_coeffs_rest * 3u;
+                const auto gpu_frames = readDevice<float>(d_frames.ptr, 4);
+                const auto gpu_shN = readDevice<std::uint32_t>(d_shN.ptr, sh_slot_count);
+                for (std::size_t k = 0; k < sh_floats; ++k) {
+                    const std::uint32_t slot_idx = static_cast<std::uint32_t>(k / 4u);
+                    const std::uint32_t comp = static_cast<std::uint32_t>(k % 4u);
+                    // Swizzled float4 layout is [block][slot][lane].
+                    const std::uint32_t slot_in_block =
+                        (slot_idx % (dst_slots * lfs::core::kShReorderSize)) /
+                        lfs::core::kShReorderSize;
+                    const std::uint32_t cf = slot_in_block * 4u + comp;
+                    const std::uint32_t band = cf / 3u < 3u ? 0u : (cf / 3u < 8u ? 1u : 2u);
+                    const auto b = static_cast<std::int8_t>(
+                        (gpu_shN[slot_idx] >> (comp * 8u)) & 0xFFu);
+                    const float decoded =
+                        cf < valid_floats
+                            ? radmath::dequantS8(b, std::max(gpu_frames[band], 1e-6f))
+                            : 0.0f;
+                    ASSERT_EQ(decoded, ref_shN[k]) << "shN at float " << k;
+                }
             }
 
             const std::size_t logical_start = c * kPage;
@@ -347,7 +356,60 @@ namespace {
                 EXPECT_EQ(gpu_links[i].w, 0xFFFFFFFFu) << "slack link sentinel at " << i;
                 EXPECT_EQ(gpu_bounds[i].w, 0.0f) << "slack bounds at " << i;
             }
+            if (::testing::Test::HasFailure()) {
+                return;
+            }
         }
+    }
+
+    TEST(LodPageDequant, KernelMatchesCpuDecodeOnConvertedFile) {
+        EncodingSet seen;
+        runConvertedFileParity("sh3", 150'000, 45, /*opacity_raw=*/2.0f, seen);
+        using lfs::io::RadPackedEncoding;
+        using lfs::io::RadPackedKind;
+        // Full Auto-profile matrix for an SH3 LOD tree. Opaque leaves make
+        // merged-interior alpha exceed 1, and bhatt levels don't align with
+        // chunk boundaries, so every chunk takes the f16 alpha path here; the
+        // degree-1 fixture covers r8.
+        EXPECT_TRUE(seen.count(kindEnc(RadPackedKind::Means, RadPackedEncoding::F32LeBytes)));
+        EXPECT_TRUE(seen.count(kindEnc(RadPackedKind::Alpha, RadPackedEncoding::F16)));
+        EXPECT_TRUE(seen.count(kindEnc(RadPackedKind::Sh0, RadPackedEncoding::R8)));
+        EXPECT_TRUE(seen.count(kindEnc(RadPackedKind::Scales, RadPackedEncoding::LnF16)));
+        EXPECT_TRUE(seen.count(kindEnc(RadPackedKind::Rotation, RadPackedEncoding::Oct88R8)));
+        EXPECT_TRUE(seen.count(kindEnc(RadPackedKind::Sh1, RadPackedEncoding::S8)));
+        EXPECT_TRUE(seen.count(kindEnc(RadPackedKind::Sh2, RadPackedEncoding::S8)));
+        EXPECT_TRUE(seen.count(kindEnc(RadPackedKind::Sh3, RadPackedEncoding::S8)));
+    }
+
+    TEST(LodPageDequant, KernelMatchesCpuDecodeDegree2) {
+        EncodingSet seen;
+        runConvertedFileParity("sh2", 80'000, 24, /*opacity_raw=*/2.0f, seen);
+        using lfs::io::RadPackedEncoding;
+        using lfs::io::RadPackedKind;
+        EXPECT_TRUE(seen.count(kindEnc(RadPackedKind::Sh1, RadPackedEncoding::S8)));
+        EXPECT_TRUE(seen.count(kindEnc(RadPackedKind::Sh2, RadPackedEncoding::S8)));
+        EXPECT_FALSE(seen.count(kindEnc(RadPackedKind::Sh3, RadPackedEncoding::S8)));
+    }
+
+    TEST(LodPageDequant, KernelMatchesCpuDecodeDegree1) {
+        EncodingSet seen;
+        // Near-transparent leaves keep merged alpha below 1 in every chunk,
+        // forcing the Auto profile onto the r8 alpha path.
+        runConvertedFileParity("sh1", 80'000, 9, /*opacity_raw=*/-4.0f, seen);
+        using lfs::io::RadPackedEncoding;
+        using lfs::io::RadPackedKind;
+        EXPECT_TRUE(seen.count(kindEnc(RadPackedKind::Alpha, RadPackedEncoding::R8)));
+        EXPECT_TRUE(seen.count(kindEnc(RadPackedKind::Sh1, RadPackedEncoding::S8)));
+        EXPECT_FALSE(seen.count(kindEnc(RadPackedKind::Sh2, RadPackedEncoding::S8)));
+    }
+
+    TEST(LodPageDequant, KernelMatchesCpuDecodeDegree0) {
+        EncodingSet seen;
+        runConvertedFileParity("sh0", 80'000, 0, /*opacity_raw=*/2.0f, seen);
+        using lfs::io::RadPackedEncoding;
+        using lfs::io::RadPackedKind;
+        EXPECT_TRUE(seen.count(kindEnc(RadPackedKind::Means, RadPackedEncoding::F32LeBytes)));
+        EXPECT_FALSE(seen.count(kindEnc(RadPackedKind::Sh1, RadPackedEncoding::S8)));
     }
 
     // CPU sink-cost comparison on a real converted file: full decode (old

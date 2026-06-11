@@ -5938,6 +5938,29 @@ namespace lfs::vis {
             }
             gpu_lod_last_miss_count_ = miss_count;
 
+            // Pool utilization is the Phase C (treelet) gate number: the
+            // fraction of resident pool nodes the live cut actually renders.
+            static std::uint32_t lod_utilization_log_counter = 0;
+            if ((++lod_utilization_log_counter % 60u) == 0u && lod_page_cache_.configured()) {
+                const auto& cache_snapshot = lod_page_cache_.snapshot();
+                const std::size_t resident_pages =
+                    std::min(cache_snapshot.resident_chunks, cache_snapshot.physical_pages);
+                const std::size_t pool_nodes = resident_pages * LodPageCache::kChunkSplats;
+                const std::size_t touched_pages =
+                    gpu_lod_protected_chunks_.size() + gpu_lod_prefetch_requests_.size();
+                if (pool_nodes > 0) {
+                    LOG_PERF("vksplat.lod_utilization cut={} resident_pages={} pool_nodes={} "
+                             "util={:.1f}% touched_pages={} cut_per_touched={}",
+                             lod_stats->candidate_count,
+                             resident_pages,
+                             pool_nodes,
+                             100.0 * static_cast<double>(lod_stats->candidate_count) /
+                                 static_cast<double>(pool_nodes),
+                             touched_pages,
+                             touched_pages > 0 ? lod_stats->candidate_count / touched_pages : 0);
+                }
+            }
+
             // Damped threshold controller with a wide deadband; the per-frame
             // rate clamp keeps the limit (and with it the global transition
             // band and the touch set) stable at rest.

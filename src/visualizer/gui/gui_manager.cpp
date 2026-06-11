@@ -266,10 +266,19 @@ namespace lfs::vis::gui {
                 if (stats.admission_frozen) {
                     streaming += " | FROZEN";
                 }
-                state.cache_text = std::format("{}/{} pages | {} splat pool | {}",
-                                               formatLodCount(std::min(stats.resident_chunks, stats.pool_pages)),
+                const std::size_t resident_pages = std::min(stats.resident_chunks, stats.pool_pages);
+                std::string utilization;
+                if (stats.gpu_selection && resident_pages > 0) {
+                    utilization = std::format(
+                        " | util {:.1f}%",
+                        100.0 * static_cast<double>(stats.selected_splats) /
+                            static_cast<double>(resident_pages * stats.chunk_splats));
+                }
+                state.cache_text = std::format("{}/{} pages | {} splat pool{} | {}",
+                                               formatLodCount(resident_pages),
                                                formatLodCount(stats.pool_pages),
                                                formatLodCount(pool_splats),
+                                               utilization,
                                                streaming);
             } else {
                 state.cache_text = "--";
