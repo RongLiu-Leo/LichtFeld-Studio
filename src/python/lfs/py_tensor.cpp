@@ -1386,12 +1386,14 @@ namespace lfs::python {
 
     PyTensor PyTensor::from_dlpack(nb::object obj) {
         nb::capsule capsule;
+        bool stream_handshake = false;
 
         if (nb::hasattr(obj, "__dlpack__")) {
             nb::object dlpack_fn = obj.attr("__dlpack__");
             const int64_t consumer = cuda_stream_to_dlpack(lfs::core::getCurrentCUDAStream());
             try {
                 capsule = nb::cast<nb::capsule>(dlpack_fn(nb::arg("stream") = consumer));
+                stream_handshake = true;
             } catch (const std::exception&) {
                 capsule = nb::cast<nb::capsule>(dlpack_fn());
             }
@@ -1434,6 +1436,12 @@ namespace lfs::python {
         const DataType dtype = from_dl_dtype(dl.dtype);
 
         Tensor tensor(data, TensorShape(shape_vec), device, dtype);
+        if (stream_handshake && device == Device::CUDA) {
+            // The producer ordered the data onto our current stream via the
+            // __dlpack__(stream=) handshake; home the tensor there so a later
+            // cross-stream op bridges from the consumer stream, not legacy.
+            tensor.set_stream(lfs::core::getCurrentCUDAStream());
+        }
 
         // Store the DLManagedTensor with a custom deleter that calls the DLPack deleter
         auto result = PyTensor(std::move(tensor), false);

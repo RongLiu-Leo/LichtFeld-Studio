@@ -136,6 +136,13 @@ namespace lfs::vis {
         }
         [[nodiscard]] std::uint64_t renderCompleteValue() const { return render_complete_value_; }
 
+        // Eagerly create the render stream + completion fence so the trainer↔viewer
+        // handshake can be installed before the first live frame submits (covers
+        // training start, scene switch, and post-reset() frames).
+        [[nodiscard]] std::expected<void, std::string> ensureHandshakeReady(VulkanContext& context) {
+            return ensureInitialized(context);
+        }
+
         // Invoked with the completion value immediately after each live-model
         // submit, BEFORE the shared arena frame is released — the trainer's
         // borrow wait must cover the in-flight Vulkan batch before the trainer

@@ -255,6 +255,10 @@ namespace lfs::core {
         std::optional<uint64_t> begin_frame_impl(cudaStream_t stream, bool from_rendering,
                                                  std::optional<uint32_t> wait_timeout_ms);
         bool wait_for_previous_frame(cudaStream_t stream);
+        // Host-blocks on a pending Vulkan release fence (note_external_release)
+        // and clears it. Must run before any path that frees or replaces arena
+        // backing — a device sync cannot observe the in-flight Vulkan batch.
+        void drain_external_release();
         bool install_external_backing_impl(ExternalBacking backing, bool wait);
         char* allocate_internal(Arena& arena, size_t size, uint64_t frame_id);
         void release_arena_storage(Arena& arena);

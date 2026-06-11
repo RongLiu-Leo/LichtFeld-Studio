@@ -186,6 +186,33 @@ namespace lfs::core {
         external_release_value_ = value;
     }
 
+    void RasterizerMemoryArena::drain_external_release() {
+        cudaExternalSemaphore_t release_semaphore = nullptr;
+        uint64_t release_value = 0;
+        {
+            std::lock_guard<std::mutex> lock(last_frame_event_mutex_);
+            release_semaphore = external_release_semaphore_;
+            release_value = external_release_value_;
+            external_release_semaphore_ = nullptr;
+            external_release_value_ = 0;
+        }
+        if (release_semaphore == nullptr || release_value == 0) {
+            return;
+        }
+        // A device sync cannot observe the in-flight Vulkan batch that signals
+        // this release, so host-block on the fence before backing is freed or
+        // replaced under it.
+        cudaExternalSemaphoreWaitParams wait_params{};
+        wait_params.params.fence.value = release_value;
+        if (cudaWaitExternalSemaphoresAsync(&release_semaphore, &wait_params, 1, nullptr) != cudaSuccess) {
+            LOG_WARN("RasterizerMemoryArena: external release drain wait failed (value {})", release_value);
+            return;
+        }
+        if (cudaStreamSynchronize(nullptr) != cudaSuccess) {
+            LOG_WARN("RasterizerMemoryArena: external release drain sync failed (value {})", release_value);
+        }
+    }
+
     // Orders the new frame's work after the previous frame before the arena
     // offset resets and memory gets overwritten. Stream-aware frames chain via
     // the completion event (GPU-side, no host stall); legacy frames or a broken
@@ -560,6 +587,10 @@ namespace lfs::core {
             return active_frames_ == 0 && pending_render_frames_ == 0;
         });
 
+        // A submitted viewport batch may still be reading arena scratch; drain
+        // its release fence before the reset frees or decommits the backing.
+        drain_external_release();
+
         const std::scoped_lock lock(arena_mutex_, frame_mutex_);
 
         frame_contexts_.clear();
@@ -606,6 +637,10 @@ namespace lfs::core {
         } else if (!can_install()) {
             return false;
         }
+
+        // A submitted viewport batch may still be reading the current backing;
+        // drain its release fence before the swap releases that storage.
+        drain_external_release();
 
         cudaSetDevice(backing.device);
         cudaDeviceSynchronize();

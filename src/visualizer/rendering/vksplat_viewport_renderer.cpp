@@ -1131,7 +1131,11 @@ namespace lfs::vis {
             const Tensor& tensor,
             const std::string_view label) {
             try {
-                lfs::core::waitForCUDAStream(stream, tensor.stream());
+                // sync_to_stream (not waitForCUDAStream) so a null/legacy home
+                // stream and any recorded cross-stream uses are ordered before
+                // the render-stream read too; waitForCUDAStream no-ops a nullptr
+                // dependency, leaving default-stream producers unsynchronized.
+                tensor.sync_to_stream(stream);
                 return {};
             } catch (const std::exception& e) {
                 return std::unexpected(std::format(

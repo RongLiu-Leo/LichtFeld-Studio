@@ -733,6 +733,20 @@ namespace lfs::vis {
         // trainer's last consistent parameter state. The reverse edge — the
         // trainer waiting on this frame's completion before its next in-place
         // writes — is published after the frame's submits.
+        //
+        // Initialize the renderer (its render stream + completion fence) before
+        // installing the handshake so the first live frame after a start, scene
+        // switch, or reset() is covered too — otherwise that frame submits with
+        // no borrow fence and the trainer can write while Vulkan still reads.
+        if (is_training && context.vulkan_context &&
+            lfs::rendering::isVkSplatBackend(settings_.raster_backend)) {
+            if (!vksplat_viewport_renderer_) {
+                vksplat_viewport_renderer_ = std::make_unique<VksplatViewportRenderer>();
+            }
+            if (const auto ok = vksplat_viewport_renderer_->ensureHandshakeReady(*context.vulkan_context); !ok) {
+                LOG_WARN("VkSplat handshake pre-init skipped: {}", ok.error());
+            }
+        }
         lfs::training::Trainer* live_trainer = nullptr;
         if (is_training && trainer_manager && vksplat_viewport_renderer_ &&
             vksplat_viewport_renderer_->renderStream()) {
@@ -760,6 +774,12 @@ namespace lfs::vis {
             VksplatViewportRenderer* renderer;
             ~ViewerBorrowPublisher() {
                 if (trainer && renderer) {
+                    // Reverse edge that also covers early exits: even when no new
+                    // batch advanced the completion value (validation/setup error
+                    // after prepareInputs enqueued render-stream model copies),
+                    // record a reader-done edge on the render stream so the next
+                    // training step waits for those reads before writing.
+                    trainer->endModelRead(renderer->renderStream());
                     trainer->publishViewerBorrow(renderer->renderCompleteValue());
                 }
             }

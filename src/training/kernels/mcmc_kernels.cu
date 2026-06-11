@@ -911,6 +911,9 @@ namespace lfs::training::mcmc {
             return;
 
         const cudaStream_t cuda_stream = resolve_stream(stream);
+        // Home the scan/sampling temporaries on the launch stream so the
+        // stream-aware pool cannot recycle them before this work completes.
+        const lfs::core::CUDAStreamGuard stream_guard(cuda_stream);
 
         auto alive_probs = lfs::core::Tensor::empty({n_alive}, lfs::core::Device::CUDA, lfs::core::DataType::Float32);
         auto cumsum_buf = lfs::core::Tensor::empty({n_alive}, lfs::core::Device::CUDA, lfs::core::DataType::Float32);
@@ -1016,6 +1019,8 @@ namespace lfs::training::mcmc {
             return;
 
         const cudaStream_t cuda_stream = resolve_stream(stream);
+        // Home the scan temporary on the launch stream (see launch_multinomial_sample).
+        const lfs::core::CUDAStreamGuard stream_guard(cuda_stream);
 
         auto cumsum_buf = lfs::core::Tensor::empty({N}, lfs::core::Device::CUDA, lfs::core::DataType::Float32);
 
