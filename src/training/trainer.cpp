@@ -3195,13 +3195,13 @@ namespace lfs::training {
                 std::unique_lock<std::shared_mutex> lock(render_mutex_, std::defer_lock);
                 if (strategy_->is_refining(iter)) {
                     lock.lock();
-                    // Reallocation ahead: order the trainer stream after any
-                    // in-flight model-read GPU work whose done-event is still
-                    // pending (a metric render that finished CPU-side between
-                    // the step-top drain and now). The exclusive lock guarantees
-                    // no new reader starts.
-                    waitForModelReaders();
                 }
+                // Drain in-flight reader events immediately before post_backward's
+                // in-place writes — not only at the loop top — so the trainer stream
+                // is ordered after any read that began mid-step, collapsing the
+                // reader↔writer overlap to a sub-microsecond CPU window. The
+                // exclusive lock (when refining) additionally bars new readers.
+                waitForModelReaders();
                 auto& model = strategy_->get_model();
                 const size_t model_size_before = static_cast<size_t>(model.size());
                 strategy_->post_backward(iter, r_output);
@@ -4168,10 +4168,12 @@ namespace lfs::training {
                     std::unique_lock<std::shared_mutex> lock(render_mutex_, std::defer_lock);
                     if (strategy_->is_refining(iter)) {
                         lock.lock();
-                        // See post_backward lock above: drain in-flight reader
-                        // events before grow/prune reallocates model tensors.
-                        waitForModelReaders();
                     }
+                    // Drain in-flight reader events immediately before the optimizer
+                    // step's in-place writes — not only at the loop top — so the
+                    // trainer stream is ordered after any read that began mid-step.
+                    // The exclusive lock (when refining) additionally bars new readers.
+                    waitForModelReaders();
                     LFS_VRAM_SCOPE("train.optimizer.strategy_step");
                     LOG_VRAM_DIFF("train.optimizer.strategy_step");
                     auto& model = strategy_->get_model();
