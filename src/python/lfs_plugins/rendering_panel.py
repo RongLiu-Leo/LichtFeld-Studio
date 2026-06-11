@@ -515,27 +515,6 @@ class RenderingPanel(Panel):
         model.bind_func("simplify_show_error", lambda: bool(self._simplify_error_text))
         model.bind_func("simplify_error_text", lambda: self._simplify_error_text)
 
-        model.bind_func("tooltip_lod_enabled",
-                         lambda: lf.ui.tr("tooltip.lod_enabled") or "")
-        model.bind_func("tooltip_lod_max_splats",
-                         lambda: lf.ui.tr("tooltip.lod_max_splats") or "")
-        model.bind_func("tooltip_lod_page_pool_splats",
-                         lambda: lf.ui.tr("tooltip.lod_page_pool_splats") or "")
-        model.bind_func("tooltip_lod_pool_vram_fraction",
-                         lambda: lf.ui.tr("tooltip.lod_pool_vram_fraction") or "")
-        model.bind_func("tooltip_lod_fade_frames",
-                         lambda: lf.ui.tr("tooltip.lod_fade_frames") or "")
-        model.bind_func("tooltip_lod_render_scale",
-                         lambda: lf.ui.tr("tooltip.lod_render_scale") or "")
-        model.bind_func("tooltip_lod_cone_foveation",
-                         lambda: lf.ui.tr("tooltip.lod_cone_foveation") or "")
-        model.bind_func("tooltip_lod_cone_inner_degrees",
-                         lambda: lf.ui.tr("tooltip.lod_cone_inner_degrees") or "")
-        model.bind_func("tooltip_lod_cone_outer_degrees",
-                         lambda: lf.ui.tr("tooltip.lod_cone_outer_degrees") or "")
-        model.bind_func("tooltip_lod_debug_mode",
-                         lambda: lf.ui.tr("tooltip.lod_debug_mode") or "")
-
         model.bind("theme_vignette_enabled",
                    lambda: bool((vignette := _theme_vignette()) and vignette.enabled),
                    lambda v: lf.ui.set_theme_vignette_enabled(bool(v)))
