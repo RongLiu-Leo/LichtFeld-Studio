@@ -151,7 +151,8 @@ namespace lfs::vis {
         AdmitResult requestResident(std::uint32_t chunk,
                                     bool pin,
                                     std::uint32_t priority,
-                                    std::span<const std::uint8_t> protected_pages = {});
+                                    std::span<const std::uint8_t> protected_pages = {},
+                                    bool screened_inactive = false);
         [[nodiscard]] std::size_t chooseEvictionSlot(
             std::span<const std::uint8_t> protected_pages = {}) const;
         void buildEvictionScratch(std::span<const std::uint8_t> protected_pages) const;

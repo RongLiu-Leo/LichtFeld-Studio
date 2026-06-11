@@ -161,6 +161,20 @@ namespace lfs::vis {
             return in_flight_chunks_.count(chunk) > 0;
         }
 
+        // One-lock snapshot of every chunk this scheduler currently owns;
+        // submitInternal screens requests against it instead of paying a
+        // mutex + queue scan per request.
+        void snapshotChunks(std::unordered_set<std::uint32_t>& out) const {
+            std::lock_guard lock(mutex_);
+            for (const auto& entry : queue_) {
+                out.insert(entry.chunk);
+            }
+            for (const auto& result : completed_) {
+                out.insert(result.chunk);
+            }
+            out.insert(in_flight_chunks_.begin(), in_flight_chunks_.end());
+        }
+
         void setSink(std::shared_ptr<const PageSink> sink) {
             std::lock_guard lock(mutex_);
             sink_ = std::move(sink);
@@ -410,11 +424,24 @@ namespace lfs::vis {
         std::size_t refused_no_slot = 0;
         std::size_t refused_margin = 0;
 
-        const auto has_pending_upload = [&](const std::uint32_t chunk) {
-            return std::any_of(pending_uploads_.begin(), pending_uploads_.end(), [chunk](const PendingUpload& upload) {
-                return upload.chunk == chunk;
-            });
-        };
+        // Per-submit activity snapshot: chunks pending upload, queued or
+        // running in the scheduler, or loading into a slot. Screening against
+        // a set keeps the request loop O(1) per request — the per-request
+        // decodeInFlight/pending scans measured 800 ms/frame at 95K pages.
+        std::unordered_set<std::uint32_t> active_chunks;
+        active_chunks.reserve(pending_uploads_.size() + requests.size());
+        for (const auto& upload : pending_uploads_) {
+            active_chunks.insert(upload.chunk);
+        }
+        if (scheduler_) {
+            scheduler_->snapshotChunks(active_chunks);
+        }
+        for (const auto& slot : pages_) {
+            if (slot.loading_chunk != kInvalidPage) {
+                active_chunks.insert(slot.loading_chunk);
+            }
+        }
+        const std::size_t outstanding_base = outstandingWorkCount();
 
         for (const auto& request : requests) {
             const std::uint32_t chunk = request.chunk;
@@ -427,22 +454,25 @@ namespace lfs::vis {
             if (resident && stamp_resident_requests) {
                 stampProtection(chunk, request.priority);
             }
-            const bool active_request = resident || decodeInFlight(chunk) || has_pending_upload(chunk);
+            const bool active_request = resident || active_chunks.count(chunk) > 0;
             if (!active_request) {
                 ++wants;
-                const std::size_t outstanding = outstandingWorkCount();
-                if (new_requests >= request_budget || outstanding >= request_budget) {
+                if (new_requests >= request_budget ||
+                    outstanding_base + new_requests >= request_budget) {
                     ++deferred_requests_;
                     ++budget_deferred;
                     continue;
                 }
             }
-            const AdmitResult result = requestResident(chunk, false, request.priority, protected_pages);
+            const AdmitResult result =
+                requestResident(chunk, false, request.priority, protected_pages,
+                                /*screened_inactive=*/!active_request);
             if (!active_request) {
                 switch (result) {
                 case AdmitResult::Admitted:
                     ++new_requests;
                     ++admitted_requests_;
+                    active_chunks.insert(chunk);
                     break;
                 case AdmitResult::NoSlot:
                     ++deferred_requests_;
@@ -600,7 +630,8 @@ namespace lfs::vis {
         const std::uint32_t chunk,
         const bool pin,
         const std::uint32_t priority,
-        const std::span<const std::uint8_t> protected_pages) {
+        const std::span<const std::uint8_t> protected_pages,
+        const bool screened_inactive) {
         if (chunk >= snapshot_.logical_chunks || pages_.empty()) {
             return AdmitResult::Invalid;
         }
@@ -611,16 +642,18 @@ namespace lfs::vis {
             pages_[current_page].pinned = pages_[current_page].pinned || pin;
             return AdmitResult::AlreadyActive;
         }
-        if (decodeInFlight(chunk)) {
-            return AdmitResult::AlreadyActive;
-        }
-        for (auto& pending : pending_uploads_) {
-            if (pending.chunk == chunk) {
-                if (pending.page < pages_.size()) {
-                    pages_[pending.page].last_used = ++clock_;
-                    pages_[pending.page].pinned = pages_[pending.page].pinned || pin;
-                }
+        if (!screened_inactive) {
+            if (decodeInFlight(chunk)) {
                 return AdmitResult::AlreadyActive;
+            }
+            for (auto& pending : pending_uploads_) {
+                if (pending.chunk == chunk) {
+                    if (pending.page < pages_.size()) {
+                        pages_[pending.page].last_used = ++clock_;
+                        pages_[pending.page].pinned = pages_[pending.page].pinned || pin;
+                    }
+                    return AdmitResult::AlreadyActive;
+                }
             }
         }
 
