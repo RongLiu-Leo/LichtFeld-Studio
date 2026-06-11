@@ -13,6 +13,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <random>
 #include <span>
 #include <vector>
@@ -121,6 +122,41 @@ namespace {
         options.temp_dir = temp_dir / "scratch";
         EXPECT_TRUE(lfs::io::convert_ply_to_rad_lod(ply_path, rad_path, options).has_value());
         return rad_path;
+    }
+
+    TEST(RadMetaSidecar, ConverterEmitsSidecarInline) {
+        const auto temp_dir = std::filesystem::temp_directory_path() / "rad_meta_sidecar_inline";
+        std::filesystem::remove_all(temp_dir);
+        const auto rad_path = makeTestRad(temp_dir);
+        const auto meta_path = lfs::io::rad_meta_sidecar_path(rad_path);
+
+        // The converter publishes the sidecar during chunk emission; opening
+        // must succeed without any rebuild pass.
+        ASSERT_TRUE(std::filesystem::exists(meta_path));
+        {
+            auto view = lfs::io::open_rad_meta_sidecar(rad_path);
+            ASSERT_TRUE(view.has_value()) << view.error();
+            EXPECT_GT(view->node_count, 200'000u);
+            EXPECT_EQ(view->leaf_count, 200'000u);
+            EXPECT_EQ(view->links[0].parent, 0xFFFFFFFFu);
+        }
+
+        // Inline emission must replicate the standalone builder bit for bit.
+        const auto read_all = [](const std::filesystem::path& p) {
+            std::ifstream in(p, std::ios::binary);
+            return std::vector<char>(std::istreambuf_iterator<char>(in),
+                                     std::istreambuf_iterator<char>());
+        };
+        const auto inline_bytes = read_all(meta_path);
+        ASSERT_FALSE(inline_bytes.empty());
+        std::filesystem::remove(meta_path);
+        ASSERT_TRUE(lfs::io::build_rad_meta_sidecar(rad_path).has_value());
+        const auto rebuilt_bytes = read_all(meta_path);
+        ASSERT_EQ(inline_bytes.size(), rebuilt_bytes.size());
+        EXPECT_TRUE(inline_bytes == rebuilt_bytes)
+            << "inline sidecar diverges from a standalone rebuild";
+
+        std::filesystem::remove_all(temp_dir);
     }
 
     TEST(RadMetaSidecar, RoundtripQuantizationAndInvalidation) {

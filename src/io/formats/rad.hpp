@@ -168,13 +168,18 @@ namespace lfs::io {
     // Streams LOD RAD chunks to disk with bounded memory. The chunk index area
     // is reserved up front (total node count must be known) and backpatched on
     // finish(); the decoder tolerates the trailing space padding.
+    // With emit_meta_sidecar (LOD only), the .rad.meta sidecar is written
+    // alongside chunk emission from the same decoded values the standalone
+    // builder would see, so finished files open without a rebuild pass.
+    // Emission is best-effort and never fails the writer.
     class RadStreamWriter {
     public:
         RadStreamWriter(std::filesystem::path output_path,
                         std::uint64_t total_count,
                         int sh_degree,
                         bool lod_tree,
-                        int compression_level = 6);
+                        int compression_level = 6,
+                        bool emit_meta_sidecar = false);
         ~RadStreamWriter();
         RadStreamWriter(const RadStreamWriter&) = delete;
         RadStreamWriter& operator=(const RadStreamWriter&) = delete;

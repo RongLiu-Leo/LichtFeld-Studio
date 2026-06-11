@@ -3131,6 +3131,187 @@ namespace lfs::io {
             return stamp;
         }
 
+        // Per-chunk sidecar quantization shared by the standalone builder and
+        // the inline converter path. Both feed decoded chunk values, so the
+        // resulting planes are bit-identical regardless of which path ran.
+        void quantizeRadMetaChunk(const std::size_t base,
+                                  const std::size_t count,
+                                  const float* const means,
+                                  const float* const scales,
+                                  const float* const alpha,
+                                  const std::uint16_t* const child_count,
+                                  const std::uint32_t* const child_start,
+                                  const bool lod_opacity_encoded,
+                                  std::vector<float>& sizes_scratch,
+                                  lfs::core::RadMetaBoundsQ* const out_bounds,
+                                  lfs::core::RadMetaLinksQ* const out_links,
+                                  RadMetaChunkEntry& out_entry) {
+            // Pass 1: float centers/sizes + the chunk's quantization frame.
+            constexpr float kSizeFloor = 1e-20f;
+            sizes_scratch.resize(count);
+            glm::vec3 bbox_min{std::numeric_limits<float>::max()};
+            glm::vec3 bbox_max{std::numeric_limits<float>::lowest()};
+            float log_min = std::numeric_limits<float>::max();
+            float log_max = std::numeric_limits<float>::lowest();
+            for (std::size_t i = 0; i < count; ++i) {
+                const float max_scale = std::max({scales[i * 3 + 0],
+                                                  scales[i * 3 + 1],
+                                                  scales[i * 3 + 2]});
+                float expansion = 1.0f;
+                if (lod_opacity_encoded) {
+                    const float lod_alpha = std::max(alpha[i], 0.0f);
+                    if (lod_alpha > 1.0f) {
+                        const float spark_lod_opacity =
+                            std::min(lod_alpha * 4.0f - 3.0f, 5.0f);
+                        expansion = 1.0f + 0.7f * (spark_lod_opacity - 1.0f);
+                    }
+                }
+                const float size = std::max(2.0f * expansion * max_scale, kSizeFloor);
+                sizes_scratch[i] = size;
+                const glm::vec3 center{means[i * 3 + 0],
+                                       means[i * 3 + 1],
+                                       means[i * 3 + 2]};
+                bbox_min = glm::min(bbox_min, center);
+                bbox_max = glm::max(bbox_max, center);
+                log_min = std::min(log_min, std::log(size));
+                log_max = std::max(log_max, std::log(size));
+            }
+            const glm::vec3 extent = bbox_max - bbox_min;
+            const float log_range = log_max - log_min;
+
+            // Pass 2: quantize against the frame.
+            const auto quant = [](const float v, const float lo, const float range) {
+                if (!(range > 0.0f)) {
+                    return std::uint16_t{0};
+                }
+                const float t = std::clamp((v - lo) / range, 0.0f, 1.0f);
+                return static_cast<std::uint16_t>(std::lround(t * 65535.0f));
+            };
+            for (std::size_t i = 0; i < count; ++i) {
+                out_bounds[i] = {
+                    .qx = quant(means[i * 3 + 0], bbox_min.x, extent.x),
+                    .qy = quant(means[i * 3 + 1], bbox_min.y, extent.y),
+                    .qz = quant(means[i * 3 + 2], bbox_min.z, extent.z),
+                    .qsize = quant(std::log(sizes_scratch[i]), log_min, log_range),
+                };
+
+                const std::uint32_t cc = child_count[i];
+                const std::uint32_t logical = static_cast<std::uint32_t>(base + i);
+                std::uint32_t flags = 0u;
+                if (cc == 0u) {
+                    flags |= 1u;
+                }
+                if (logical == 0u) {
+                    flags |= 2u;
+                }
+                if (lod_opacity_encoded) {
+                    flags |= 4u;
+                }
+                out_links[i] = {
+                    .child_start = child_start[i],
+                    .packed = (cc & 0xffffu) | ((flags & 0xffu) << 24u),
+                    .parent = lfs::core::SplatLodTree::kInvalidPage,
+                };
+            }
+
+            out_entry.bbox_min[0] = bbox_min.x;
+            out_entry.bbox_min[1] = bbox_min.y;
+            out_entry.bbox_min[2] = bbox_min.z;
+            out_entry.bbox_extent[0] = extent.x;
+            out_entry.bbox_extent[1] = extent.y;
+            out_entry.bbox_extent[2] = extent.z;
+            out_entry.log_size_min = log_min;
+            out_entry.log_size_range = log_range;
+        }
+
+        // Phase 2 of sidecar builds: block-stream the links plane patching
+        // parent and level via forward scatter. Children always follow their
+        // parent in the BFS layout, so each node's entry is final when
+        // reached. Returns the leaf count.
+        Result<std::uint64_t> patchRadMetaLinksPlane(
+            std::fstream& rmw,
+            const std::uint64_t links_offset,
+            const std::uint64_t n,
+            const std::filesystem::path& rad_path,
+            const std::filesystem::path& tmp_path,
+            const std::function<bool(float)>& progress) {
+            std::vector<std::uint32_t> parent;
+            std::vector<std::uint8_t> level;
+            try {
+                parent.assign(n, lfs::core::SplatLodTree::kInvalidPage);
+                level.assign(n, 0);
+            } catch (const std::bad_alloc&) {
+                return make_error(ErrorCode::WRITE_FAILURE,
+                                  std::format("Not enough RAM for sidecar parent scatter ({} nodes)", n),
+                                  rad_path);
+            }
+            std::uint64_t leaf_count = 0;
+            std::uint64_t assigned = 0;
+            constexpr std::size_t kBlockRecords = std::size_t{4} << 20;
+            std::vector<lfs::core::RadMetaLinksQ> block(std::min<std::size_t>(kBlockRecords, n));
+            for (std::uint64_t first = 0; first < n; first += kBlockRecords) {
+                const std::size_t count = static_cast<std::size_t>(
+                    std::min<std::uint64_t>(kBlockRecords, n - first));
+                const std::streamoff offset = static_cast<std::streamoff>(
+                    links_offset + first * sizeof(lfs::core::RadMetaLinksQ));
+                rmw.clear();
+                rmw.seekg(offset, std::ios::beg);
+                rmw.read(reinterpret_cast<char*>(block.data()),
+                         static_cast<std::streamsize>(count * sizeof(lfs::core::RadMetaLinksQ)));
+                if (!rmw.good()) {
+                    return make_error(ErrorCode::READ_FAILURE,
+                                      std::format("Failed to read sidecar links block: {}", io_error_detail()),
+                                      tmp_path);
+                }
+                for (std::size_t k = 0; k < count; ++k) {
+                    const std::uint64_t i = first + k;
+                    auto& rec = block[k];
+                    rec.parent = parent[i];
+                    rec.packed = (rec.packed & 0xff00ffffu) |
+                                 ((static_cast<std::uint32_t>(level[i]) & 0xffu) << 16u);
+                    const std::uint32_t cc = rec.packed & 0xffffu;
+                    if (cc == 0) {
+                        ++leaf_count;
+                        continue;
+                    }
+                    const std::uint64_t cs = rec.child_start;
+                    if (cs <= i || cs + cc > n) {
+                        return make_error(ErrorCode::CORRUPTED_DATA,
+                                          std::format("corrupt LOD layout: node {} children [{}, {})",
+                                                      i, cs, cs + cc),
+                                          rad_path);
+                    }
+                    const std::uint8_t child_level =
+                        static_cast<std::uint8_t>(std::min<std::uint32_t>(level[i] + 1u, 255u));
+                    for (std::uint32_t c = 0; c < cc; ++c) {
+                        parent[cs + c] = static_cast<std::uint32_t>(i);
+                        level[cs + c] = child_level;
+                    }
+                    assigned += cc;
+                }
+                rmw.clear();
+                rmw.seekp(offset, std::ios::beg);
+                rmw.write(reinterpret_cast<const char*>(block.data()),
+                          static_cast<std::streamsize>(count * sizeof(lfs::core::RadMetaLinksQ)));
+                if (!rmw.good()) {
+                    return make_error(ErrorCode::WRITE_FAILURE,
+                                      std::format("Failed to write sidecar links block: {}", io_error_detail()),
+                                      tmp_path);
+                }
+                if (progress != nullptr &&
+                    !progress(static_cast<float>(first + count) / static_cast<float>(n))) {
+                    return make_error(ErrorCode::CANCELLED, "Sidecar build cancelled", rad_path);
+                }
+            }
+            if (assigned != n - 1) {
+                return make_error(ErrorCode::CORRUPTED_DATA,
+                                  std::format("corrupt LOD layout: {} of {} nodes have a parent",
+                                              assigned, n - 1),
+                                  rad_path);
+            }
+            return leaf_count;
+        }
+
         std::size_t available_host_memory_bytes() {
 #ifdef _WIN32
             MEMORYSTATUSEX status{};
@@ -4055,6 +4236,202 @@ namespace lfs::io {
     // RadStreamWriter
     // ============================================================================
 
+    namespace {
+
+        // Streams the .rad.meta sidecar while the converter emits chunks, so
+        // converter-produced files skip the standalone full-file rebuild pass.
+        // Inputs are the freshly encoded chunk's decoded values, making the
+        // planes bit-identical to a build_rad_meta_sidecar() run over the
+        // finished file. Emission is best-effort: any failure abandons the
+        // temp file and the loader rebuilds on demand.
+        class RadMetaInlineWriter {
+        public:
+            ~RadMetaInlineWriter() { abandon(); }
+
+            [[nodiscard]] std::expected<void, std::string> open(
+                const std::filesystem::path& rad_path,
+                const std::uint64_t node_count,
+                const std::uint64_t chunk_count) {
+                header_ = {};
+                header_.magic = RAD_META_MAGIC;
+                header_.version = RAD_META_VERSION;
+                header_.endian_sentinel = RAD_META_ENDIAN_SENTINEL;
+                header_.chunk_size = static_cast<std::uint32_t>(lfs::core::SplatLodTree::kChunkSplats);
+                header_.node_count = node_count;
+                header_.chunk_count = chunk_count;
+                header_.bounds_offset = RAD_META_HEADER_BYTES;
+                header_.links_offset =
+                    header_.bounds_offset + alignPlane(node_count * sizeof(lfs::core::RadMetaBoundsQ));
+                header_.chunk_table_offset =
+                    header_.links_offset + alignPlane(node_count * sizeof(lfs::core::RadMetaLinksQ));
+                header_.lod_opacity_encoded = 1;
+                header_.complete = 0;
+                const std::uint64_t total_bytes =
+                    header_.chunk_table_offset + chunk_count * sizeof(RadMetaChunkEntry);
+
+                meta_path_ = rad_meta_sidecar_path(rad_path);
+                {
+                    std::error_code ec;
+                    const auto space = std::filesystem::space(meta_path_.parent_path(), ec);
+                    if (!ec && space.available < total_bytes + (std::uint64_t{1} << 28)) {
+                        return std::unexpected(
+                            std::format("not enough disk space for sidecar: need {} GB, {} GB free",
+                                        total_bytes >> 30, space.available >> 30));
+                    }
+                }
+
+#ifdef _WIN32
+                const auto pid = static_cast<std::uint64_t>(GetCurrentProcessId());
+#else
+                const auto pid = static_cast<std::uint64_t>(getpid());
+#endif
+                tmp_path_ = meta_path_;
+                tmp_path_ += std::format(".tmp.{}", pid);
+                {
+                    std::ofstream create;
+                    if (!lfs::core::open_file_for_write(tmp_path_, std::ios::binary | std::ios::trunc, create)) {
+                        return std::unexpected(std::format(
+                            "failed to create sidecar temp file: {}", io_error_detail()));
+                    }
+                    create.seekp(static_cast<std::streamoff>(total_bytes - 1), std::ios::beg);
+                    create.put('\0');
+                    if (!create.good()) {
+                        create.close();
+                        removeTmp();
+                        return std::unexpected(std::format(
+                            "failed to size sidecar temp file: {}", io_error_detail()));
+                    }
+                }
+                out_.open(tmp_path_, std::ios::binary | std::ios::in | std::ios::out);
+                if (!out_.is_open()) {
+                    removeTmp();
+                    return std::unexpected(std::format(
+                        "failed to open sidecar temp file: {}", io_error_detail()));
+                }
+                chunk_table_.assign(static_cast<std::size_t>(chunk_count), {});
+                nodes_written_ = 0;
+                open_ = true;
+                return {};
+            }
+
+            [[nodiscard]] bool isOpen() const { return open_; }
+
+            [[nodiscard]] std::expected<void, std::string> writeChunk(
+                const std::uint64_t chunk_idx,
+                const std::uint64_t base,
+                const std::span<const lfs::core::RadMetaBoundsQ> bounds,
+                const std::span<const lfs::core::RadMetaLinksQ> links,
+                const RadMetaChunkEntry& entry) {
+                if (chunk_idx >= chunk_table_.size() ||
+                    base != chunk_idx * lfs::core::SplatLodTree::kChunkSplats) {
+                    return std::unexpected(std::format(
+                        "sidecar chunk {} misaligned (base {})", chunk_idx, base));
+                }
+                out_.clear();
+                out_.seekp(static_cast<std::streamoff>(
+                               header_.bounds_offset + base * sizeof(lfs::core::RadMetaBoundsQ)),
+                           std::ios::beg);
+                out_.write(reinterpret_cast<const char*>(bounds.data()),
+                           static_cast<std::streamsize>(bounds.size_bytes()));
+                out_.seekp(static_cast<std::streamoff>(
+                               header_.links_offset + base * sizeof(lfs::core::RadMetaLinksQ)),
+                           std::ios::beg);
+                out_.write(reinterpret_cast<const char*>(links.data()),
+                           static_cast<std::streamsize>(links.size_bytes()));
+                if (!out_.good()) {
+                    return std::unexpected(std::format(
+                        "failed to write sidecar planes: {}", io_error_detail()));
+                }
+                chunk_table_[static_cast<std::size_t>(chunk_idx)] = entry;
+                nodes_written_ += links.size();
+                return {};
+            }
+
+            // Must run after the RAD file is committed to its final path: the
+            // staleness stamp hashes the published header bytes.
+            [[nodiscard]] std::expected<void, std::string> finalize(
+                const std::filesystem::path& rad_path,
+                const std::size_t chunk_area_start) {
+                if (!open_) {
+                    return std::unexpected("sidecar writer not open");
+                }
+                if (nodes_written_ != header_.node_count) {
+                    return std::unexpected(std::format(
+                        "sidecar holds {} of {} nodes", nodes_written_, header_.node_count));
+                }
+                auto leaf_count = patchRadMetaLinksPlane(
+                    out_, header_.links_offset, header_.node_count, rad_path, tmp_path_, nullptr);
+                if (!leaf_count) {
+                    return std::unexpected(leaf_count.error().message);
+                }
+                header_.leaf_count = *leaf_count;
+
+                auto stamp = radSourceStamp(rad_path, chunk_area_start);
+                if (!stamp) {
+                    return std::unexpected(stamp.error());
+                }
+                header_.source_file_size = stamp->file_size;
+                header_.source_mtime = stamp->mtime;
+                header_.source_header_hash = stamp->header_hash;
+                header_.complete = 1;
+
+                out_.clear();
+                out_.seekp(static_cast<std::streamoff>(header_.chunk_table_offset), std::ios::beg);
+                out_.write(reinterpret_cast<const char*>(chunk_table_.data()),
+                           static_cast<std::streamsize>(chunk_table_.size() * sizeof(RadMetaChunkEntry)));
+                out_.seekp(0, std::ios::beg);
+                out_.write(reinterpret_cast<const char*>(&header_), sizeof(header_));
+                out_.flush();
+                if (!out_.good()) {
+                    return std::unexpected(std::format(
+                        "failed to finalize sidecar: {}", io_error_detail()));
+                }
+                out_.close();
+
+                std::error_code rename_ec;
+                std::filesystem::rename(tmp_path_, meta_path_, rename_ec);
+                if (rename_ec) {
+                    removeTmp();
+                    open_ = false;
+                    if (open_rad_meta_sidecar(rad_path)) {
+                        return {};
+                    }
+                    return std::unexpected(std::format(
+                        "failed to publish sidecar: {}", rename_ec.message()));
+                }
+                open_ = false;
+                LOG_INFO("RAD metadata sidecar emitted inline: {} ({} nodes, {} leaves)",
+                         lfs::core::path_to_utf8(meta_path_), header_.node_count,
+                         header_.leaf_count);
+                return {};
+            }
+
+            void abandon() {
+                if (!open_) {
+                    return;
+                }
+                out_.close();
+                removeTmp();
+                open_ = false;
+            }
+
+        private:
+            void removeTmp() {
+                std::error_code ec;
+                std::filesystem::remove(tmp_path_, ec);
+            }
+
+            RadMetaHeader header_{};
+            std::vector<RadMetaChunkEntry> chunk_table_;
+            std::filesystem::path meta_path_;
+            std::filesystem::path tmp_path_;
+            std::fstream out_;
+            std::uint64_t nodes_written_ = 0;
+            bool open_ = false;
+        };
+
+    } // namespace
+
     struct RadStreamWriter::Impl {
         std::filesystem::path output_path;
         std::uint64_t total_count = 0;
@@ -4071,13 +4448,22 @@ namespace lfs::io {
         std::vector<RadChunkRange> ranges;
         bool opened = false;
         bool finished = false;
+
+        bool emit_meta_sidecar = false;
+        RadMetaInlineWriter meta_writer;
+
+        void dropMetaWriter(const std::string& reason) {
+            LOG_WARN("RAD sidecar inline emission disabled: {}; loader rebuilds on demand", reason);
+            meta_writer.abandon();
+        }
     };
 
     RadStreamWriter::RadStreamWriter(std::filesystem::path output_path,
                                      const std::uint64_t total_count,
                                      const int sh_degree,
                                      const bool lod_tree,
-                                     const int compression_level)
+                                     const int compression_level,
+                                     const bool emit_meta_sidecar)
         : impl_(std::make_unique<Impl>()) {
         impl_->output_path = std::move(output_path);
         impl_->total_count = total_count;
@@ -4088,6 +4474,7 @@ namespace lfs::io {
             (compression_level >= Z_NO_COMPRESSION && compression_level <= Z_BEST_COMPRESSION)
                 ? compression_level
                 : GZ_LEVEL;
+        impl_->emit_meta_sidecar = emit_meta_sidecar && lod_tree;
     }
 
     RadStreamWriter::~RadStreamWriter() = default;
@@ -4131,6 +4518,13 @@ namespace lfs::io {
                 "RadStreamWriter: failed to write RAD header: {}", io_error_detail()));
         }
         s.opened = true;
+
+        if (s.emit_meta_sidecar) {
+            if (auto meta_opened = s.meta_writer.open(s.output_path, s.total_count, expected_chunks);
+                !meta_opened) {
+                s.dropMetaWriter(meta_opened.error());
+            }
+        }
         return {};
     }
 
@@ -4169,6 +4563,19 @@ namespace lfs::io {
             return std::unexpected("RadStreamWriter: chunk exceeds declared total count");
         }
 
+        // Sidecar planes quantize from the chunk's encoded-then-decoded values
+        // so they match a standalone rebuild over the finished file bit for
+        // bit (lossy property encodings shift means/scales/alpha slightly).
+        struct MetaSlice {
+            std::vector<lfs::core::RadMetaBoundsQ> bounds;
+            std::vector<lfs::core::RadMetaLinksQ> links;
+            RadMetaChunkEntry entry{};
+            std::size_t payload_start = 0;
+            std::string error;
+        };
+        const bool emit_meta = s.meta_writer.isOpen();
+        std::vector<MetaSlice> meta(emit_meta ? chunks.size() : 0);
+
         std::vector<std::pair<RadChunkMeta, std::vector<uint8_t>>> encoded(chunks.size());
         tbb::parallel_for(std::size_t{0}, chunks.size(), [&](const std::size_t i) {
             const auto& chunk = chunks[i];
@@ -4187,6 +4594,39 @@ namespace lfs::io {
                 s.lod_tree ? chunk.child_start : nullptr,
                 s.lod_tree,
                 s.compression_level);
+
+            if (!emit_meta) {
+                return;
+            }
+            auto& slice = meta[i];
+            const auto& bytes = encoded[i].second;
+            auto parsed = parse_rad_chunk_header(bytes.data(), bytes.size());
+            if (!parsed) {
+                slice.error = parsed.error();
+                return;
+            }
+            const std::size_t count = chunk.count;
+            std::vector<float> means(count * 3);
+            std::vector<float> scales(count * 3);
+            std::vector<float> alpha(count);
+            auto err = decode_chunk_properties(
+                bytes.data(), parsed->meta, 0, parsed->payload_start,
+                parsed->has_payload_prefix, parsed->chunk_end, 0,
+                means.data(), alpha.data(), nullptr,
+                scales.data(), nullptr, nullptr, nullptr, nullptr);
+            if (err.has_value()) {
+                slice.error = std::move(*err);
+                return;
+            }
+            std::vector<float> sizes;
+            slice.bounds.resize(count);
+            slice.links.resize(count);
+            quantizeRadMetaChunk(bases[i], count, means.data(), scales.data(),
+                                 alpha.data(), chunk.child_count, chunk.child_start,
+                                 /*lod_opacity_encoded=*/true, sizes,
+                                 slice.bounds.data(), slice.links.data(), slice.entry);
+            slice.payload_start = parsed->payload_start;
+            slice.entry.payload_bytes = parsed->meta.payload_bytes;
         });
 
         for (std::size_t i = 0; i < chunks.size(); ++i) {
@@ -4204,6 +4644,22 @@ namespace lfs::io {
             range.base = s.written_count;
             range.count = chunks[i].count;
             s.ranges.push_back(range);
+
+            if (s.meta_writer.isOpen()) {
+                auto& slice = meta[i];
+                if (!slice.error.empty()) {
+                    s.dropMetaWriter(slice.error);
+                } else {
+                    slice.entry.payload_offset =
+                        8 + s.meta_reserved + range.offset + slice.payload_start;
+                    if (auto written = s.meta_writer.writeChunk(
+                            s.ranges.size() - 1, bases[i],
+                            slice.bounds, slice.links, slice.entry);
+                        !written) {
+                        s.dropMetaWriter(written.error());
+                    }
+                }
+            }
 
             s.chunk_area_bytes += payload.size();
             s.written_count += chunks[i].count;
@@ -4253,6 +4709,15 @@ namespace lfs::io {
             return std::unexpected(commit_result.error().message);
         }
         s.finished = true;
+
+        if (s.meta_writer.isOpen()) {
+            // The stamp hashes the committed file's header, so this must come
+            // after the atomic rename above.
+            if (auto finalized = s.meta_writer.finalize(s.output_path, 8 + s.meta_reserved);
+                !finalized) {
+                s.dropMetaWriter(finalized.error());
+            }
+        }
         return {};
     }
 
@@ -4618,75 +5083,15 @@ namespace lfs::io {
                         return;
                     }
 
-                    // Pass 1: float centers/sizes + the chunk's quantization frame.
-                    constexpr float kSizeFloor = 1e-20f;
-                    scratch.sizes.resize(count);
-                    glm::vec3 bbox_min{std::numeric_limits<float>::max()};
-                    glm::vec3 bbox_max{std::numeric_limits<float>::lowest()};
-                    float log_min = std::numeric_limits<float>::max();
-                    float log_max = std::numeric_limits<float>::lowest();
-                    for (std::size_t i = 0; i < count; ++i) {
-                        const float max_scale = std::max({scratch.scales[i * 3 + 0],
-                                                          scratch.scales[i * 3 + 1],
-                                                          scratch.scales[i * 3 + 2]});
-                        float expansion = 1.0f;
-                        if (lod_opacity_encoded) {
-                            const float lod_alpha = std::max(scratch.alpha[i], 0.0f);
-                            if (lod_alpha > 1.0f) {
-                                const float spark_lod_opacity =
-                                    std::min(lod_alpha * 4.0f - 3.0f, 5.0f);
-                                expansion = 1.0f + 0.7f * (spark_lod_opacity - 1.0f);
-                            }
-                        }
-                        const float size = std::max(2.0f * expansion * max_scale, kSizeFloor);
-                        scratch.sizes[i] = size;
-                        const glm::vec3 center{scratch.means[i * 3 + 0],
-                                               scratch.means[i * 3 + 1],
-                                               scratch.means[i * 3 + 2]};
-                        bbox_min = glm::min(bbox_min, center);
-                        bbox_max = glm::max(bbox_max, center);
-                        log_min = std::min(log_min, std::log(size));
-                        log_max = std::max(log_max, std::log(size));
-                    }
-                    const glm::vec3 extent = bbox_max - bbox_min;
-                    const float log_range = log_max - log_min;
-
-                    // Pass 2: quantize against the frame.
-                    const auto quant = [](const float v, const float lo, const float range) {
-                        if (!(range > 0.0f)) {
-                            return std::uint16_t{0};
-                        }
-                        const float t = std::clamp((v - lo) / range, 0.0f, 1.0f);
-                        return static_cast<std::uint16_t>(std::lround(t * 65535.0f));
-                    };
                     scratch.bounds.resize(count);
                     scratch.links.resize(count);
-                    for (std::size_t i = 0; i < count; ++i) {
-                        scratch.bounds[i] = {
-                            .qx = quant(scratch.means[i * 3 + 0], bbox_min.x, extent.x),
-                            .qy = quant(scratch.means[i * 3 + 1], bbox_min.y, extent.y),
-                            .qz = quant(scratch.means[i * 3 + 2], bbox_min.z, extent.z),
-                            .qsize = quant(std::log(scratch.sizes[i]), log_min, log_range),
-                        };
-
-                        const std::uint32_t cc = scratch.child_count[i];
-                        const std::uint32_t logical = static_cast<std::uint32_t>(base + i);
-                        std::uint32_t flags = 0u;
-                        if (cc == 0u) {
-                            flags |= 1u;
-                        }
-                        if (logical == 0u) {
-                            flags |= 2u;
-                        }
-                        if (lod_opacity_encoded) {
-                            flags |= 4u;
-                        }
-                        scratch.links[i] = {
-                            .child_start = scratch.child_start[i],
-                            .packed = (cc & 0xffffu) | ((flags & 0xffu) << 24u),
-                            .parent = lfs::core::SplatLodTree::kInvalidPage,
-                        };
-                    }
+                    RadMetaChunkEntry entry{};
+                    quantizeRadMetaChunk(base, count,
+                                         scratch.means.data(), scratch.scales.data(),
+                                         scratch.alpha.data(), scratch.child_count.data(),
+                                         scratch.child_start.data(), lod_opacity_encoded,
+                                         scratch.sizes,
+                                         scratch.bounds.data(), scratch.links.data(), entry);
 
                     scratch.out.clear();
                     scratch.out.seekp(static_cast<std::streamoff>(
@@ -4706,14 +5111,9 @@ namespace lfs::io {
                         return;
                     }
 
-                    chunk_table[ci] = {
-                        .payload_offset = file_offset + parsed->payload_start,
-                        .payload_bytes = chunk.payload_bytes,
-                        .bbox_min = {bbox_min.x, bbox_min.y, bbox_min.z},
-                        .bbox_extent = {extent.x, extent.y, extent.z},
-                        .log_size_min = log_min,
-                        .log_size_range = log_range,
-                    };
+                    entry.payload_offset = file_offset + parsed->payload_start;
+                    entry.payload_bytes = chunk.payload_bytes;
+                    chunk_table[ci] = entry;
 
                     const std::size_t done = chunks_done.fetch_add(1) + 1;
                     if ((done & 0x3f) == 0 || done == meta.chunks.size()) {
@@ -4739,9 +5139,6 @@ namespace lfs::io {
             return make_error(ErrorCode::CORRUPTED_DATA, build_error, rad_path);
         }
 
-        // Phase 2 (sequential): block-stream the links plane patching parent
-        // and level via forward scatter. Children always follow their parent
-        // in the BFS layout, so each node's entry is final when reached.
         {
             std::fstream rmw(tmp_path, std::ios::binary | std::ios::in | std::ios::out);
             if (!rmw.is_open()) {
@@ -4749,81 +5146,15 @@ namespace lfs::io {
                                   std::format("Failed to reopen sidecar temp file: {}", io_error_detail()),
                                   tmp_path);
             }
-            std::vector<std::uint32_t> parent;
-            std::vector<std::uint8_t> level;
-            try {
-                parent.assign(n, lfs::core::SplatLodTree::kInvalidPage);
-                level.assign(n, 0);
-            } catch (const std::bad_alloc&) {
-                return make_error(ErrorCode::WRITE_FAILURE,
-                                  std::format("Not enough RAM for sidecar parent scatter ({} nodes)", n),
-                                  rad_path);
+            auto leaf_count = patchRadMetaLinksPlane(
+                rmw, header.links_offset, n, rad_path, tmp_path,
+                [&](const float f) {
+                    return report(0.8f + 0.2f * f, "Linking RAD metadata sidecar");
+                });
+            if (!leaf_count) {
+                return std::unexpected(leaf_count.error());
             }
-            std::uint64_t leaf_count = 0;
-            std::uint64_t assigned = 0;
-            constexpr std::size_t kBlockRecords = std::size_t{4} << 20;
-            std::vector<lfs::core::RadMetaLinksQ> block(std::min<std::size_t>(kBlockRecords, n));
-            for (std::uint64_t first = 0; first < n; first += kBlockRecords) {
-                const std::size_t count = static_cast<std::size_t>(
-                    std::min<std::uint64_t>(kBlockRecords, n - first));
-                const std::streamoff offset = static_cast<std::streamoff>(
-                    header.links_offset + first * sizeof(lfs::core::RadMetaLinksQ));
-                rmw.clear();
-                rmw.seekg(offset, std::ios::beg);
-                rmw.read(reinterpret_cast<char*>(block.data()),
-                         static_cast<std::streamsize>(count * sizeof(lfs::core::RadMetaLinksQ)));
-                if (!rmw.good()) {
-                    return make_error(ErrorCode::READ_FAILURE,
-                                      std::format("Failed to read sidecar links block: {}", io_error_detail()),
-                                      tmp_path);
-                }
-                for (std::size_t k = 0; k < count; ++k) {
-                    const std::uint64_t i = first + k;
-                    auto& rec = block[k];
-                    rec.parent = parent[i];
-                    rec.packed = (rec.packed & 0xff00ffffu) |
-                                 ((static_cast<std::uint32_t>(level[i]) & 0xffu) << 16u);
-                    const std::uint32_t cc = rec.packed & 0xffffu;
-                    if (cc == 0) {
-                        ++leaf_count;
-                        continue;
-                    }
-                    const std::uint64_t cs = rec.child_start;
-                    if (cs <= i || cs + cc > n) {
-                        return make_error(ErrorCode::CORRUPTED_DATA,
-                                          std::format("corrupt LOD layout: node {} children [{}, {})",
-                                                      i, cs, cs + cc),
-                                          rad_path);
-                    }
-                    const std::uint8_t child_level =
-                        static_cast<std::uint8_t>(std::min<std::uint32_t>(level[i] + 1u, 255u));
-                    for (std::uint32_t c = 0; c < cc; ++c) {
-                        parent[cs + c] = static_cast<std::uint32_t>(i);
-                        level[cs + c] = child_level;
-                    }
-                    assigned += cc;
-                }
-                rmw.clear();
-                rmw.seekp(offset, std::ios::beg);
-                rmw.write(reinterpret_cast<const char*>(block.data()),
-                          static_cast<std::streamsize>(count * sizeof(lfs::core::RadMetaLinksQ)));
-                if (!rmw.good()) {
-                    return make_error(ErrorCode::WRITE_FAILURE,
-                                      std::format("Failed to write sidecar links block: {}", io_error_detail()),
-                                      tmp_path);
-                }
-                if (!report(0.8f + 0.2f * static_cast<float>(first + count) / static_cast<float>(n),
-                            "Linking RAD metadata sidecar")) {
-                    return make_error(ErrorCode::CANCELLED, "Sidecar build cancelled", rad_path);
-                }
-            }
-            if (assigned != n - 1) {
-                return make_error(ErrorCode::CORRUPTED_DATA,
-                                  std::format("corrupt LOD layout: {} of {} nodes have a parent",
-                                              assigned, n - 1),
-                                  rad_path);
-            }
-            header.leaf_count = leaf_count;
+            header.leaf_count = *leaf_count;
 
             // Chunk table + finalized header (complete=1) last, then rename.
             rmw.clear();

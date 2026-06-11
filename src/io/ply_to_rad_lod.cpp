@@ -1526,7 +1526,7 @@ namespace lfs::io {
         }
 
         RadStreamWriter writer(output_path, total_nodes, layout.sh_degree, true,
-                               options.compression_level);
+                               options.compression_level, /*emit_meta_sidecar=*/true);
         if (auto ok = writer.open(); !ok) {
             return make_error(ErrorCode::WRITE_FAILURE, ok.error(), output_path);
         }
