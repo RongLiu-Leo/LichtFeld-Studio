@@ -6433,7 +6433,13 @@ namespace lfs::vis {
         // to the legacy per-render-tile chain (its raster loads model tensors
         // by sorted id, which compact slots would break), as do devices
         // without 16-bit storage (the macro raster stores half4 partials).
-        const bool higs_active = !request.gut && renderer_.supportsFloat16Storage();
+        //
+        // Third fallback — a live training model: the macro chain's deferred
+        // readback gives no ordering against the trainer's in-place writes, so
+        // it reads the model mid-mutation and flickers. The legacy chain's
+        // synchronous readback orders the read after the writes; use it then.
+        const bool higs_active =
+            !request.gut && renderer_.supportsFloat16Storage() && !synchronize_input_upload;
         // Visible capacity follows the decaying high-water mark; until the
         // first readback lands, size at the render domain (always sufficient).
         // A clamped frame self-heals: the raw emit count grows the mark and
