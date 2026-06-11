@@ -13,7 +13,6 @@
 #include "core/tensor.hpp"
 #include "io/atomic_output.hpp"
 #include "io/error.hpp"
-#include "io/treelet_layout.hpp"
 
 #include <cuda_runtime.h>
 #include <libdeflate.h>
@@ -4889,20 +4888,40 @@ namespace lfs::io {
                               "RAD file has no usable LOD chunk index", input);
         }
         const std::uint32_t source_chunk = meta.chunk_size.value_or(0);
-        if (source_chunk == 0) {
-            return make_error(ErrorCode::CORRUPTED_DATA, "RAD file lacks a chunk size", input);
+        if (source_chunk == CHUNK_SIZE) {
+            return make_error(ErrorCode::CORRUPTED_DATA,
+                              "RAD file already uses the current chunk size", input);
+        }
+        if (source_chunk == 0 || source_chunk % CHUNK_SIZE != 0) {
+            return make_error(ErrorCode::CORRUPTED_DATA,
+                              std::format("Unsupported source chunk size {}", source_chunk),
+                              input);
         }
         const int max_sh = meta.max_sh.value_or(0);
         const int sh_coeffs = max_sh > 0 ? SH_COEFFS_FOR_DEGREE[max_sh] : 0;
-        const std::size_t n = meta.count;
 
         std::ifstream in;
         if (!lfs::core::open_file_for_read(input, std::ios::binary, in)) {
             return make_error(ErrorCode::PATH_NOT_FOUND, "Failed to open RAD file", input);
         }
+
+        RadStreamWriter writer(output, meta.count, max_sh, /*lod_tree=*/true);
+        if (auto opened = writer.open(); !opened) {
+            return make_error(ErrorCode::WRITE_FAILURE, opened.error(), output);
+        }
+
+        const std::size_t old_count = source_chunk;
+        std::vector<float> means(old_count * 3), opacity(old_count), rgb(old_count * 3);
+        std::vector<float> scales(old_count * 3), rotation(old_count * 4);
+        std::vector<float> shN(sh_coeffs > 0
+                                   ? old_count * static_cast<std::size_t>(sh_coeffs) * 3
+                                   : 0);
+        std::vector<std::uint16_t> child_count(old_count);
+        std::vector<std::uint32_t> child_start(old_count);
         std::vector<std::uint8_t> chunk_bytes;
-        const auto read_parsed_chunk =
-            [&](const std::size_t c) -> std::expected<ParsedChunkHeader, std::string> {
+        std::vector<RadStreamChunkSource> slices;
+
+        for (std::size_t c = 0; c < meta.chunks.size(); ++c) {
             const auto& range = meta.chunks[c];
             chunk_bytes.resize(range.bytes);
             in.seekg(static_cast<std::streamoff>(info->chunk_area_start + range.offset),
@@ -4910,238 +4929,72 @@ namespace lfs::io {
             in.read(reinterpret_cast<char*>(chunk_bytes.data()),
                     static_cast<std::streamsize>(chunk_bytes.size()));
             if (!in.good()) {
-                return std::unexpected(std::format("Failed to read chunk {}", c));
+                return make_error(ErrorCode::CORRUPTED_DATA,
+                                  std::format("Failed to read chunk {}", c), input);
             }
             auto parsed = parse_rad_chunk_header(chunk_bytes.data(), chunk_bytes.size());
-            if (parsed && (parsed->meta.count == 0 || parsed->meta.count != *range.count)) {
-                return std::unexpected(std::format("Chunk {} count mismatch", c));
-            }
-            return parsed;
-        };
-
-        // Pass 1: links-only scan (payload planes stay compressed), then the
-        // treelet ranking the PLY converter uses, over the whole tree.
-        std::vector<std::uint16_t> all_child_count(n);
-        std::vector<std::uint32_t> all_child_start(n);
-        for (std::size_t c = 0; c < meta.chunks.size(); ++c) {
-            auto parsed = read_parsed_chunk(c);
             if (!parsed) {
                 return make_error(ErrorCode::CORRUPTED_DATA, parsed.error(), input);
             }
-            const std::size_t base = static_cast<std::size_t>(*meta.chunks[c].base);
-            if (auto err = decode_chunk_properties(chunk_bytes.data(), parsed->meta, 0,
+            const std::uint32_t count = parsed->meta.count;
+            if (count == 0 || count > old_count || count != *range.count) {
+                return make_error(ErrorCode::CORRUPTED_DATA,
+                                  std::format("Chunk {} count mismatch", c), input);
+            }
+            if (sh_coeffs > 0) {
+                std::fill(shN.begin(), shN.end(), 0.0f);
+            }
+            if (auto err = decode_chunk_properties(chunk_bytes.data(),
+                                                   parsed->meta,
+                                                   0,
                                                    parsed->payload_start,
                                                    parsed->has_payload_prefix,
-                                                   parsed->chunk_end, sh_coeffs,
-                                                   nullptr, nullptr, nullptr, nullptr, nullptr,
-                                                   nullptr,
-                                                   all_child_count.data() + base,
-                                                   all_child_start.data() + base);
+                                                   parsed->chunk_end,
+                                                   sh_coeffs,
+                                                   means.data(),
+                                                   opacity.data(),
+                                                   rgb.data(),
+                                                   scales.data(),
+                                                   rotation.data(),
+                                                   sh_coeffs > 0 ? shN.data() : nullptr,
+                                                   child_count.data(),
+                                                   child_start.data());
                 err.has_value()) {
                 return make_error(ErrorCode::CORRUPTED_DATA, std::move(*err), input);
             }
-            if (progress && (c % 64u) == 0u &&
-                !progress(0.15f * static_cast<float>(c) /
-                          static_cast<float>(meta.chunks.size()))) {
-                return make_error(ErrorCode::CANCELLED, "Re-layout cancelled", input);
-            }
-        }
 
-        std::vector<std::uint8_t> level(n, 0);
-        std::uint8_t max_level = 0;
-        for (std::size_t i = 0; i < n; ++i) {
-            const std::uint32_t cc = all_child_count[i];
-            const std::uint32_t cs = all_child_start[i];
-            if (cc == 0) {
-                continue;
-            }
-            if (cs <= i || static_cast<std::size_t>(cs) + cc > n) {
-                return make_error(ErrorCode::CORRUPTED_DATA,
-                                  std::format("Corrupt child range at node {}", i), input);
-            }
-            const auto child_level = static_cast<std::uint8_t>(
-                std::min<std::uint32_t>(level[i] + 1u, 255u));
-            max_level = std::max(max_level, child_level);
-            for (std::uint32_t c = 0; c < cc; ++c) {
-                level[cs + c] = child_level;
-            }
-        }
-        // Ranking needs level-major input; treelet-ordered files would need
-        // an inverse pass first and re-running the migration buys nothing.
-        for (std::size_t i = 1; i < n; ++i) {
-            if (level[i] < level[i - 1]) {
-                return make_error(ErrorCode::CORRUPTED_DATA,
-                                  "RAD file is not level-ordered (already treelet-laid-out?)",
-                                  input);
-            }
-        }
-        std::vector<std::uint32_t> level_starts(static_cast<std::size_t>(max_level) + 2, 0);
-        for (std::size_t i = 0; i < n; ++i) {
-            ++level_starts[level[i] + 1u];
-        }
-        for (std::size_t l = 1; l < level_starts.size(); ++l) {
-            level_starts[l] += level_starts[l - 1];
-        }
-
-        const std::size_t levels = static_cast<std::size_t>(max_level) + 1;
-        const std::size_t bands =
-            (levels + treelet::kTreeletBandLevels - 1) / treelet::kTreeletBandLevels;
-        const auto ranks = treelet::build_treelet_ranks(level_starts, all_child_count,
-                                                        all_child_start, 0, 0, bands);
-        std::vector<std::uint64_t> band_base(bands + 1, 0);
-        for (std::size_t band = 0; band < bands; ++band) {
-            band_base[band + 1] = band_base[band] + ranks.band_count[band];
-        }
-        if (band_base[bands] != n) {
-            return make_error(ErrorCode::CORRUPTED_DATA, "Treelet layout mismatch", input);
-        }
-        const auto new_pos_of = [&](const std::uint32_t old) {
-            return band_base[level[old] / treelet::kTreeletBandLevels] + ranks.rank[old];
-        };
-        std::vector<std::uint32_t> new_to_old(n);
-        for (std::size_t old = 0; old < n; ++old) {
-            new_to_old[new_pos_of(static_cast<std::uint32_t>(old))] =
-                static_cast<std::uint32_t>(old);
-        }
-
-        // Pass 2: emission in treelet order. The order interleaves at most a
-        // band's worth of monotone per-level streams, so a small decoded-chunk
-        // cache serves it with sequential-grade hit rates.
-        struct DecodedSrc {
-            std::uint32_t count = 0;
-            std::uint64_t last_use = 0;
-            std::vector<float> means, opacity, rgb, scales, rotation, shN;
-            std::vector<std::uint16_t> child_count;
-            std::vector<std::uint32_t> child_start;
-        };
-        constexpr std::size_t kCacheCapacity = 64;
-        std::unordered_map<std::uint32_t, DecodedSrc> cache;
-        std::uint64_t use_clock = 0;
-        const std::size_t sh_floats = static_cast<std::size_t>(sh_coeffs) * 3;
-        const auto fetch_chunk = [&](const std::uint32_t c) -> std::expected<DecodedSrc*, std::string> {
-            if (const auto it = cache.find(c); it != cache.end()) {
-                it->second.last_use = ++use_clock;
-                return &it->second;
-            }
-            if (cache.size() >= kCacheCapacity) {
-                auto victim = cache.begin();
-                for (auto it = cache.begin(); it != cache.end(); ++it) {
-                    if (it->second.last_use < victim->second.last_use) {
-                        victim = it;
-                    }
-                }
-                cache.erase(victim);
-            }
-            auto parsed = read_parsed_chunk(c);
-            if (!parsed) {
-                return std::unexpected(parsed.error());
-            }
-            DecodedSrc& dc = cache[c];
-            dc.count = parsed->meta.count;
-            dc.last_use = ++use_clock;
-            dc.means.resize(static_cast<std::size_t>(dc.count) * 3);
-            dc.opacity.resize(dc.count);
-            dc.rgb.resize(static_cast<std::size_t>(dc.count) * 3);
-            dc.scales.resize(static_cast<std::size_t>(dc.count) * 3);
-            dc.rotation.resize(static_cast<std::size_t>(dc.count) * 4);
-            dc.shN.assign(static_cast<std::size_t>(dc.count) * sh_floats, 0.0f);
-            dc.child_count.resize(dc.count);
-            dc.child_start.resize(dc.count);
-            if (auto err = decode_chunk_properties(chunk_bytes.data(), parsed->meta, 0,
-                                                   parsed->payload_start,
-                                                   parsed->has_payload_prefix,
-                                                   parsed->chunk_end, sh_coeffs,
-                                                   dc.means.data(), dc.opacity.data(),
-                                                   dc.rgb.data(), dc.scales.data(),
-                                                   dc.rotation.data(),
-                                                   sh_floats > 0 ? dc.shN.data() : nullptr,
-                                                   dc.child_count.data(),
-                                                   dc.child_start.data());
-                err.has_value()) {
-                return std::unexpected(std::move(*err));
-            }
-            return &dc;
-        };
-
-        RadStreamWriter writer(output, n, max_sh, /*lod_tree=*/true);
-        if (auto opened = writer.open(); !opened) {
-            return make_error(ErrorCode::WRITE_FAILURE, opened.error(), output);
-        }
-        constexpr std::size_t kEmitBatchChunks = 16;
-        const std::size_t batch_rows = kEmitBatchChunks * CHUNK_SIZE;
-        std::vector<float> means(batch_rows * 3), opacity(batch_rows), rgb(batch_rows * 3);
-        std::vector<float> scales(batch_rows * 3), rotation(batch_rows * 4);
-        std::vector<float> shN(batch_rows * sh_floats);
-        std::vector<std::uint16_t> child_count(batch_rows);
-        std::vector<std::uint32_t> child_start(batch_rows);
-        std::vector<RadStreamChunkSource> slices;
-        std::size_t fill = 0;
-        const auto flush = [&]() -> std::expected<void, std::string> {
             slices.clear();
-            for (std::size_t s = 0; s < fill; s += CHUNK_SIZE) {
-                const auto count = static_cast<std::uint32_t>(std::min<std::size_t>(CHUNK_SIZE, fill - s));
+            for (std::uint32_t s = 0; s < count; s += CHUNK_SIZE) {
+                const std::uint32_t n = std::min(CHUNK_SIZE, count - s);
                 slices.push_back({
-                    .count = count,
-                    .means = means.data() + s * 3,
+                    .count = n,
+                    .means = means.data() + static_cast<std::size_t>(s) * 3,
                     .alpha = opacity.data() + s,
-                    .rgb = rgb.data() + s * 3,
-                    .scales = scales.data() + s * 3,
-                    .rotation = rotation.data() + s * 4,
-                    .shN = sh_floats > 0 ? shN.data() + s * sh_floats : nullptr,
+                    .rgb = rgb.data() + static_cast<std::size_t>(s) * 3,
+                    .scales = scales.data() + static_cast<std::size_t>(s) * 3,
+                    .rotation = rotation.data() + static_cast<std::size_t>(s) * 4,
+                    .shN = sh_coeffs > 0
+                               ? shN.data() + static_cast<std::size_t>(s) * sh_coeffs * 3
+                               : nullptr,
                     .child_count = child_count.data() + s,
                     .child_start = child_start.data() + s,
                 });
             }
-            fill = 0;
-            if (slices.empty()) {
-                return {};
+            if (auto appended = writer.append_batch(slices); !appended) {
+                return make_error(ErrorCode::WRITE_FAILURE, appended.error(), output);
             }
-            return writer.append_batch(slices);
-        };
-        for (std::size_t pos = 0; pos < n; ++pos) {
-            const std::uint32_t old = new_to_old[pos];
-            const std::uint32_t c = old / source_chunk;
-            const std::uint32_t off = old - c * source_chunk;
-            auto fetched = fetch_chunk(c);
-            if (!fetched) {
-                return make_error(ErrorCode::CORRUPTED_DATA, fetched.error(), input);
+            if (progress &&
+                !progress(static_cast<float>(c + 1) / static_cast<float>(meta.chunks.size()))) {
+                return make_error(ErrorCode::CANCELLED, "Re-chunking cancelled", input);
             }
-            const DecodedSrc& dc = **fetched;
-            std::memcpy(means.data() + fill * 3, dc.means.data() + static_cast<std::size_t>(off) * 3, 12);
-            opacity[fill] = dc.opacity[off];
-            std::memcpy(rgb.data() + fill * 3, dc.rgb.data() + static_cast<std::size_t>(off) * 3, 12);
-            std::memcpy(scales.data() + fill * 3, dc.scales.data() + static_cast<std::size_t>(off) * 3, 12);
-            std::memcpy(rotation.data() + fill * 4, dc.rotation.data() + static_cast<std::size_t>(off) * 4, 16);
-            if (sh_floats > 0) {
-                std::memcpy(shN.data() + fill * sh_floats,
-                            dc.shN.data() + static_cast<std::size_t>(off) * sh_floats,
-                            sh_floats * sizeof(float));
-            }
-            const std::uint16_t cc = dc.child_count[off];
-            child_count[fill] = cc;
-            child_start[fill] =
-                cc > 0 ? static_cast<std::uint32_t>(new_pos_of(dc.child_start[off])) : 0;
-            ++fill;
-            if (fill == batch_rows) {
-                if (auto appended = flush(); !appended) {
-                    return make_error(ErrorCode::WRITE_FAILURE, appended.error(), output);
-                }
-            }
-            if (progress && (pos % 262144u) == 0u &&
-                !progress(0.15f + 0.85f * static_cast<float>(pos) / static_cast<float>(n))) {
-                return make_error(ErrorCode::CANCELLED, "Re-layout cancelled", input);
-            }
-        }
-        if (auto appended = flush(); !appended) {
-            return make_error(ErrorCode::WRITE_FAILURE, appended.error(), output);
         }
         in.close();
         if (auto finished = writer.finish(); !finished) {
             return make_error(ErrorCode::WRITE_FAILURE, finished.error(), output);
         }
-        LOG_INFO("RAD re-laid out: {} -> {} ({} nodes, {}-splat chunks -> {}, treelet bands)",
+        LOG_INFO("RAD re-chunked: {} -> {} ({} nodes, {}-splat chunks -> {})",
                  lfs::core::path_to_utf8(input), lfs::core::path_to_utf8(output),
-                 n, source_chunk, CHUNK_SIZE);
+                 meta.count, source_chunk, CHUNK_SIZE);
         return {};
     }
 
