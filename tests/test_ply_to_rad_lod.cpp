@@ -463,8 +463,7 @@ TEST(PlyToRadLod, TreeletLayoutAudit) {
             picked.push_back(seeds[k * seeds.size() / 64]);
         }
         for (const std::uint32_t descend : {4u, 8u}) {
-            std::set<std::uint64_t> chunks;
-            std::size_t cut_nodes = 0;
+            std::vector<std::uint32_t> cut;
             std::vector<std::uint32_t> frontier;
             std::vector<std::uint32_t> next;
             for (const std::uint32_t seed : picked) {
@@ -479,20 +478,25 @@ TEST(PlyToRadLod, TreeletLayoutAudit) {
                     }
                     frontier.swap(next);
                 }
-                for (const std::uint32_t node : frontier) {
-                    chunks.insert(node / kChunk);
-                    ++cut_nodes;
-                }
+                cut.insert(cut.end(), frontier.begin(), frontier.end());
             }
-            if (cut_nodes == 0) {
+            if (cut.empty()) {
                 continue;
             }
-            std::printf("audit level=%u+%u: cut=%zu chunks=%zu nodes/chunk=%.0f (%.1f%% of %zu)\n",
-                        seed_level, descend, cut_nodes, chunks.size(),
-                        static_cast<double>(cut_nodes) / static_cast<double>(chunks.size()),
-                        100.0 * static_cast<double>(cut_nodes) /
-                            (static_cast<double>(chunks.size()) * static_cast<double>(kChunk)),
-                        chunks.size());
+            // Sweep hypothetical page sizes: membership is just node/size, so
+            // the same file predicts utilization at any granularity.
+            for (const std::size_t page : {kChunk, kChunk / 4, kChunk / 8}) {
+                std::set<std::uint64_t> chunks;
+                for (const std::uint32_t node : cut) {
+                    chunks.insert(node / page);
+                }
+                std::printf(
+                    "audit level=%u+%u page=%zu: cut=%zu chunks=%zu nodes/chunk=%.0f util=%.1f%%\n",
+                    seed_level, descend, page, cut.size(), chunks.size(),
+                    static_cast<double>(cut.size()) / static_cast<double>(chunks.size()),
+                    100.0 * static_cast<double>(cut.size()) /
+                        (static_cast<double>(chunks.size()) * static_cast<double>(page)));
+            }
         }
     }
 }
