@@ -1490,7 +1490,9 @@ namespace lfs::io {
 
                         std::expected<std::unique_ptr<SplatData>, std::string> lod_result;
                         if (options.builder == LodBuilder::kOctree) {
-                            lod_result = lfs::core::build_octree_lod(bucket_input);
+                            lfs::core::OctreeLodBuildOptions octree_options;
+                            octree_options.leaf_group_splats = options.octree_leaf_splats;
+                            lod_result = lfs::core::build_octree_lod(bucket_input, octree_options);
                         } else {
                             lfs::core::BhattLodBuildOptions lod_options;
                             lod_options.lod_base = options.lod_base;

@@ -49,6 +49,10 @@ namespace lfs::io {
         float lod_base = 1.25f;
         int compression_level = 3;
         LodBuilder builder = LodBuilder::kBhatt;
+        // kOctree only: splats per octree leaf group before binary pairing
+        // takes over (OctreeLodBuildOptions::leaf_group_splats, clamped to
+        // [2, 64]).
+        std::uint32_t octree_leaf_splats = 8;
         // Replicates the source across a tiles_x by tiles_y grid on the X/Y
         // ground plane, offsetting each instance by the scene extent plus a
         // 1% margin. The source PLY is replayed once per tile, so no tiled
