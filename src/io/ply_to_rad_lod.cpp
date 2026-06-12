@@ -31,6 +31,7 @@
 #include <expected>
 #include <format>
 #include <fstream>
+#include <future>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -821,8 +822,10 @@ namespace lfs::io {
 
         // Stages whole chunks and hands them to the writer in batches so the
         // per-chunk DEFLATE runs in parallel instead of serializing the final
-        // assembly phase. Staging is bounded (~256 MB) and reused across
-        // batches.
+        // assembly phase. Full batches flush on a background thread (one in
+        // flight), overlapping the fill thread's bucket-file reads with the
+        // previous batch's quantize+DEFLATE. Two bounded stage pools are
+        // reused across batches.
         class ChunkAccumulator {
         public:
             ChunkAccumulator(RadStreamWriter& writer, const int rest_coeffs)
@@ -846,9 +849,9 @@ namespace lfs::io {
                     first += take;
                     count -= take;
                     if (stage.fill == kChunkSplats) {
-                        ++full_stages_;
-                        if (full_stages_ == batch_capacity_) {
-                            if (auto ok = flush_batch(); !ok) {
+                        ++fill_->full;
+                        if (fill_->full == batch_capacity_) {
+                            if (auto ok = launch_flush(); !ok) {
                                 return ok;
                             }
                         }
@@ -858,7 +861,10 @@ namespace lfs::io {
             }
 
             [[nodiscard]] std::expected<void, std::string> finish() {
-                return flush_batch();
+                if (auto ok = wait_inflight(); !ok) {
+                    return ok;
+                }
+                return append_pool(*fill_);
             }
 
         private:
@@ -869,8 +875,14 @@ namespace lfs::io {
                 std::size_t fill = 0;
             };
 
+            struct Pool {
+                std::vector<Stage> stages;
+                std::size_t full = 0;
+            };
+
             Stage& filling_stage() {
-                if (full_stages_ == stages_.size()) {
+                Pool& pool = *fill_;
+                if (pool.full == pool.stages.size()) {
                     Stage stage;
                     stage.means.resize(kChunkSplats * 3);
                     stage.rgb.resize(kChunkSplats * 3);
@@ -882,9 +894,9 @@ namespace lfs::io {
                     }
                     stage.child_count.resize(kChunkSplats);
                     stage.child_start.resize(kChunkSplats);
-                    stages_.push_back(std::move(stage));
+                    pool.stages.push_back(std::move(stage));
                 }
-                return stages_[full_stages_];
+                return pool.stages[pool.full];
             }
 
             void copy_range(Stage& stage, const BucketNodes& nodes,
@@ -911,9 +923,29 @@ namespace lfs::io {
                             take * sizeof(std::uint32_t));
             }
 
-            [[nodiscard]] std::expected<void, std::string> flush_batch() {
-                std::size_t pending = full_stages_;
-                if (pending < stages_.size() && stages_[pending].fill > 0) {
+            [[nodiscard]] std::expected<void, std::string> wait_inflight() {
+                if (!inflight_.valid()) {
+                    return {};
+                }
+                return inflight_.get();
+            }
+
+            // Hands the filled pool to a background append and keeps filling
+            // the other one; at most one append in flight preserves chunk
+            // order and bounds staging to two pools.
+            [[nodiscard]] std::expected<void, std::string> launch_flush() {
+                if (auto ok = wait_inflight(); !ok) {
+                    return ok;
+                }
+                std::swap(fill_, flight_);
+                inflight_ = std::async(std::launch::async,
+                                       [this] { return append_pool(*flight_); });
+                return {};
+            }
+
+            [[nodiscard]] std::expected<void, std::string> append_pool(Pool& pool) {
+                std::size_t pending = pool.full;
+                if (pending < pool.stages.size() && pool.stages[pending].fill > 0) {
                     ++pending; // trailing partial chunk, only legal as the file's last
                 }
                 if (pending == 0) {
@@ -921,7 +953,7 @@ namespace lfs::io {
                 }
                 std::vector<RadStreamChunkSource> sources(pending);
                 for (std::size_t i = 0; i < pending; ++i) {
-                    const Stage& stage = stages_[i];
+                    const Stage& stage = pool.stages[i];
                     auto& chunk = sources[i];
                     chunk.count = static_cast<std::uint32_t>(stage.fill);
                     chunk.means = stage.means.data();
@@ -935,17 +967,19 @@ namespace lfs::io {
                 }
                 auto ok = writer_.append_batch(sources);
                 for (std::size_t i = 0; i < pending; ++i) {
-                    stages_[i].fill = 0;
+                    pool.stages[i].fill = 0;
                 }
-                full_stages_ = 0;
+                pool.full = 0;
                 return ok;
             }
 
             RadStreamWriter& writer_;
             int rest_coeffs_;
             std::size_t batch_capacity_ = 0;
-            std::size_t full_stages_ = 0;
-            std::vector<Stage> stages_;
+            Pool pools_[2];
+            Pool* fill_ = &pools_[0];
+            Pool* flight_ = &pools_[1];
+            std::future<std::expected<void, std::string>> inflight_;
         };
 
         std::size_t available_memory_bytes() {
