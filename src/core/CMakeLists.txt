@@ -60,6 +60,7 @@ set(CORE_SOURCES
         scene.cpp
         splat_simplify.cpp
         bhatt_lod.cpp
+        octree_lod.cpp
         splat_data.cpp
         splat_data_mirror.cpp
         splat_data_transform.cpp
