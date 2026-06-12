@@ -5,8 +5,9 @@
 // LOD builder benchmark + quality-gate harness. Env-gated:
 //   LFS_LOD_BUILDER_BENCH=synthetic[:count]  one synthetic bucket (default 2M)
 //   LFS_LOD_BUILDER_BENCH=/path/to/file.ply  Morton-bucketed real input
-// Builds every bucket with both builders and reports wall time and tree
-// stats (node counts, level distribution, interior alpha sums).
+// Builds every bucket with bhatt, the pure refined octree, and the hybrid
+// default (octree bottom + bhatt top) and reports wall time and tree stats
+// (node counts, level distribution, per-level integrated alpha).
 
 #include "core/bhatt_lod.hpp"
 #include "core/octree_lod.hpp"
@@ -232,6 +233,7 @@ namespace {
         double interior_integrated_alpha = 0.0;
         double root_integrated_alpha = 0.0;
         std::map<int, std::uint64_t> nodes_per_level;
+        std::map<int, double> integrated_alpha_per_level;
     };
 
     void accumulate(const SplatData& lod, BuilderStats& st) {
@@ -249,6 +251,8 @@ namespace {
             const float area = ellipsoid_area(std::exp(scaling[i * 3 + 0]),
                                               std::exp(scaling[i * 3 + 1]),
                                               std::exp(scaling[i * 3 + 2]));
+            st.integrated_alpha_per_level[tree.lod_level[i]] +=
+                static_cast<double>(opacity[i]) * area;
             if (i == 0) {
                 st.root_integrated_alpha += static_cast<double>(opacity[i]) * area;
             }
@@ -275,6 +279,10 @@ namespace {
         std::printf("%s: nodes per level:", name);
         for (const auto& [level, count] : st.nodes_per_level) {
             std::printf(" %d:%llu", level, static_cast<unsigned long long>(count));
+        }
+        std::printf("\n%s: integrated alpha per level:", name);
+        for (const auto& [level, alpha] : st.integrated_alpha_per_level) {
+            std::printf(" %d:%.0f", level, alpha);
         }
         std::printf("\n");
     }
@@ -309,7 +317,9 @@ TEST(LodBuilderBench, CompareBuilders) {
     std::printf("input: %zu splats, SH degree %d, %zu bucket(s)\n",
                 raw.count, raw.sh_degree, bucket_count);
 
-    BuilderStats bhatt_stats, octree_stats;
+    BuilderStats bhatt_stats, octree_stats, hybrid_stats;
+    lfs::core::OctreeLodBuildOptions pure_octree;
+    pure_octree.bhatt_top_nodes = 0;
     for (std::size_t b = 0; b < bucket_count; ++b) {
         const std::size_t first = b * kBucketSplats;
         const std::size_t count = std::min(kBucketSplats, raw.count - first);
@@ -318,20 +328,26 @@ TEST(LodBuilderBench, CompareBuilders) {
         const auto t0 = std::chrono::steady_clock::now();
         auto bhatt = lfs::core::build_bhatt_lod(bucket);
         const auto t1 = std::chrono::steady_clock::now();
-        auto octree = lfs::core::build_octree_lod(bucket);
+        auto octree = lfs::core::build_octree_lod(bucket, pure_octree);
         const auto t2 = std::chrono::steady_clock::now();
+        auto hybrid = lfs::core::build_octree_lod(bucket);
+        const auto t3 = std::chrono::steady_clock::now();
         ASSERT_TRUE(bhatt.has_value()) << bhatt.error();
         ASSERT_TRUE(octree.has_value()) << octree.error();
+        ASSERT_TRUE(hybrid.has_value()) << hybrid.error();
 
         const double bhatt_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         const double octree_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+        const double hybrid_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
         bhatt_stats.total_ms += bhatt_ms;
         octree_stats.total_ms += octree_ms;
-        std::printf("bucket %zu (%zu splats): bhatt %.0f ms, octree %.0f ms, speedup %.1fx\n",
-                    b, count, bhatt_ms, octree_ms, bhatt_ms / std::max(octree_ms, 1e-3));
+        hybrid_stats.total_ms += hybrid_ms;
+        std::printf("bucket %zu (%zu splats): bhatt %.0f ms, octree %.0f ms, hybrid %.0f ms\n",
+                    b, count, bhatt_ms, octree_ms, hybrid_ms);
 
         accumulate(**bhatt, bhatt_stats);
         accumulate(**octree, octree_stats);
+        accumulate(**hybrid, hybrid_stats);
         if (::testing::Test::HasFatalFailure()) {
             return;
         }
@@ -339,9 +355,13 @@ TEST(LodBuilderBench, CompareBuilders) {
 
     print_stats("bhatt ", bhatt_stats);
     print_stats("octree", octree_stats);
-    std::printf("overall speedup: %.1fx\n",
-                bhatt_stats.total_ms / std::max(octree_stats.total_ms, 1e-3));
+    print_stats("hybrid", hybrid_stats);
+    std::printf("bhatt/octree %.1fx, bhatt/hybrid %.1fx, hybrid/octree %.2fx\n",
+                bhatt_stats.total_ms / std::max(octree_stats.total_ms, 1e-3),
+                bhatt_stats.total_ms / std::max(hybrid_stats.total_ms, 1e-3),
+                hybrid_stats.total_ms / std::max(octree_stats.total_ms, 1e-3));
 
     EXPECT_EQ(bhatt_stats.leaves, raw.count);
     EXPECT_EQ(octree_stats.leaves, raw.count);
+    EXPECT_EQ(hybrid_stats.leaves, raw.count);
 }
