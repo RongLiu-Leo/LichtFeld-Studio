@@ -483,24 +483,41 @@ namespace lfs::core {
                 return std::unexpected("build_octree_lod: cancelled by user");
             }
 
+            // Binary refinement: a cell's k entries pair up by Bhattacharyya
+            // similarity into ceil(log2 k) sub-levels (8 -> 4 -> 2 -> 1), so
+            // emitted node counts step ~2x per level like the bhatt builder
+            // instead of ~8x. Every merge combines exactly two entries; a cell
+            // spends k - 1 merges, the last of which is the cell's own
+            // representative, leaving k - 2 intermediate reps stored past
+            // node_count.
+            std::vector<uint32_t> inter_offset(node_count + 1, 0);
+            for (size_t i = 0; i < node_count; ++i) {
+                const OctNode& node = topo.nodes[i];
+                const uint32_t k = node.leaf ? node.splat_count() : node.child_count;
+                inter_offset[i + 1] = inter_offset[i] + (k > 2 ? k - 2 : 0);
+            }
+            const uint32_t total_intermediates = inter_offset[node_count];
+            const size_t rep_count = node_count + total_intermediates;
+
             // Bottom-up moment matching, parallel within each depth. Children
             // have higher pre-order indices, so deeper levels finish first.
             Reps reps;
-            reps.mean.resize(node_count * 3);
-            reps.scale.resize(node_count * 3);
-            reps.quat.resize(node_count * 4);
-            reps.alpha.resize(node_count);
-            reps.rgb.resize(node_count * 3);
-            reps.area.resize(node_count);
+            reps.mean.resize(rep_count * 3);
+            reps.scale.resize(rep_count * 3);
+            reps.quat.resize(rep_count * 4);
+            reps.alpha.resize(rep_count);
+            reps.rgb.resize(rep_count * 3);
+            reps.area.resize(rep_count);
             if (soa.max_sh_degree >= 1) {
-                reps.sh1.resize(node_count * 9);
+                reps.sh1.resize(rep_count * 9);
             }
             if (soa.max_sh_degree >= 2) {
-                reps.sh2.resize(node_count * 15);
+                reps.sh2.resize(rep_count * 15);
             }
             if (soa.max_sh_degree >= 3) {
-                reps.sh3.resize(node_count * 21);
+                reps.sh3.resize(rep_count * 21);
             }
+            std::vector<uint32_t> merge_child(rep_count * 2, 0);
 
             int max_depth = 0;
             for (const OctNode& node : topo.nodes) {
@@ -511,29 +528,74 @@ namespace lfs::core {
                 by_depth[topo.nodes[i].depth].push_back(i);
             }
 
-            const auto splat_child = [&](MergeInput& in, const uint32_t splat) {
-                const uint32_t k = in.count++;
-                in.mean[k] = soa.mean.data() + static_cast<size_t>(splat) * 3;
-                in.scale[k] = soa.scale.data() + static_cast<size_t>(splat) * 3;
-                in.quat[k] = soa.quat.data() + static_cast<size_t>(splat) * 4;
-                in.rgb[k] = soa.rgb.data() + static_cast<size_t>(splat) * 3;
-                in.sh1[k] = soa.max_sh_degree >= 1 ? soa.sh1.data() + static_cast<size_t>(splat) * 9 : nullptr;
-                in.sh2[k] = soa.max_sh_degree >= 2 ? soa.sh2.data() + static_cast<size_t>(splat) * 15 : nullptr;
-                in.sh3[k] = soa.max_sh_degree >= 3 ? soa.sh3.data() + static_cast<size_t>(splat) * 21 : nullptr;
-                in.alpha[k] = soa.alpha[splat];
-                in.area[k] = ellipsoid_area(in.scale[k][0], in.scale[k][1], in.scale[k][2]);
+            struct PairEntry {
+                uint32_t ref;
+                const float* mean;
+                const float* scale;
+                const float* quat;
+                const float* rgb;
+                const float* sh1;
+                const float* sh2;
+                const float* sh3;
+                float alpha;
+                float area;
+                float cov[6];
+                float det;
             };
-            const auto rep_child = [&](MergeInput& in, const uint32_t node) {
-                const uint32_t k = in.count++;
-                in.mean[k] = reps.mean.data() + static_cast<size_t>(node) * 3;
-                in.scale[k] = reps.scale.data() + static_cast<size_t>(node) * 3;
-                in.quat[k] = reps.quat.data() + static_cast<size_t>(node) * 4;
-                in.rgb[k] = reps.rgb.data() + static_cast<size_t>(node) * 3;
-                in.sh1[k] = soa.max_sh_degree >= 1 ? reps.sh1.data() + static_cast<size_t>(node) * 9 : nullptr;
-                in.sh2[k] = soa.max_sh_degree >= 2 ? reps.sh2.data() + static_cast<size_t>(node) * 15 : nullptr;
-                in.sh3[k] = soa.max_sh_degree >= 3 ? reps.sh3.data() + static_cast<size_t>(node) * 21 : nullptr;
-                in.alpha[k] = reps.alpha[node];
-                in.area[k] = reps.area[node];
+            const auto splat_entry = [&](PairEntry& e, const uint32_t splat) {
+                e.ref = splat;
+                e.mean = soa.mean.data() + static_cast<size_t>(splat) * 3;
+                e.scale = soa.scale.data() + static_cast<size_t>(splat) * 3;
+                e.quat = soa.quat.data() + static_cast<size_t>(splat) * 4;
+                e.rgb = soa.rgb.data() + static_cast<size_t>(splat) * 3;
+                e.sh1 = soa.max_sh_degree >= 1 ? soa.sh1.data() + static_cast<size_t>(splat) * 9 : nullptr;
+                e.sh2 = soa.max_sh_degree >= 2 ? soa.sh2.data() + static_cast<size_t>(splat) * 15 : nullptr;
+                e.sh3 = soa.max_sh_degree >= 3 ? soa.sh3.data() + static_cast<size_t>(splat) * 21 : nullptr;
+                e.alpha = soa.alpha[splat];
+                e.area = ellipsoid_area(e.scale[0], e.scale[1], e.scale[2]);
+            };
+            const auto rep_entry = [&](PairEntry& e, const uint32_t rep) {
+                e.ref = kInteriorFlag | rep;
+                e.mean = reps.mean.data() + static_cast<size_t>(rep) * 3;
+                e.scale = reps.scale.data() + static_cast<size_t>(rep) * 3;
+                e.quat = reps.quat.data() + static_cast<size_t>(rep) * 4;
+                e.rgb = reps.rgb.data() + static_cast<size_t>(rep) * 3;
+                e.sh1 = soa.max_sh_degree >= 1 ? reps.sh1.data() + static_cast<size_t>(rep) * 9 : nullptr;
+                e.sh2 = soa.max_sh_degree >= 2 ? reps.sh2.data() + static_cast<size_t>(rep) * 15 : nullptr;
+                e.sh3 = soa.max_sh_degree >= 3 ? reps.sh3.data() + static_cast<size_t>(rep) * 21 : nullptr;
+                e.alpha = reps.alpha[rep];
+                e.area = reps.area[rep];
+            };
+            const auto entry_cov = [](PairEntry& e) {
+                compute_covariance_from_scale_quat(
+                    e.scale[0], e.scale[1], e.scale[2],
+                    e.quat[0], e.quat[1], e.quat[2], e.quat[3],
+                    e.cov[0], e.cov[1], e.cov[2], e.cov[3], e.cov[4], e.cov[5], e.det);
+            };
+            const auto merge_pair = [&](const PairEntry& a, const PairEntry& b, const uint32_t dst) {
+                MergeInput in;
+                in.count = 2;
+                in.mean[0] = a.mean;
+                in.scale[0] = a.scale;
+                in.quat[0] = a.quat;
+                in.rgb[0] = a.rgb;
+                in.sh1[0] = a.sh1;
+                in.sh2[0] = a.sh2;
+                in.sh3[0] = a.sh3;
+                in.alpha[0] = a.alpha;
+                in.area[0] = a.area;
+                in.mean[1] = b.mean;
+                in.scale[1] = b.scale;
+                in.quat[1] = b.quat;
+                in.rgb[1] = b.rgb;
+                in.sh1[1] = b.sh1;
+                in.sh2[1] = b.sh2;
+                in.sh3[1] = b.sh3;
+                in.alpha[1] = b.alpha;
+                in.area[1] = b.area;
+                merge_group(in, soa.max_sh_degree, reps, dst);
+                merge_child[static_cast<size_t>(dst) * 2 + 0] = a.ref;
+                merge_child[static_cast<size_t>(dst) * 2 + 1] = b.ref;
             };
 
             for (int d = max_depth; d >= 0; --d) {
@@ -544,38 +606,102 @@ namespace lfs::core {
                         for (size_t bi = range.begin(); bi != range.end(); ++bi) {
                             const uint32_t ni = bucket[bi];
                             const OctNode& node = topo.nodes[ni];
-                            MergeInput in;
-                            if (node.leaf) {
-                                if (node.splat_count() == 1) {
-                                    const size_t s = order[node.begin];
-                                    std::copy_n(soa.mean.data() + s * 3, 3, reps.mean.data() + ni * 3);
-                                    std::copy_n(soa.scale.data() + s * 3, 3, reps.scale.data() + ni * 3);
-                                    std::copy_n(soa.quat.data() + s * 4, 4, reps.quat.data() + ni * 4);
-                                    reps.alpha[ni] = soa.alpha[s];
-                                    std::copy_n(soa.rgb.data() + s * 3, 3, reps.rgb.data() + ni * 3);
-                                    reps.area[ni] = ellipsoid_area(soa.scale[s * 3 + 0],
-                                                                   soa.scale[s * 3 + 1],
-                                                                   soa.scale[s * 3 + 2]);
-                                    if (soa.max_sh_degree >= 1) {
-                                        std::copy_n(soa.sh1.data() + s * 9, 9, reps.sh1.data() + ni * 9);
-                                    }
-                                    if (soa.max_sh_degree >= 2) {
-                                        std::copy_n(soa.sh2.data() + s * 15, 15, reps.sh2.data() + ni * 15);
-                                    }
-                                    if (soa.max_sh_degree >= 3) {
-                                        std::copy_n(soa.sh3.data() + s * 21, 21, reps.sh3.data() + ni * 21);
-                                    }
-                                    continue;
+                            if (node.leaf && node.splat_count() == 1) {
+                                const size_t s = order[node.begin];
+                                std::copy_n(soa.mean.data() + s * 3, 3, reps.mean.data() + ni * 3);
+                                std::copy_n(soa.scale.data() + s * 3, 3, reps.scale.data() + ni * 3);
+                                std::copy_n(soa.quat.data() + s * 4, 4, reps.quat.data() + ni * 4);
+                                reps.alpha[ni] = soa.alpha[s];
+                                std::copy_n(soa.rgb.data() + s * 3, 3, reps.rgb.data() + ni * 3);
+                                reps.area[ni] = ellipsoid_area(soa.scale[s * 3 + 0],
+                                                               soa.scale[s * 3 + 1],
+                                                               soa.scale[s * 3 + 2]);
+                                if (soa.max_sh_degree >= 1) {
+                                    std::copy_n(soa.sh1.data() + s * 9, 9, reps.sh1.data() + ni * 9);
                                 }
+                                if (soa.max_sh_degree >= 2) {
+                                    std::copy_n(soa.sh2.data() + s * 15, 15, reps.sh2.data() + ni * 15);
+                                }
+                                if (soa.max_sh_degree >= 3) {
+                                    std::copy_n(soa.sh3.data() + s * 21, 21, reps.sh3.data() + ni * 21);
+                                }
+                                continue;
+                            }
+
+                            PairEntry entries[kMaxGroupSplats];
+                            uint32_t m = 0;
+                            if (node.leaf) {
                                 for (uint32_t i = node.begin; i < node.end; ++i) {
-                                    splat_child(in, order[i]);
+                                    splat_entry(entries[m++], order[i]);
                                 }
                             } else {
+                                // Single-splat children hoist their splat: rep
+                                // values are the splat copy, the ref points at
+                                // the splat so no chain node is emitted.
                                 for (uint8_t c = 0; c < node.child_count; ++c) {
-                                    rep_child(in, node.children[c]);
+                                    const uint32_t ci = node.children[c];
+                                    const OctNode& child = topo.nodes[ci];
+                                    rep_entry(entries[m], ci);
+                                    if (child.leaf && child.splat_count() == 1) {
+                                        entries[m].ref = order[child.begin];
+                                    }
+                                    ++m;
                                 }
                             }
-                            merge_group(in, soa.max_sh_degree, reps, ni);
+                            for (uint32_t i = 0; i < m; ++i) {
+                                entry_cov(entries[i]);
+                            }
+
+                            uint32_t next_inter = static_cast<uint32_t>(node_count) + inter_offset[ni];
+                            while (m > 2) {
+                                // One pairing round: greedy most-similar pairs;
+                                // an odd entry passes through unmerged.
+                                float sim[kMaxGroupSplats][kMaxGroupSplats];
+                                for (uint32_t i = 0; i + 1 < m; ++i) {
+                                    for (uint32_t j = i + 1; j < m; ++j) {
+                                        sim[i][j] = bhatt_similarity(
+                                            entries[i].cov, entries[i].det, entries[i].mean, entries[i].rgb,
+                                            entries[j].cov, entries[j].det, entries[j].mean, entries[j].rgb);
+                                    }
+                                }
+                                bool used[kMaxGroupSplats] = {};
+                                PairEntry merged[kMaxGroupSplats / 2];
+                                uint32_t merged_count = 0;
+                                for (uint32_t pair = 0; pair < m / 2; ++pair) {
+                                    uint32_t best_i = 0;
+                                    uint32_t best_j = 0;
+                                    float best = -1.0f;
+                                    for (uint32_t i = 0; i + 1 < m; ++i) {
+                                        if (used[i]) {
+                                            continue;
+                                        }
+                                        for (uint32_t j = i + 1; j < m; ++j) {
+                                            if (!used[j] && sim[i][j] > best) {
+                                                best = sim[i][j];
+                                                best_i = i;
+                                                best_j = j;
+                                            }
+                                        }
+                                    }
+                                    used[best_i] = true;
+                                    used[best_j] = true;
+                                    const uint32_t dst = next_inter++;
+                                    merge_pair(entries[best_i], entries[best_j], dst);
+                                    rep_entry(merged[merged_count], dst);
+                                    entry_cov(merged[merged_count]);
+                                    ++merged_count;
+                                }
+                                uint32_t m2 = 0;
+                                for (uint32_t i = 0; i < m; ++i) {
+                                    if (!used[i]) {
+                                        entries[m2++] = entries[i];
+                                    }
+                                }
+                                std::copy_n(merged, merged_count, entries + m2);
+                                m = m2 + merged_count;
+                            }
+                            merge_pair(entries[0], entries[1], ni);
+                            assert(next_inter == node_count + inter_offset[ni + 1]);
                         }
                     });
             }
@@ -584,10 +710,13 @@ namespace lfs::core {
                 return std::unexpected("build_octree_lod: cancelled by user");
             }
 
-            // BFS emission: single-splat leaves hoist their splat into the
-            // parent's child block, every other octree node becomes one
-            // interior output node. BFS order keeps children contiguous and
-            // parents first, matching build_bhatt_lod's contract.
+            // BFS emission over the binary merge graph: every merge node (cell
+            // reps and pairing intermediates) becomes one interior output node
+            // with exactly two children; single-splat leaves were hoisted into
+            // their parent's pairing. Total merges over n splats is n - 1, so
+            // the output is a strict binary tree of 2n - 1 nodes. BFS order
+            // keeps children contiguous and parents first, matching
+            // build_bhatt_lod's contract.
             size_t hoisted = 0;
             for (const OctNode& node : topo.nodes) {
                 if (node.leaf && node.splat_count() == 1) {
@@ -595,15 +724,17 @@ namespace lfs::core {
                 }
             }
             const bool root_is_single = topo.nodes[0].leaf && topo.nodes[0].splat_count() == 1;
-            const size_t output_count = root_is_single ? 1 : n + node_count - hoisted;
+            const size_t merge_count = node_count - hoisted + total_intermediates;
+            const size_t output_count = root_is_single ? 1 : n + merge_count;
+            assert(root_is_single || output_count == 2 * n - 1);
 
             std::vector<uint32_t> source(output_count);
             std::vector<uint16_t> out_child_count(output_count, 0);
             std::vector<uint32_t> out_child_start(output_count, 0);
             std::vector<uint8_t> out_level(output_count, 0);
             {
-                std::vector<std::pair<uint32_t, uint32_t>> queue; // (out index, octree node)
-                queue.reserve(node_count - hoisted);
+                std::vector<std::pair<uint32_t, uint32_t>> queue; // (out index, merge node)
+                queue.reserve(merge_count);
                 if (root_is_single) {
                     source[0] = order[0];
                 } else {
@@ -612,30 +743,17 @@ namespace lfs::core {
                 }
                 size_t next = 1;
                 for (size_t head = 0; head < queue.size(); ++head) {
-                    const auto [oi, ni] = queue[head];
-                    const OctNode& node = topo.nodes[ni];
+                    const auto [oi, ri] = queue[head];
                     const auto child_level =
                         static_cast<uint8_t>(std::min<uint32_t>(out_level[oi] + 1u, 255u));
                     out_child_start[oi] = static_cast<uint32_t>(next);
-                    if (node.leaf) {
-                        out_child_count[oi] = static_cast<uint16_t>(node.splat_count());
-                        for (uint32_t i = node.begin; i < node.end; ++i, ++next) {
-                            source[next] = order[i];
-                            out_level[next] = child_level;
-                        }
-                    } else {
-                        out_child_count[oi] = node.child_count;
-                        for (uint8_t c = 0; c < node.child_count; ++c, ++next) {
-                            const uint32_t ci = node.children[c];
-                            const OctNode& child = topo.nodes[ci];
-                            if (child.leaf && child.splat_count() == 1) {
-                                source[next] = order[child.begin];
-                            } else {
-                                source[next] = kInteriorFlag | ci;
-                                queue.emplace_back(static_cast<uint32_t>(next),
-                                                   static_cast<uint32_t>(ci));
-                            }
-                            out_level[next] = child_level;
+                    out_child_count[oi] = 2;
+                    for (int c = 0; c < 2; ++c, ++next) {
+                        const uint32_t ref = merge_child[static_cast<size_t>(ri) * 2 + c];
+                        source[next] = ref;
+                        out_level[next] = child_level;
+                        if ((ref & kInteriorFlag) != 0) {
+                            queue.emplace_back(static_cast<uint32_t>(next), ref & ~kInteriorFlag);
                         }
                     }
                 }
@@ -743,9 +861,9 @@ namespace lfs::core {
             lod_tree->lod_opacity_encoded = true;
             result->lod_tree = std::move(lod_tree);
 
-            LOG_DEBUG("build_octree_lod: {} splats -> {} nodes ({} octree, {} hoisted) in {} ms "
-                      "(extract {}, sort {}, topology {}, merge {})",
-                      n, output_count, node_count, hoisted, elapsed_ms(),
+            LOG_DEBUG("build_octree_lod: {} splats -> {} nodes ({} octree, {} intermediate, "
+                      "{} hoisted) in {} ms (extract {}, sort {}, topology {}, merge {})",
+                      n, output_count, node_count, total_intermediates, hoisted, elapsed_ms(),
                       t_extract, t_sort - t_extract, t_topo - t_sort, t_merge - t_topo);
 
             if (progress && !progress(1.0f, "LOD tree complete")) {

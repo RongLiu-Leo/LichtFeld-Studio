@@ -273,6 +273,69 @@ namespace lfs::core::lodmath {
         rotmat_to_quat(eig.vectors, rotation_raw);
     }
 
+    // Bhattacharyya-distance similarity with color modulation; cov holds the 6
+    // unique covariance elements {xx, xy, xz, yy, yz, zz}. Moved verbatim from
+    // BhattLodWorkset::similarity so both builders pair with identical metrics.
+    [[nodiscard]] inline float bhatt_similarity(
+        const float* cov_a, const float det_a, const float* mean_a, const float* rgb_a,
+        const float* cov_b, const float det_b, const float* mean_b, const float* rgb_b) {
+        const float m00 = 0.5f * (cov_a[0] + cov_b[0]);
+        const float m01 = 0.5f * (cov_a[1] + cov_b[1]);
+        const float m02 = 0.5f * (cov_a[2] + cov_b[2]);
+        const float m11 = 0.5f * (cov_a[3] + cov_b[3]);
+        const float m12 = 0.5f * (cov_a[4] + cov_b[4]);
+        const float m22 = 0.5f * (cov_a[5] + cov_b[5]);
+
+        const float C00 = m11 * m22 - m12 * m12;
+        const float C01 = m02 * m12 - m01 * m22;
+        const float C02 = m01 * m12 - m02 * m11;
+        const float C11 = m00 * m22 - m02 * m02;
+        const float C12 = m01 * m02 - m00 * m12;
+        const float C22 = m00 * m11 - m01 * m01;
+
+        const float det = m00 * C00 + m01 * C01 + m02 * C02;
+        const float det_sigma = det;
+
+        if (det_sigma <= kEpsCov || det_a <= kEpsCov || det_b <= kEpsCov ||
+            !std::isfinite(det_sigma) || !std::isfinite(det_a) || !std::isfinite(det_b)) {
+            return 0.0f;
+        }
+
+        if (std::abs(det) < kEpsCov) {
+            return 0.0f;
+        }
+
+        const float inv_det = 1.0f / det;
+        const float inv_xx = C00 * inv_det;
+        const float inv_yy = C11 * inv_det;
+        const float inv_zz = C22 * inv_det;
+        const float inv_xy = C01 * inv_det;
+        const float inv_xz = C02 * inv_det;
+        const float inv_yz = C12 * inv_det;
+
+        const float dx = mean_b[0] - mean_a[0];
+        const float dy = mean_b[1] - mean_a[1];
+        const float dz = mean_b[2] - mean_a[2];
+
+        const float quad = inv_xx * dx * dx + inv_yy * dy * dy + inv_zz * dz * dz + 2.0f * inv_xy * dx * dy + 2.0f * inv_xz * dx * dz + 2.0f * inv_yz * dy * dz;
+
+        const float term1 = 0.125f * quad;
+        const float term2 = 0.5f * std::log(det_sigma / std::sqrt(det_a * det_b));
+        const float distance = term1 + term2;
+        const float spatial = std::exp(-distance);
+
+        const float dr = rgb_a[0] - rgb_b[0];
+        const float dg = rgb_a[1] - rgb_b[1];
+        const float db = rgb_a[2] - rgb_b[2];
+        const float color_delta2 = dr * dr + dg * dg + db * db;
+
+        const float metric = spatial * std::exp(-color_delta2);
+        if (std::isnan(metric) || !std::isfinite(metric)) {
+            return 0.0f;
+        }
+        return metric;
+    }
+
     // Compute symmetric 3x3 covariance from scale + quaternion and store 6 unique elements + det
     inline void compute_covariance_from_scale_quat(
         float sx, float sy, float sz,

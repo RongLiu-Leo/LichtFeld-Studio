@@ -431,65 +431,14 @@ namespace lfs::core {
     }
 
     float BhattLodWorkset::similarity(size_t a, size_t b) const {
-        // Average cached covariances
-        const float m00 = 0.5f * (cov_xx[a] + cov_xx[b]);
-        const float m01 = 0.5f * (cov_xy[a] + cov_xy[b]);
-        const float m02 = 0.5f * (cov_xz[a] + cov_xz[b]);
-        const float m11 = 0.5f * (cov_yy[a] + cov_yy[b]);
-        const float m12 = 0.5f * (cov_yz[a] + cov_yz[b]);
-        const float m22 = 0.5f * (cov_zz[a] + cov_zz[b]);
-
-        const float det_a = cov_det[a];
-        const float det_b = cov_det[b];
-
-        const float C00 = m11 * m22 - m12 * m12;
-        const float C01 = m02 * m12 - m01 * m22;
-        const float C02 = m01 * m12 - m02 * m11;
-        const float C11 = m00 * m22 - m02 * m02;
-        const float C12 = m01 * m02 - m00 * m12;
-        const float C22 = m00 * m11 - m01 * m01;
-
-        const float det = m00 * C00 + m01 * C01 + m02 * C02;
-        const float det_sigma = det;
-
-        if (det_sigma <= kEpsCov || det_a <= kEpsCov || det_b <= kEpsCov ||
-            !std::isfinite(det_sigma) || !std::isfinite(det_a) || !std::isfinite(det_b)) {
-            return 0.0f;
-        }
-
-        if (std::abs(det) < kEpsCov) {
-            return 0.0f;
-        }
-
-        const float inv_det = 1.0f / det;
-        const float inv_xx = C00 * inv_det;
-        const float inv_yy = C11 * inv_det;
-        const float inv_zz = C22 * inv_det;
-        const float inv_xy = C01 * inv_det;
-        const float inv_xz = C02 * inv_det;
-        const float inv_yz = C12 * inv_det;
-
-        const float dx = center_x[b] - center_x[a];
-        const float dy = center_y[b] - center_y[a];
-        const float dz = center_z[b] - center_z[a];
-
-        const float quad = inv_xx * dx * dx + inv_yy * dy * dy + inv_zz * dz * dz + 2.0f * inv_xy * dx * dy + 2.0f * inv_xz * dx * dz + 2.0f * inv_yz * dy * dz;
-
-        const float term1 = 0.125f * quad;
-        const float term2 = 0.5f * std::log(det_sigma / std::sqrt(det_a * det_b));
-        const float distance = term1 + term2;
-        const float spatial = std::exp(-distance);
-
-        const float dr = r[a] - r[b];
-        const float dg = g[a] - g[b];
-        const float db = this->b[a] - this->b[b];
-        const float color_delta2 = dr * dr + dg * dg + db * db;
-
-        const float metric = spatial * std::exp(-color_delta2);
-        if (std::isnan(metric) || !std::isfinite(metric)) {
-            return 0.0f;
-        }
-        return metric;
+        const float cov_a[6] = {cov_xx[a], cov_xy[a], cov_xz[a], cov_yy[a], cov_yz[a], cov_zz[a]};
+        const float cov_b[6] = {cov_xx[b], cov_xy[b], cov_xz[b], cov_yy[b], cov_yz[b], cov_zz[b]};
+        const float mean_a[3] = {center_x[a], center_y[a], center_z[a]};
+        const float mean_b[3] = {center_x[b], center_y[b], center_z[b]};
+        const float rgb_a[3] = {r[a], g[a], this->b[a]};
+        const float rgb_b[3] = {r[b], g[b], this->b[b]};
+        return bhatt_similarity(cov_a, cov_det[a], mean_a, rgb_a,
+                                cov_b, cov_det[b], mean_b, rgb_b);
     }
 
     size_t BhattLodWorkset::merge_nodes(size_t a, size_t node_b, float filter_size) {

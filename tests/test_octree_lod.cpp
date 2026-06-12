@@ -223,6 +223,28 @@ TEST(OctreeLod, MatchesBhattContractOnSyntheticInput) {
             << "octree output not level-ordered at node " << i;
     }
 
+    // Binary refinement contract: every interior node merges exactly two
+    // children, so the output is a strict binary tree of 2n - 1 nodes whose
+    // level populations grow by at most 2x -- the ~2x granularity steps the
+    // pixel-threshold LOD selector needs (the unrefined octree jumped ~8x).
+    EXPECT_EQ(ov.n, 2 * kSplats - 1);
+    std::vector<std::size_t> per_level;
+    for (std::size_t i = 0; i < ov.n; ++i) {
+        ASSERT_TRUE(ov.tree->child_count[i] == 0 || ov.tree->child_count[i] == 2)
+            << "interior node " << i << " must have exactly two children";
+        const std::size_t level = ov.tree->lod_level[i];
+        if (level >= per_level.size()) {
+            per_level.resize(level + 1, 0);
+        }
+        ++per_level[level];
+    }
+    for (std::size_t level = 0; level + 1 < per_level.size(); ++level) {
+        ASSERT_LE(per_level[level + 1], 2 * per_level[level])
+            << "level population jumped more than 2x at level " << level;
+    }
+    const std::size_t depth = per_level.size() - 1;
+    EXPECT_GE(depth, 16u) << "binary tree over " << kSplats << " leaves must be at least log2 deep";
+
     check_alpha_conservation(ov);
     check_alpha_conservation(bv);
     if (::testing::Test::HasFatalFailure()) {
@@ -235,8 +257,16 @@ TEST(OctreeLod, MatchesBhattContractOnSyntheticInput) {
     const float bhatt_root = bv.integrated_alpha(0);
     EXPECT_NEAR(octree_root, bhatt_root, bhatt_root * 0.02f);
 
-    // Interior nodes carry blended SH1-3: every coefficient is a convex
-    // combination of its children's, and the blend is non-trivial.
+    // Depth is bhatt-like: within 2x of the binary merge tree's.
+    std::uint8_t bhatt_depth = 0;
+    for (std::size_t i = 0; i < bv.n; ++i) {
+        bhatt_depth = std::max(bhatt_depth, bv.tree->lod_level[i]);
+    }
+    EXPECT_LE(depth, 2u * bhatt_depth);
+
+    // Interior nodes carry blended SH1-3 at every emitted level: every
+    // coefficient is a convex combination of its children's, and the blend is
+    // non-trivial.
     constexpr std::size_t kShFloats = kRestCoeffs * 3;
     float max_abs_interior_sh = 0.0f;
     for (std::size_t i = 0; i < ov.n; ++i) {
@@ -260,9 +290,6 @@ TEST(OctreeLod, MatchesBhattContractOnSyntheticInput) {
         }
     }
     EXPECT_GT(max_abs_interior_sh, 1e-3f) << "interior SH must not collapse to zero";
-
-    // The octree tree is strictly more compact than the binary merge tree.
-    EXPECT_LT(ov.n, bv.n);
 }
 
 TEST(OctreeLod, SmallInputs) {
@@ -316,9 +343,10 @@ TEST(OctreeLod, IdenticalPositionsStayBounded) {
         return;
     }
     EXPECT_EQ(leaves, kSplats);
+    EXPECT_EQ(v.n, 2 * kSplats - 1);
     std::uint16_t max_children = 0;
     for (std::size_t i = 0; i < v.n; ++i) {
         max_children = std::max(max_children, v.tree->child_count[i]);
     }
-    EXPECT_LE(max_children, 64);
+    EXPECT_EQ(max_children, 2);
 }
