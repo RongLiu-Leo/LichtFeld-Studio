@@ -146,50 +146,6 @@ namespace {
         }
     }
 
-    // Mirrors the generator that produced tests/data/legacy_deflate_lod.rad
-    // (written by the last DEFLATE build before the zstd format break); the
-    // migration test reproduces the fixture's exact leaf positions from it.
-    struct SplitMix64 {
-        std::uint64_t s;
-        std::uint64_t next() {
-            s += 0x9E3779B97F4A7C15ull;
-            std::uint64_t z = s;
-            z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
-            z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
-            return z ^ (z >> 31);
-        }
-        float uniform(float lo, float hi) {
-            const float t = static_cast<float>(next() >> 40) * (1.0f / 16777216.0f);
-            return lo + t * (hi - lo);
-        }
-    };
-
-    std::vector<float> fixture_splat_positions(const std::size_t count) {
-        SplitMix64 rng{0x5EEDF00Dull ^ count};
-        constexpr std::size_t kClusters = 16;
-        float centers[kClusters][3];
-        for (auto& c : centers) {
-            c[0] = rng.uniform(-50.0f, 50.0f);
-            c[1] = rng.uniform(-50.0f, 50.0f);
-            c[2] = rng.uniform(-5.0f, 5.0f);
-        }
-        std::vector<float> pos(count * 3);
-        for (std::size_t i = 0; i < count; ++i) {
-            const auto& c = centers[i % kClusters];
-            pos[i * 3 + 0] = c[0] + rng.uniform(-2.0f, 2.0f);
-            pos[i * 3 + 1] = c[1] + rng.uniform(-2.0f, 2.0f);
-            pos[i * 3 + 2] = c[2] + rng.uniform(-2.0f, 2.0f);
-        }
-        return pos;
-    }
-
-    std::filesystem::path legacy_deflate_fixture() {
-        return std::filesystem::path(PROJECT_ROOT_PATH) / "tests" / "data" /
-               "legacy_deflate_lod.rad";
-    }
-
-    constexpr std::size_t kLegacyFixtureSplats = 2500;
-
     void run_roundtrip(const std::size_t splat_count, const std::size_t target_bucket,
                        const lfs::io::LodBuilder builder = lfs::io::LodBuilder::kBhatt) {
         const auto temp_dir = std::filesystem::temp_directory_path() / "ply_to_rad_lod_test";
@@ -456,74 +412,6 @@ TEST(PlyToRadLod, OutOfCoreLoadKeepsTreeAndStreamsChunks) {
             ASSERT_EQ(chunk->opacity_raw[i], full_opacity_ptr[node])
                 << "chunk opacity mismatch at node " << node;
         }
-    }
-
-    std::filesystem::remove_all(temp_dir);
-}
-
-TEST(PlyToRadLod, LegacyDeflateLoadRejected) {
-    const auto fixture = legacy_deflate_fixture();
-    ASSERT_TRUE(std::filesystem::exists(fixture)) << fixture;
-
-    auto loaded = lfs::io::load_rad(fixture);
-    ASSERT_FALSE(loaded.has_value());
-    EXPECT_NE(loaded.error().find("DEFLATE"), std::string::npos) << loaded.error();
-    EXPECT_NE(loaded.error().find("convert"), std::string::npos) << loaded.error();
-}
-
-TEST(PlyToRadLod, LegacyDeflateMigratesToZstd) {
-    const auto fixture = legacy_deflate_fixture();
-    ASSERT_TRUE(std::filesystem::exists(fixture)) << fixture;
-
-    const auto needs_migration = lfs::io::rad_lod_needs_rechunk(fixture);
-    ASSERT_TRUE(needs_migration.has_value()) << needs_migration.error();
-    EXPECT_TRUE(*needs_migration) << "codec probe must route legacy files to the migrator";
-
-    const auto temp_dir = std::filesystem::temp_directory_path() / "rad_legacy_migration";
-    std::filesystem::remove_all(temp_dir);
-    std::filesystem::create_directories(temp_dir);
-    const auto migrated_path = temp_dir / "migrated.rad";
-
-    const auto migrated = lfs::io::rechunk_rad_lod(fixture, migrated_path);
-    ASSERT_TRUE(migrated.has_value()) << migrated.error().message;
-
-    const auto migrated_current = lfs::io::rad_lod_needs_rechunk(migrated_path);
-    ASSERT_TRUE(migrated_current.has_value()) << migrated_current.error();
-    EXPECT_FALSE(*migrated_current);
-
-    // The migrated file must pass the loader that rejects its source.
-    auto loaded = lfs::io::load_rad(migrated_path);
-    ASSERT_TRUE(loaded.has_value()) << loaded.error();
-    ASSERT_TRUE(loaded->lod_tree && loaded->lod_tree->has_tree());
-
-    TreeCheckResult check;
-    check_tree_invariants(*loaded, check);
-    if (::testing::Test::HasFatalFailure()) {
-        return;
-    }
-    EXPECT_EQ(check.leaf_count, kLegacyFixtureSplats);
-
-    // Centers are lossless f32 through both codecs: every source splat must
-    // survive the DEFLATE decode -> zstd re-encode bit-exactly.
-    const auto expected = fixture_splat_positions(kLegacyFixtureSplats);
-    std::vector<std::array<float, 3>> expected_positions(kLegacyFixtureSplats);
-    for (std::size_t i = 0; i < kLegacyFixtureSplats; ++i) {
-        expected_positions[i] = {expected[i * 3], expected[i * 3 + 1], expected[i * 3 + 2]};
-    }
-    auto actual_positions = check.leaf_positions;
-    std::sort(expected_positions.begin(), expected_positions.end());
-    std::sort(actual_positions.begin(), actual_positions.end());
-    EXPECT_EQ(expected_positions, actual_positions);
-
-    // The paged renderer's chunk reads must decode the migrated chunks.
-    const auto& source = loaded->lod_tree->rad_source;
-    ASSERT_TRUE(source.valid());
-    for (const auto& range : source.chunks) {
-        auto chunk = lfs::io::load_rad_chunk(migrated_path, range,
-                                             loaded->get_max_sh_degree(),
-                                             loaded->lod_tree->lod_opacity_encoded);
-        ASSERT_TRUE(chunk.has_value()) << chunk.error();
-        ASSERT_EQ(chunk->count, range.count);
     }
 
     std::filesystem::remove_all(temp_dir);

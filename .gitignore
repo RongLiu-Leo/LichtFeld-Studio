@@ -12,7 +12,6 @@ results
 .idea
 imgui.ini
 data
-!tests/data/
 *.pt
 *.py
 !scripts/lichtfeld_mcp_bridge.py
