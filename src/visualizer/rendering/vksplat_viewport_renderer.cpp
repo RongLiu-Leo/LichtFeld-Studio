@@ -90,7 +90,25 @@ namespace lfs::vis {
             const bool out_of_core =
                 rad_backed &&
                 splat_data.lod_tree->total_nodes() > static_cast<std::size_t>(splat_data.size());
-            if (out_of_core) {
+            if (!out_of_core && !host_resident_leaves) {
+                // Tensors live in VRAM (non-RAD, or RAD fully migrated at
+                // load): a bounded pool would only add double residency.
+                return logical_chunks;
+            }
+            if (!out_of_core && pool_budget_splats > 0) {
+                // Explicit splat budget for host-resident streaming.
+                constexpr std::size_t kMinBudgetPoolPages = 2048;
+                const std::size_t budget_pages =
+                    (pool_budget_splats + LodPageCache::kChunkSplats - 1) / LodPageCache::kChunkSplats;
+                return std::clamp(budget_pages, std::min(kMinBudgetPoolPages, logical_chunks),
+                                  logical_chunks);
+            }
+            // Out-of-core, or host-resident leaves on auto budget: the pool is
+            // real VRAM the renderer must share — size it from headroom. A
+            // host-resident model previously fell through to a FULL pool here,
+            // which allocates pages x page_bytes regardless of free VRAM
+            // (issue #1295: 94K pages = 16.6 GB on a card with 11.8 free).
+            {
                 // Only a coarse LOD prefix is host-resident, so the pool must
                 // hold the cut's whole working set or streaming thrashes. Size
                 // it from VRAM headroom; the splat-count budget setting was
@@ -122,16 +140,6 @@ namespace lfs::vis {
                 LOG_ERROR("LOD pool sizing: cudaMemGetInfo failed; using minimum pool");
                 return std::min(kMinPoolPages, logical_chunks);
             }
-            if (!host_resident_leaves || pool_budget_splats == 0) {
-                // Models whose tensors already live in VRAM (non-RAD, or RAD
-                // fully migrated at load) gain nothing from a bounded pool —
-                // streaming would only add double residency. Budget 0 = full.
-                return logical_chunks;
-            }
-            constexpr std::size_t kMinPoolPages = 2048;
-            const std::size_t budget_pages =
-                (pool_budget_splats + LodPageCache::kChunkSplats - 1) / LodPageCache::kChunkSplats;
-            return std::clamp(budget_pages, std::min(kMinPoolPages, logical_chunks), logical_chunks);
         }
 
         std::vector<std::uint32_t> collectProtectedLodChunks(
