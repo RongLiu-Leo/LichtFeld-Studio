@@ -328,6 +328,9 @@ namespace lfs::app {
             lfs::io::PlyToRadLodOptions options;
             options.tiles_x = params.tiles_x;
             options.tiles_y = params.tiles_y;
+            options.builder = params.lod_builder == param::LodBuilder::OCTREE
+                                  ? lfs::io::LodBuilder::kOctree
+                                  : lfs::io::LodBuilder::kBhatt;
             options.progress = [&bar](const float progress, const std::string& stage) {
                 return bar.report(progress, stage);
             };
@@ -370,8 +373,11 @@ namespace lfs::app {
                 }
             }
 
+            // An explicit non-default builder always takes the bucketed
+            // converter; the monolithic in-memory path is bhatt-only.
             if (params.format == param::OutputFormat::RAD && isPlyExtension(input) &&
-                (tiled || shouldStreamLodConvert(input))) {
+                (tiled || params.lod_builder != param::LodBuilder::BHATT ||
+                 shouldStreamLodConvert(input))) {
                 return streamLodConvertFile(input, output, params);
             }
 

@@ -6,6 +6,7 @@
 #include "core/bhatt_lod.hpp"
 #include "core/logger.hpp"
 #include "core/mapped_file.hpp"
+#include "core/octree_lod.hpp"
 #include "core/path_utils.hpp"
 #include "core/splat_data.hpp"
 #include "core/tensor.hpp"
@@ -1453,9 +1454,14 @@ namespace lfs::io {
                         records.clear();
                         records.shrink_to_fit();
 
-                        lfs::core::BhattLodBuildOptions lod_options;
-                        lod_options.lod_base = options.lod_base;
-                        auto lod_result = lfs::core::build_bhatt_lod(bucket_input, lod_options);
+                        std::expected<std::unique_ptr<SplatData>, std::string> lod_result;
+                        if (options.builder == LodBuilder::kOctree) {
+                            lod_result = lfs::core::build_octree_lod(bucket_input);
+                        } else {
+                            lfs::core::BhattLodBuildOptions lod_options;
+                            lod_options.lod_base = options.lod_base;
+                            lod_result = lfs::core::build_bhatt_lod(bucket_input, lod_options);
+                        }
                         if (!lod_result) {
                             fail(std::format("bucket {} LOD build failed: {}", b, lod_result.error()));
                             return;

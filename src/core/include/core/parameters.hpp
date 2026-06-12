@@ -302,6 +302,12 @@ namespace lfs::core {
                                   USDC,
                                   RAD };
 
+        // PLY -> RAD only: per-bucket LOD tree builder for the out-of-core
+        // converter. BHATT is the quality-validated default; OCTREE trades
+        // unvalidated quality for a much faster parallel build.
+        enum class LodBuilder { BHATT,
+                                OCTREE };
+
         // Parameters for the convert command
         struct LFS_CORE_API ConvertParameters {
             std::filesystem::path input_path;
@@ -313,6 +319,7 @@ namespace lfs::core {
             // grid instead of pre-tiling the input file.
             std::uint32_t tiles_x = 1;
             std::uint32_t tiles_y = 1;
+            LodBuilder lod_builder = LodBuilder::BHATT;
             bool overwrite = false; // Skip overwrite prompts
         };
 

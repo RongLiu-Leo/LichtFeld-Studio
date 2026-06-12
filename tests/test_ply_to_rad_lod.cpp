@@ -146,7 +146,8 @@ namespace {
         }
     }
 
-    void run_roundtrip(const std::size_t splat_count, const std::size_t target_bucket) {
+    void run_roundtrip(const std::size_t splat_count, const std::size_t target_bucket,
+                       const lfs::io::LodBuilder builder = lfs::io::LodBuilder::kBhatt) {
         const auto temp_dir = std::filesystem::temp_directory_path() / "ply_to_rad_lod_test";
         std::filesystem::create_directories(temp_dir);
         const auto ply_path = temp_dir / "synthetic.ply";
@@ -158,6 +159,7 @@ namespace {
         lfs::io::PlyToRadLodOptions options;
         options.target_bucket_splats = target_bucket;
         options.temp_dir = temp_dir / "scratch";
+        options.builder = builder;
         const auto convert_result = lfs::io::convert_ply_to_rad_lod(ply_path, rad_path, options);
         ASSERT_TRUE(convert_result.has_value())
             << convert_result.error().message;
@@ -200,6 +202,14 @@ TEST(PlyToRadLod, MultiBucketRoundtrip) {
 
 TEST(PlyToRadLod, SingleBucketRoundtrip) {
     run_roundtrip(50'000, 4'000'000);
+}
+
+TEST(PlyToRadLod, MultiBucketRoundtripOctree) {
+    run_roundtrip(300'000, 65'536, lfs::io::LodBuilder::kOctree);
+}
+
+TEST(PlyToRadLod, SingleBucketRoundtripOctree) {
+    run_roundtrip(50'000, 4'000'000, lfs::io::LodBuilder::kOctree);
 }
 
 TEST(PlyToRadLod, TileGridDoublesLeaves) {
