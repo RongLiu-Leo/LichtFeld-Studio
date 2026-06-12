@@ -53,6 +53,12 @@ namespace lfs::io {
         // takes over (OctreeLodBuildOptions::leaf_group_splats, clamped to
         // [2, 64]).
         std::uint32_t octree_leaf_splats = 8;
+        // kOctree only: the per-bucket octree pass hands its surviving
+        // representatives to the bhatt agglomerative builder once they fit
+        // this budget, so the visible coarse levels carry similarity-ordered
+        // merges instead of compounded cell-forced pairings. 0 = pure octree
+        // to the bucket root (OctreeLodBuildOptions::bhatt_top_nodes).
+        std::uint32_t octree_bhatt_top_nodes = 32768;
         // Replicates the source across a tiles_x by tiles_y grid on the X/Y
         // ground plane, offsetting each instance by the scene extent plus a
         // 1% margin. The source PLY is replayed once per tile, so no tiled

@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "core/octree_lod.hpp"
+#include "core/bhatt_lod.hpp"
 #include "core/logger.hpp"
 #include "core/splat_data.hpp"
 #include "lod_merge_math.hpp"
@@ -30,7 +31,9 @@ namespace lfs::core {
 
         constexpr int kMortonLevels = 21;
         constexpr uint32_t kMaxGroupSplats = 64;
-        constexpr uint32_t kInteriorFlag = 0x80000000u;
+        constexpr uint32_t kInteriorFlag = 0x80000000u; // octree merge representative
+        constexpr uint32_t kBhattFlag = 0x40000000u;    // hybrid bhatt top-tree node
+        constexpr uint32_t kRefTagMask = kInteriorFlag | kBhattFlag;
 
         // Interleaved display-space splat arrays (visible splats only).
         struct SplatSoa {
@@ -420,6 +423,9 @@ namespace lfs::core {
             if (n == 0) {
                 return std::unexpected("build_octree_lod: no visible gaussians");
             }
+            assert(n < (size_t{1} << 30));
+            const int max_sh = soa.max_sh_degree;
+            const int shN_coeffs = static_cast<int>(input.max_sh_coeffs_rest());
             const auto t_extract = elapsed_ms();
             if (progress && !progress(0.05f, "Extracting splats")) {
                 return std::unexpected("build_octree_lod: cancelled by user");
@@ -498,6 +504,7 @@ namespace lfs::core {
             }
             const uint32_t total_intermediates = inter_offset[node_count];
             const size_t rep_count = node_count + total_intermediates;
+            assert(rep_count < (size_t{1} << 30));
 
             // Bottom-up moment matching, parallel within each depth. Children
             // have higher pre-order indices, so deeper levels finish first.
@@ -527,6 +534,40 @@ namespace lfs::core {
             for (uint32_t i = 0; i < node_count; ++i) {
                 by_depth[topo.nodes[i].depth].push_back(i);
             }
+
+            // Hybrid cut: octree merging stops at the deepest depth whose
+            // surviving set fits bhatt_top_nodes; build_bhatt_lod then orders
+            // the remaining merges globally by similarity, so the coarse
+            // levels are never compounded cell-forced pairings. The cut at
+            // depth d holds one representative per depth-d cell plus the raw
+            // splats of leaf cells above it (those skip octree merging
+            // entirely); cut_depth == max_depth + 1 means bhatt builds the
+            // whole tree.
+            int cut_depth = max_depth + 1;
+            size_t cut_size = 0;
+            bool use_bhatt_top = false;
+            if (options.bhatt_top_nodes >= 2 && n >= 2) {
+                std::vector<size_t> leaf_splats_at_depth(static_cast<size_t>(max_depth) + 1, 0);
+                for (const OctNode& node : topo.nodes) {
+                    if (node.leaf) {
+                        leaf_splats_at_depth[node.depth] += node.splat_count();
+                    }
+                }
+                size_t shallow_splats = 0;
+                for (int d = 0; d <= max_depth + 1; ++d) {
+                    const size_t cells = d <= max_depth ? by_depth[static_cast<size_t>(d)].size() : 0;
+                    const size_t survivors = cells + shallow_splats;
+                    if (survivors >= 2 && survivors <= options.bhatt_top_nodes) {
+                        cut_depth = d;
+                        cut_size = survivors;
+                        use_bhatt_top = true;
+                    }
+                    if (d <= max_depth) {
+                        shallow_splats += leaf_splats_at_depth[static_cast<size_t>(d)];
+                    }
+                }
+            }
+            const int merge_floor = use_bhatt_top ? cut_depth : 0;
 
             struct PairEntry {
                 uint32_t ref;
@@ -598,7 +639,7 @@ namespace lfs::core {
                 merge_child[static_cast<size_t>(dst) * 2 + 1] = b.ref;
             };
 
-            for (int d = max_depth; d >= 0; --d) {
+            for (int d = max_depth; d >= merge_floor; --d) {
                 const auto& bucket = by_depth[static_cast<size_t>(d)];
                 tbb::parallel_for(
                     tbb::blocked_range<size_t>(0, bucket.size()),
@@ -710,51 +751,188 @@ namespace lfs::core {
                 return std::unexpected("build_octree_lod: cancelled by user");
             }
 
-            // BFS emission over the binary merge graph: every merge node (cell
-            // reps and pairing intermediates) becomes one interior output node
-            // with exactly two children; single-splat leaves were hoisted into
-            // their parent's pairing. Total merges over n splats is n - 1, so
-            // the output is a strict binary tree of 2n - 1 nodes. BFS order
-            // keeps children contiguous and parents first, matching
-            // build_bhatt_lod's contract.
-            size_t hoisted = 0;
-            for (const OctNode& node : topo.nodes) {
-                if (node.leaf && node.splat_count() == 1) {
-                    ++hoisted;
+            // Bhatt top: the cut survivors become input splats of the
+            // agglomerative builder, whose output tree is stitched above the
+            // octree-built binary subtrees. Leaves of the bhatt tree are the
+            // cut entries themselves, so they are emitted from the original
+            // rep/splat values (bit-exact with the merge graph), not bhatt's
+            // round-tripped copies.
+            std::vector<uint32_t> cut_refs; // tagged: splat index or kInteriorFlag | node
+            std::unique_ptr<SplatData> bhatt_top;
+            std::vector<uint32_t> bhatt_leaf_cut;
+            if (use_bhatt_top) {
+                cut_refs.reserve(cut_size);
+                if (cut_depth <= max_depth) {
+                    for (const uint32_t ni : by_depth[static_cast<size_t>(cut_depth)]) {
+                        const OctNode& node = topo.nodes[ni];
+                        const bool single = node.leaf && node.splat_count() == 1;
+                        cut_refs.push_back(single ? order[node.begin] : (kInteriorFlag | ni));
+                    }
                 }
+                for (uint32_t ni = 0; ni < node_count; ++ni) {
+                    const OctNode& node = topo.nodes[ni];
+                    if (node.leaf && static_cast<int>(node.depth) < cut_depth) {
+                        for (uint32_t i = node.begin; i < node.end; ++i) {
+                            cut_refs.push_back(order[i]);
+                        }
+                    }
+                }
+                assert(cut_refs.size() == cut_size);
+
+                std::vector<float> c_means(cut_size * 3);
+                std::vector<float> c_sh0(cut_size * 3);
+                std::vector<float> c_scaling(cut_size * 3);
+                std::vector<float> c_rotation(cut_size * 4);
+                std::vector<float> c_opacity(cut_size);
+                std::vector<float> c_shN;
+                if (shN_coeffs > 0) {
+                    c_shN.resize(cut_size * static_cast<size_t>(shN_coeffs) * 3);
+                }
+                for (size_t c = 0; c < cut_size; ++c) {
+                    const bool interior = (cut_refs[c] & kInteriorFlag) != 0;
+                    const size_t s = cut_refs[c] & ~kRefTagMask;
+                    const float* const mean = (interior ? reps.mean : soa.mean).data() + s * 3;
+                    const float* const scale = (interior ? reps.scale : soa.scale).data() + s * 3;
+                    const float* const quat = (interior ? reps.quat : soa.quat).data() + s * 4;
+                    const float* const rgb = (interior ? reps.rgb : soa.rgb).data() + s * 3;
+                    std::copy_n(mean, 3, c_means.data() + c * 3);
+                    c_opacity[c] = interior ? reps.alpha[s] : soa.alpha[s];
+                    for (int d = 0; d < 3; ++d) {
+                        c_sh0[c * 3 + d] = (rgb[d] - 0.5f) / SH_C0;
+                        c_scaling[c * 3 + d] = std::log(std::max(scale[d], 1e-8f));
+                    }
+                    std::copy_n(quat, 4, c_rotation.data() + c * 4);
+                    if (shN_coeffs > 0) {
+                        float* const dst = c_shN.data() + c * static_cast<size_t>(shN_coeffs) * 3;
+                        if (max_sh >= 1 && shN_coeffs >= 3) {
+                            std::copy_n((interior ? reps.sh1 : soa.sh1).data() + s * 9, 9, dst);
+                        }
+                        if (max_sh >= 2 && shN_coeffs >= 8) {
+                            std::copy_n((interior ? reps.sh2 : soa.sh2).data() + s * 15, 15, dst + 9);
+                        }
+                        if (max_sh >= 3 && shN_coeffs >= 15) {
+                            std::copy_n((interior ? reps.sh3 : soa.sh3).data() + s * 21, 21, dst + 24);
+                        }
+                    }
+                }
+                Tensor c_shN_tensor;
+                if (shN_coeffs > 0) {
+                    c_shN_tensor = Tensor::from_vector(
+                        c_shN, {cut_size, static_cast<size_t>(shN_coeffs), 3}, Device::CPU);
+                }
+                const SplatData top_input(
+                    max_sh,
+                    Tensor::from_vector(c_means, {cut_size, 3}, Device::CPU),
+                    Tensor::from_vector(c_sh0, {cut_size, 1, 3}, Device::CPU),
+                    std::move(c_shN_tensor),
+                    Tensor::from_vector(c_scaling, {cut_size, 3}, Device::CPU),
+                    Tensor::from_vector(c_rotation, {cut_size, 4}, Device::CPU),
+                    Tensor::from_vector(c_opacity, {cut_size, 1}, Device::CPU),
+                    1.0f);
+
+                BhattLodBuildOptions top_options;
+                top_options.lod_base = options.bhatt_lod_base;
+                top_options.input_lod_opacity = true;
+                top_options.leaf_input_indices = &bhatt_leaf_cut;
+                SplatSimplifyProgressCallback top_progress;
+                if (progress) {
+                    top_progress = [&progress](const float p, const std::string& stage) {
+                        return progress(0.76f + 0.14f * p, stage);
+                    };
+                }
+                auto top_result = build_bhatt_lod(top_input, top_options, std::move(top_progress));
+                if (!top_result) {
+                    return std::unexpected("build_octree_lod: similarity top tree failed: " +
+                                           top_result.error());
+                }
+                bhatt_top = std::move(*top_result);
             }
-            const bool root_is_single = topo.nodes[0].leaf && topo.nodes[0].splat_count() == 1;
-            const size_t merge_count = node_count - hoisted + total_intermediates;
-            const size_t output_count = root_is_single ? 1 : n + merge_count;
-            assert(root_is_single || output_count == 2 * n - 1);
+            const auto t_top = elapsed_ms();
+
+            // BFS emission over the stitched merge graph: bhatt top nodes
+            // keep their (possibly pruned, >2-ary) child lists; bhatt leaves
+            // are substituted by their cut entry, whose binary merge subtree
+            // (or raw splat) follows. Every octree merge node emits exactly
+            // two children; single-splat leaf cells were hoisted into their
+            // parent's pairing. BFS order keeps children contiguous, parents
+            // first, and levels monotone, matching build_bhatt_lod's
+            // contract.
+            size_t output_count;
+            bool root_is_single = false;
+            if (use_bhatt_top) {
+                const auto& ttree = *bhatt_top->lod_tree;
+                size_t top_interior = 0;
+                for (size_t i = 0; i < ttree.child_count.size(); ++i) {
+                    top_interior += ttree.child_count[i] > 0 ? 1 : 0;
+                }
+                size_t bottom = 0;
+                for (const uint32_t ref : cut_refs) {
+                    bottom += (ref & kInteriorFlag) != 0
+                                  ? 2 * static_cast<size_t>(
+                                            topo.nodes[ref & ~kRefTagMask].splat_count()) -
+                                        1
+                                  : 1;
+                }
+                output_count = top_interior + bottom;
+            } else {
+                size_t hoisted = 0;
+                for (const OctNode& node : topo.nodes) {
+                    if (node.leaf && node.splat_count() == 1) {
+                        ++hoisted;
+                    }
+                }
+                root_is_single = topo.nodes[0].leaf && topo.nodes[0].splat_count() == 1;
+                const size_t merge_count = node_count - hoisted + total_intermediates;
+                output_count = root_is_single ? 1 : n + merge_count;
+                assert(root_is_single || output_count == 2 * n - 1);
+            }
 
             std::vector<uint32_t> source(output_count);
             std::vector<uint16_t> out_child_count(output_count, 0);
             std::vector<uint32_t> out_child_start(output_count, 0);
             std::vector<uint8_t> out_level(output_count, 0);
             {
-                std::vector<std::pair<uint32_t, uint32_t>> queue; // (out index, merge node)
-                queue.reserve(merge_count);
-                if (root_is_single) {
+                const SplatLodTree* const ttree = use_bhatt_top ? bhatt_top->lod_tree.get() : nullptr;
+                std::vector<std::pair<uint32_t, uint32_t>> queue; // (out index, tagged ref)
+                queue.reserve(output_count / 2 + 1);
+                if (use_bhatt_top) {
+                    source[0] = kBhattFlag | 0u;
+                    queue.emplace_back(0u, source[0]);
+                } else if (root_is_single) {
                     source[0] = order[0];
                 } else {
                     source[0] = kInteriorFlag | 0u;
-                    queue.emplace_back(0u, 0u);
+                    queue.emplace_back(0u, source[0]);
                 }
                 size_t next = 1;
                 for (size_t head = 0; head < queue.size(); ++head) {
-                    const auto [oi, ri] = queue[head];
+                    const auto [oi, ref] = queue[head];
                     const auto child_level =
                         static_cast<uint8_t>(std::min<uint32_t>(out_level[oi] + 1u, 255u));
                     out_child_start[oi] = static_cast<uint32_t>(next);
-                    out_child_count[oi] = 2;
-                    for (int c = 0; c < 2; ++c, ++next) {
-                        const uint32_t ref = merge_child[static_cast<size_t>(ri) * 2 + c];
-                        source[next] = ref;
+                    const auto emit = [&](const uint32_t child_ref) {
+                        source[next] = child_ref;
                         out_level[next] = child_level;
-                        if ((ref & kInteriorFlag) != 0) {
-                            queue.emplace_back(static_cast<uint32_t>(next), ref & ~kInteriorFlag);
+                        if ((child_ref & kRefTagMask) != 0) {
+                            queue.emplace_back(static_cast<uint32_t>(next), child_ref);
                         }
+                        ++next;
+                    };
+                    if ((ref & kBhattFlag) != 0) {
+                        const uint32_t b = ref & ~kRefTagMask;
+                        const uint16_t cc = ttree->child_count[b];
+                        const uint32_t cs = ttree->child_start[b];
+                        out_child_count[oi] = cc;
+                        for (uint32_t c = 0; c < cc; ++c) {
+                            const uint32_t tc = cs + c;
+                            emit(ttree->child_count[tc] > 0 ? (kBhattFlag | tc)
+                                                            : cut_refs[bhatt_leaf_cut[tc]]);
+                        }
+                    } else {
+                        const uint32_t ri = ref & ~kRefTagMask;
+                        out_child_count[oi] = 2;
+                        emit(merge_child[static_cast<size_t>(ri) * 2 + 0]);
+                        emit(merge_child[static_cast<size_t>(ri) * 2 + 1]);
                     }
                 }
                 assert(next == output_count);
@@ -764,15 +942,13 @@ namespace lfs::core {
                 auto& leaf_map = *options.leaf_input_indices;
                 leaf_map.assign(output_count, std::numeric_limits<uint32_t>::max());
                 for (size_t i = 0; i < output_count; ++i) {
-                    if ((source[i] & kInteriorFlag) == 0) {
+                    if ((source[i] & kRefTagMask) == 0) {
                         leaf_map[i] = source[i];
                     }
                 }
             }
 
             // Output tensors + tree metadata, mirroring build_bhatt_lod.
-            const int max_sh = soa.max_sh_degree;
-            const int shN_coeffs = static_cast<int>(input.max_sh_coeffs_rest());
             std::vector<float> means_vec(output_count * 3);
             std::vector<float> opacity_vec(output_count);
             std::vector<float> sh0_vec(output_count * 3);
@@ -786,12 +962,62 @@ namespace lfs::core {
             lod_tree->centers.resize(output_count);
             lod_tree->sizes.resize(output_count);
 
+            Tensor b_means, b_opacity, b_sh0, b_scaling, b_rotation, b_shN;
+            const float* bt_means = nullptr;
+            const float* bt_opacity = nullptr;
+            const float* bt_sh0 = nullptr;
+            const float* bt_scaling = nullptr;
+            const float* bt_rotation = nullptr;
+            const float* bt_shN = nullptr;
+            if (use_bhatt_top) {
+                b_means = bhatt_top->means_raw().cpu().contiguous();
+                b_opacity = bhatt_top->opacity_raw().cpu().contiguous();
+                b_sh0 = bhatt_top->sh0_raw().cpu().contiguous();
+                b_scaling = bhatt_top->scaling_raw().cpu().contiguous();
+                b_rotation = bhatt_top->rotation_raw().cpu().contiguous();
+                bt_means = b_means.ptr<float>();
+                bt_opacity = b_opacity.ptr<float>();
+                bt_sh0 = b_sh0.ptr<float>();
+                bt_scaling = b_scaling.ptr<float>();
+                bt_rotation = b_rotation.ptr<float>();
+                if (shN_coeffs > 0) {
+                    b_shN = bhatt_top->shN_canonical_cpu();
+                    bt_shN = b_shN.ptr<float>();
+                }
+            }
+
             tbb::parallel_for(
                 tbb::blocked_range<size_t>(0, output_count),
                 [&](const tbb::blocked_range<size_t>& range) {
                     for (size_t i = range.begin(); i != range.end(); ++i) {
-                        const bool interior = (source[i] & kInteriorFlag) != 0;
-                        const size_t s = source[i] & ~kInteriorFlag;
+                        const uint32_t tag = source[i] & kRefTagMask;
+                        const size_t s = source[i] & ~kRefTagMask;
+                        if (tag == kBhattFlag) {
+                            // Bhatt output is already in optimizer domain
+                            // (log scales, sh0, lodOpacity); copy through.
+                            std::copy_n(bt_means + s * 3, 3, means_vec.data() + i * 3);
+                            opacity_vec[i] = std::max(bt_opacity[s], 0.0f);
+                            std::copy_n(bt_sh0 + s * 3, 3, sh0_vec.data() + i * 3);
+                            std::copy_n(bt_scaling + s * 3, 3, scaling_vec.data() + i * 3);
+                            std::copy_n(bt_rotation + s * 4, 4, rotation_vec.data() + i * 4);
+                            if (shN_coeffs > 0) {
+                                const size_t row = static_cast<size_t>(shN_coeffs) * 3;
+                                std::copy_n(bt_shN + s * row, row, shN_vec.data() + i * row);
+                            }
+                            lod_tree->centers[i] = {means_vec[i * 3 + 0], means_vec[i * 3 + 1],
+                                                    means_vec[i * 3 + 2]};
+                            const float max_scale = std::exp(std::max(
+                                {bt_scaling[s * 3 + 0], bt_scaling[s * 3 + 1], bt_scaling[s * 3 + 2]}));
+                            const float alpha = opacity_vec[i];
+                            float expansion = 1.0f;
+                            if (alpha > 1.0f) {
+                                const float spark_lod_opacity = std::min(alpha * 4.0f - 3.0f, 5.0f);
+                                expansion = 1.0f + 0.7f * (spark_lod_opacity - 1.0f);
+                            }
+                            lod_tree->sizes[i] = 2.0f * expansion * max_scale;
+                            continue;
+                        }
+                        const bool interior = tag != 0;
                         const float* const mean = (interior ? reps.mean : soa.mean).data() + s * 3;
                         const float* const scale = (interior ? reps.scale : soa.scale).data() + s * 3;
                         const float* const quat = (interior ? reps.quat : soa.quat).data() + s * 4;
@@ -861,10 +1087,13 @@ namespace lfs::core {
             lod_tree->lod_opacity_encoded = true;
             result->lod_tree = std::move(lod_tree);
 
-            LOG_DEBUG("build_octree_lod: {} splats -> {} nodes ({} octree, {} intermediate, "
-                      "{} hoisted) in {} ms (extract {}, sort {}, topology {}, merge {})",
-                      n, output_count, node_count, total_intermediates, hoisted, elapsed_ms(),
-                      t_extract, t_sort - t_extract, t_topo - t_sort, t_merge - t_topo);
+            LOG_DEBUG("build_octree_lod: {} splats -> {} nodes ({} octree cells, cut depth {}, "
+                      "{} survivors, {} bhatt top nodes) in {} ms (extract {}, sort {}, "
+                      "topology {}, merge {}, top {})",
+                      n, output_count, node_count, use_bhatt_top ? cut_depth : 0, cut_size,
+                      use_bhatt_top ? static_cast<size_t>(bhatt_top->size()) : 0, elapsed_ms(),
+                      t_extract, t_sort - t_extract, t_topo - t_sort, t_merge - t_topo,
+                      t_top - t_merge);
 
             if (progress && !progress(1.0f, "LOD tree complete")) {
                 return std::unexpected("build_octree_lod: cancelled by user");

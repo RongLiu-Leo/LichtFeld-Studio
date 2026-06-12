@@ -180,13 +180,62 @@ namespace {
         return positions;
     }
 
+    std::vector<std::array<float, 3>> sorted_input_positions(const SplatData& input) {
+        const auto means_cpu = input.means_raw().cpu().contiguous();
+        const float* const ptr = means_cpu.ptr<float>();
+        std::vector<std::array<float, 3>> positions(static_cast<std::size_t>(input.size()));
+        for (std::size_t i = 0; i < positions.size(); ++i) {
+            positions[i] = {ptr[i * 3 + 0], ptr[i * 3 + 1], ptr[i * 3 + 2]};
+        }
+        std::sort(positions.begin(), positions.end());
+        return positions;
+    }
+
+    void check_level_order(const TreeView& v) {
+        for (std::size_t i = 1; i < v.n; ++i) {
+            ASSERT_GE(v.tree->lod_level[i], v.tree->lod_level[i - 1])
+                << "output not level-ordered at node " << i;
+        }
+    }
+
+    // Interior nodes carry blended SH1-3 at every emitted level: every
+    // coefficient is a convex combination of its children's, and the blend is
+    // non-trivial.
+    void check_sh_convexity(const TreeView& v) {
+        constexpr std::size_t kShFloats = kRestCoeffs * 3;
+        float max_abs_interior_sh = 0.0f;
+        for (std::size_t i = 0; i < v.n; ++i) {
+            const std::uint32_t cc = v.tree->child_count[i];
+            if (cc == 0) {
+                continue;
+            }
+            const std::uint32_t cs = v.tree->child_start[i];
+            for (std::size_t k = 0; k < kShFloats; ++k) {
+                float lo = std::numeric_limits<float>::max();
+                float hi = std::numeric_limits<float>::lowest();
+                for (std::uint32_t c = 0; c < cc; ++c) {
+                    const float val = v.shN[(cs + c) * kShFloats + k];
+                    lo = std::min(lo, val);
+                    hi = std::max(hi, val);
+                }
+                const float own = v.shN[i * kShFloats + k];
+                ASSERT_GE(own, lo - 1e-4f) << "SH blend out of range at node " << i << " coeff " << k;
+                ASSERT_LE(own, hi + 1e-4f) << "SH blend out of range at node " << i << " coeff " << k;
+                max_abs_interior_sh = std::max(max_abs_interior_sh, std::abs(own));
+            }
+        }
+        EXPECT_GT(max_abs_interior_sh, 1e-3f) << "interior SH must not collapse to zero";
+    }
+
 } // namespace
 
 TEST(OctreeLod, MatchesBhattContractOnSyntheticInput) {
     constexpr std::size_t kSplats = 50'000;
     const SplatData input = make_synthetic_input(kSplats);
 
-    auto octree = lfs::core::build_octree_lod(input);
+    lfs::core::OctreeLodBuildOptions pure_octree;
+    pure_octree.bhatt_top_nodes = 0;
+    auto octree = lfs::core::build_octree_lod(input, pure_octree);
     ASSERT_TRUE(octree.has_value()) << octree.error();
     auto bhatt = lfs::core::build_bhatt_lod(input);
     ASSERT_TRUE(bhatt.has_value()) << bhatt.error();
@@ -206,21 +255,15 @@ TEST(OctreeLod, MatchesBhattContractOnSyntheticInput) {
 
     // Exact leaf preservation: identical position multisets, identical to the
     // input.
-    const auto input_means = input.means_raw().cpu().contiguous();
-    const float* const in_ptr = input_means.ptr<float>();
-    std::vector<std::array<float, 3>> expected(kSplats);
-    for (std::size_t i = 0; i < kSplats; ++i) {
-        expected[i] = {in_ptr[i * 3 + 0], in_ptr[i * 3 + 1], in_ptr[i * 3 + 2]};
-    }
-    std::sort(expected.begin(), expected.end());
+    const auto expected = sorted_input_positions(input);
     EXPECT_EQ(sorted_leaf_positions(ov), expected);
     EXPECT_EQ(sorted_leaf_positions(bv), expected);
 
     // BFS level order is part of the octree builder's contract (bhatt emits
     // DFS pre-order and relies on the converter's relabel pass).
-    for (std::size_t i = 1; i < ov.n; ++i) {
-        ASSERT_GE(ov.tree->lod_level[i], ov.tree->lod_level[i - 1])
-            << "octree output not level-ordered at node " << i;
+    check_level_order(ov);
+    if (::testing::Test::HasFatalFailure()) {
+        return;
     }
 
     // Binary refinement contract: every interior node merges exactly two
@@ -264,52 +307,109 @@ TEST(OctreeLod, MatchesBhattContractOnSyntheticInput) {
     }
     EXPECT_LE(depth, 2u * bhatt_depth);
 
-    // Interior nodes carry blended SH1-3 at every emitted level: every
-    // coefficient is a convex combination of its children's, and the blend is
-    // non-trivial.
-    constexpr std::size_t kShFloats = kRestCoeffs * 3;
-    float max_abs_interior_sh = 0.0f;
-    for (std::size_t i = 0; i < ov.n; ++i) {
-        const std::uint32_t cc = ov.tree->child_count[i];
-        if (cc == 0) {
-            continue;
-        }
-        const std::uint32_t cs = ov.tree->child_start[i];
-        for (std::size_t k = 0; k < kShFloats; ++k) {
-            float lo = std::numeric_limits<float>::max();
-            float hi = std::numeric_limits<float>::lowest();
-            for (std::uint32_t c = 0; c < cc; ++c) {
-                const float val = ov.shN[(cs + c) * kShFloats + k];
-                lo = std::min(lo, val);
-                hi = std::max(hi, val);
-            }
-            const float own = ov.shN[i * kShFloats + k];
-            ASSERT_GE(own, lo - 1e-4f) << "SH blend out of range at node " << i << " coeff " << k;
-            ASSERT_LE(own, hi + 1e-4f) << "SH blend out of range at node " << i << " coeff " << k;
-            max_abs_interior_sh = std::max(max_abs_interior_sh, std::abs(own));
-        }
-    }
-    EXPECT_GT(max_abs_interior_sh, 1e-3f) << "interior SH must not collapse to zero";
+    check_sh_convexity(ov);
 }
 
-TEST(OctreeLod, SmallInputs) {
-    for (const std::size_t count : {std::size_t{1}, std::size_t{2}, std::size_t{7},
-                                    std::size_t{9}, std::size_t{100}}) {
-        const SplatData input = make_synthetic_input(count);
-        auto octree = lfs::core::build_octree_lod(input);
-        ASSERT_TRUE(octree.has_value()) << octree.error();
+// The hybrid default stitches a similarity-ordered bhatt top onto the
+// octree-built binary bottom. The seam where bhatt leaves hand over to the
+// octree representatives is the risky boundary: child ranges are rebased
+// across two builders, so contiguity, parent-before-child level order, and
+// per-node integrated-alpha conservation are asserted over the whole tree --
+// a wrong rebase at the seam breaks the child sums of the bhatt parents
+// directly above it.
+TEST(OctreeLod, HybridStitchedTreeInvariants) {
+    struct Config {
+        std::size_t splats;
+        std::uint32_t top_nodes;
+    };
+    for (const Config cfg : {Config{50'000, 4'096}, Config{50'000, 32'768},
+                             Config{20'000, 64}, Config{10'000, 1u << 20}}) {
+        SCOPED_TRACE(::testing::Message()
+                     << "splats=" << cfg.splats << " top_nodes=" << cfg.top_nodes);
+        const SplatData input = make_synthetic_input(cfg.splats);
+        lfs::core::OctreeLodBuildOptions options;
+        options.bhatt_top_nodes = cfg.top_nodes;
+        auto hybrid = lfs::core::build_octree_lod(input, options);
+        ASSERT_TRUE(hybrid.has_value()) << hybrid.error();
 
-        const TreeView v(**octree);
+        const TreeView v(**hybrid);
         std::size_t leaves = 0;
         check_structure(v, leaves);
+        check_level_order(v);
         if (::testing::Test::HasFatalFailure()) {
             return;
         }
-        EXPECT_EQ(leaves, count) << "count=" << count;
-        if (count == 1) {
-            EXPECT_EQ(v.n, 1u);
-        } else {
-            check_alpha_conservation(v);
+        EXPECT_EQ(leaves, cfg.splats);
+        EXPECT_EQ(sorted_leaf_positions(v), sorted_input_positions(input));
+        check_alpha_conservation(v);
+        check_sh_convexity(v);
+        if (::testing::Test::HasFatalFailure()) {
+            return;
+        }
+
+        // The bhatt top prunes, so the stitched tree is smaller than the
+        // strict binary 2n - 1 the pure octree emits.
+        EXPECT_LT(v.n, 2 * cfg.splats - 1);
+
+        // Seam decomposition: the leaves must hang under at most top_nodes
+        // maximal all-binary subtrees (the octree bottom), and at least one
+        // interior node above them must be non-binary (the pruned bhatt top).
+        std::vector<std::uint32_t> parent(v.n, std::numeric_limits<std::uint32_t>::max());
+        for (std::size_t i = 0; i < v.n; ++i) {
+            const std::uint32_t cs = v.tree->child_start[i];
+            for (std::uint32_t c = 0; c < v.tree->child_count[i]; ++c) {
+                parent[cs + c] = static_cast<std::uint32_t>(i);
+            }
+        }
+        std::vector<std::uint8_t> pure_binary(v.n, 0);
+        for (std::size_t i = v.n; i-- > 0;) {
+            const std::uint32_t cc = v.tree->child_count[i];
+            const std::uint32_t cs = v.tree->child_start[i];
+            if (cc == 0) {
+                pure_binary[i] = 1;
+            } else if (cc == 2) {
+                pure_binary[i] = pure_binary[cs] && pure_binary[cs + 1];
+            }
+        }
+        std::size_t maximal_binary_roots = 0;
+        std::size_t top_interior = 0;
+        for (std::size_t i = 0; i < v.n; ++i) {
+            if (pure_binary[i] && (i == 0 || !pure_binary[parent[i]])) {
+                ++maximal_binary_roots;
+            }
+            if (v.tree->child_count[i] > 0 && !pure_binary[i]) {
+                ++top_interior;
+            }
+        }
+        EXPECT_LE(maximal_binary_roots, cfg.top_nodes);
+        EXPECT_GE(top_interior, 1u);
+    }
+}
+
+TEST(OctreeLod, SmallInputs) {
+    lfs::core::OctreeLodBuildOptions pure_octree;
+    pure_octree.bhatt_top_nodes = 0;
+    for (const auto& options : {lfs::core::OctreeLodBuildOptions{}, pure_octree}) {
+        for (const std::size_t count : {std::size_t{1}, std::size_t{2}, std::size_t{7},
+                                        std::size_t{9}, std::size_t{100}}) {
+            SCOPED_TRACE(::testing::Message() << "count=" << count
+                                              << " top_nodes=" << options.bhatt_top_nodes);
+            const SplatData input = make_synthetic_input(count);
+            auto octree = lfs::core::build_octree_lod(input, options);
+            ASSERT_TRUE(octree.has_value()) << octree.error();
+
+            const TreeView v(**octree);
+            std::size_t leaves = 0;
+            check_structure(v, leaves);
+            if (::testing::Test::HasFatalFailure()) {
+                return;
+            }
+            EXPECT_EQ(leaves, count);
+            if (count == 1) {
+                EXPECT_EQ(v.n, 1u);
+            } else {
+                check_alpha_conservation(v);
+            }
         }
     }
 }
@@ -334,7 +434,9 @@ TEST(OctreeLod, IdenticalPositionsStayBounded) {
         Tensor::from_vector(opacity, {kSplats, 1}, Device::CPU),
         1.0f);
 
-    auto octree = lfs::core::build_octree_lod(input);
+    lfs::core::OctreeLodBuildOptions pure_octree;
+    pure_octree.bhatt_top_nodes = 0;
+    auto octree = lfs::core::build_octree_lod(input, pure_octree);
     ASSERT_TRUE(octree.has_value()) << octree.error();
     const TreeView v(**octree);
     std::size_t leaves = 0;
@@ -349,4 +451,17 @@ TEST(OctreeLod, IdenticalPositionsStayBounded) {
         max_children = std::max(max_children, v.tree->child_count[i]);
     }
     EXPECT_EQ(max_children, 2);
+
+    // The hybrid default routes identical positions through the bhatt top
+    // (n below the budget); the degenerate input must stay bounded there too.
+    auto hybrid = lfs::core::build_octree_lod(input);
+    ASSERT_TRUE(hybrid.has_value()) << hybrid.error();
+    const TreeView hv(**hybrid);
+    std::size_t hybrid_leaves = 0;
+    check_structure(hv, hybrid_leaves);
+    if (::testing::Test::HasFatalFailure()) {
+        return;
+    }
+    EXPECT_EQ(hybrid_leaves, kSplats);
+    check_alpha_conservation(hv);
 }

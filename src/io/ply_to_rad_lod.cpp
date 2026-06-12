@@ -1492,6 +1492,8 @@ namespace lfs::io {
                         if (options.builder == LodBuilder::kOctree) {
                             lfs::core::OctreeLodBuildOptions octree_options;
                             octree_options.leaf_group_splats = options.octree_leaf_splats;
+                            octree_options.bhatt_top_nodes = options.octree_bhatt_top_nodes;
+                            octree_options.bhatt_lod_base = options.lod_base;
                             lod_result = lfs::core::build_octree_lod(bucket_input, octree_options);
                         } else {
                             lfs::core::BhattLodBuildOptions lod_options;

@@ -1041,7 +1041,7 @@ namespace {
         ::args::ValueFlag<std::string> format(parser, "format", "Output format: ply, sog, spz, html, usd, usda, usdc, rad", {'f', "format"});
         ::args::ValueFlag<int> sog_iter(parser, "iterations", "K-means iterations for SOG (default: 10)", {"sog-iterations"});
         ::args::ValueFlag<std::string> tiles(parser, "AxB", "Replicate a PLY source across an AxB ground-plane grid (RAD output only)", {"tiles"});
-        ::args::ValueFlag<std::string> lod_builder(parser, "builder", "PLY->RAD LOD tree builder: bhatt (default) or octree (faster, quality not yet validated)", {"lod-builder"});
+        ::args::ValueFlag<std::string> lod_builder(parser, "builder", "PLY->RAD LOD tree builder: bhatt (default) or octree (hybrid: octree fine levels + similarity-ordered bhatt top, much faster)", {"lod-builder"});
         ::args::Flag overwrite(parser, "overwrite", "Overwrite existing files without prompting", {'y', "overwrite"});
 
         std::vector<std::string> args_vec(argv + 1, argv + argc);
