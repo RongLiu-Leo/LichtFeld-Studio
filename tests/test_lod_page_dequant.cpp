@@ -24,7 +24,6 @@
 #include <cuda_runtime.h>
 #include <filesystem>
 #include <fstream>
-#include <limits>
 #include <random>
 #include <set>
 #include <span>
@@ -509,62 +508,6 @@ namespace {
         std::printf("sink CPU cost over %zu chunks: full decode %.3f ms/chunk "
                     "(%.0f chunks/s/core), packed %.3f ms/chunk (%.0f chunks/s/core)\n",
                     n, full_ms, 1000.0 / full_ms, packed_ms, 1000.0 / packed_ms);
-    }
-
-    // Codec-bound decode throughput: the packed decode is ~pure decompression
-    // plus plane staging, so this isolates what the chunk codec contributes to
-    // the streaming fill rate. LFS_RAD_BENCH_FILE=<file.rad> with a sidecar.
-    TEST(LodPageDequant, PackedDecodeThroughputBenchmark) {
-        const char* const bench = std::getenv("LFS_RAD_BENCH_FILE");
-        if (bench == nullptr) {
-            GTEST_SKIP() << "set LFS_RAD_BENCH_FILE to run";
-        }
-        const std::filesystem::path rad_path(bench);
-        auto loaded = lfs::io::load_rad(rad_path);
-        ASSERT_TRUE(loaded.has_value()) << loaded.error();
-        ASSERT_TRUE(loaded->lod_tree && loaded->lod_tree->rad_source.valid());
-        const auto& source = loaded->lod_tree->rad_source;
-        auto view = lfs::io::open_rad_meta_sidecar(rad_path);
-        ASSERT_TRUE(view.has_value()) << view.error();
-        const bool lod_opacity = loaded->lod_tree->lod_opacity_encoded;
-        const int max_sh = loaded->get_max_sh_degree();
-
-        const std::size_t n = std::min<std::size_t>(source.chunks.size(), 256);
-        std::ifstream in(rad_path, std::ios::binary);
-        std::vector<std::vector<std::uint8_t>> raw(n);
-        std::size_t file_bytes = 0;
-        std::size_t splats = 0;
-        for (std::size_t c = 0; c < n; ++c) {
-            raw[c].resize(source.chunks[c].file_bytes);
-            in.seekg(static_cast<std::streamoff>(source.chunks[c].file_offset), std::ios::beg);
-            in.read(reinterpret_cast<char*>(raw[c].data()),
-                    static_cast<std::streamsize>(raw[c].size()));
-            ASSERT_TRUE(in.good());
-            file_bytes += raw[c].size();
-            splats += source.chunks[c].count;
-        }
-
-        std::vector<std::uint8_t> slot(64u << 20);
-        double best_ms = std::numeric_limits<double>::max();
-        for (int rep = 0; rep < 5; ++rep) {
-            const auto t0 = std::chrono::steady_clock::now();
-            for (std::size_t c = 0; c < n; ++c) {
-                auto desc = lfs::io::decode_rad_chunk_packed(
-                    std::span<const std::uint8_t>(raw[c]), max_sh, lod_opacity, kPage,
-                    *view, static_cast<std::uint32_t>(c), std::span<std::uint8_t>(slot));
-                ASSERT_TRUE(desc.has_value()) << desc.error();
-            }
-            const auto t1 = std::chrono::steady_clock::now();
-            best_ms = std::min(
-                best_ms, std::chrono::duration<double, std::milli>(t1 - t0).count());
-        }
-        std::printf("packed decode over %zu chunks (%.1f MB on disk, %zu splats): "
-                    "%.3f ms/chunk, %.0f chunks/s/core, %.0f MB/s, %.1f Msplat/s\n",
-                    n, file_bytes / 1048576.0, splats,
-                    best_ms / static_cast<double>(n),
-                    1000.0 * static_cast<double>(n) / best_ms,
-                    file_bytes / 1048576.0 / (best_ms / 1000.0),
-                    static_cast<double>(splats) / 1000.0 / best_ms);
     }
 
 } // namespace
