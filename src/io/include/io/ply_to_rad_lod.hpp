@@ -47,7 +47,7 @@ namespace lfs::io {
         // 0 = derive from available memory.
         std::size_t max_concurrent_buckets = 0;
         float lod_base = 1.25f;
-        int compression_level = 3;
+        int compression_level = 6;
         LodBuilder builder = LodBuilder::kBhatt;
         // kOctree only: splats per octree leaf group before binary pairing
         // takes over (OctreeLodBuildOptions::leaf_group_splats, clamped to

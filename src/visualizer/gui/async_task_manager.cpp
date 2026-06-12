@@ -1107,7 +1107,7 @@ namespace lfs::vis::gui {
                         case ExportFormat::RAD: {
                             const lfs::io::RadSaveOptions options{
                                 .output_path = path,
-                                .compression_level = 3,
+                                .compression_level = 6,
                                 .flip_y = rad_flip_y,
                                 .progress_callback = update_progress};
                             if (auto result = lfs::io::save_rad(*splat_data, options); result) {
