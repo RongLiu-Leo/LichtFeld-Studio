@@ -1132,9 +1132,15 @@ struct Uniforms {
     // HiGS raster/compose wave window start (batch index); occupies what was
     // implicit alignment padding before dist_coeffs, so the layout is unchanged.
     uint wave_base;
-    // Splats per LOD pool page (quant-pool projection: page = g_idx / this);
-    // occupies the former higs_pad0 padding slot.
+    // Splats per LOD pool page (quant-pool projection: page = g_idx / this).
     uint lod_page_splats;
+    // 0 = median depth; > 0 = alpha-weighted (expected) depth, far bound = value.
+    float expected_far;
+    // Explicit padding to keep dist_coeffs 16-byte aligned; mirrors the C++
+    // struct exactly (192 bytes total).
+    uint uniforms_pad0;
+    uint uniforms_pad1;
+    uint uniforms_pad2;
     float4 dist_coeffs;
     float4x4 world_view_transform;
 }

@@ -35,10 +35,21 @@ PACK_STRUCT(struct VulkanGSRendererUniforms {
     uint32_t wave_base;
     // Splats per LOD pool page for the quant-pool projection variants.
     uint32_t lod_page_splats;
+    // 0 = median depth; > 0 = alpha-weighted (expected, hole-free) depth, with
+    // this value as the far bound (splats beyond it are model junk that 3DGUT
+    // projects onto sky pixels — excluded so they can't pollute the average).
+    // Honored by the per-pixel rasterizer (alphablend_shader) regardless of backend.
+    float expected_far;
+    // Explicit padding: dist_coeffs is a float4 on the shader side and must
+    // sit on a 16-byte boundary; both layouts pad here by hand so C++ and
+    // Slang can never silently disagree.
+    uint32_t uniforms_pad0;
+    uint32_t uniforms_pad1;
+    uint32_t uniforms_pad2;
     float dist_coeffs[4];
     float world_view_transform[16];
 });
-static_assert(sizeof(VulkanGSRendererUniforms) == 176);
+static_assert(sizeof(VulkanGSRendererUniforms) == 192);
 
 PACK_STRUCT(struct VulkanGSLodCompactUniforms {
     uint32_t chunk_count;
@@ -269,6 +280,12 @@ public:
                                  const _VulkanBuffer& model_transforms,
                                  bool use_gut_rasterization = false,
                                  bool overlays_active = true);
+    // When set, forward forces the non-batched per-pixel rasterizer: the
+    // load-balanced batched compose only covers a subset of pixels, leaving the
+    // rest with shared-buffer residue, which corrupts a one-shot depth readback.
+    // (Whether that rasterizer writes median or expected depth is carried per
+    // render by VulkanGSRendererUniforms::expected_far.)
+    void setDepthCapture(bool on) { depth_capture_ = on; }
     void executeSelectionMask(const VulkanGSSelectionMaskUniforms& uniforms,
                               VulkanGSPipelineBuffers& buffers,
                               const _VulkanBuffer& transform_indices,
@@ -399,6 +416,7 @@ protected:
     _ComputePipelinePair pipeline_rasterize_forward_batches_plain = _ComputePipelinePair(7);
     _ComputePipeline pipeline_compose_tile_batches = _ComputePipeline(17);
     _ComputePipeline pipeline_compose_tile_batches_plain = _ComputePipeline(12);
+    bool depth_capture_ = false;
     struct _CumsumComputePipeline {
         _ComputePipeline single_pass = _ComputePipeline(2);
         _ComputePipeline block_scan = _ComputePipeline(3);

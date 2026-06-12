@@ -135,6 +135,23 @@ namespace lfs::vis {
         [[nodiscard]] std::expected<std::shared_ptr<lfs::core::Tensor>, std::string> readOutputImageRgba8(
             VulkanContext& context,
             OutputSlot output_slot = OutputSlot::Main) const;
+        // Reads the most recent render's raw per-pixel linear depth (the
+        // final_pixel_depth buffer every chain writes) into an [H,W] CPU float32
+        // tensor. Valid only directly after a render into this slot, before the
+        // next render reuses the pixel_depth scratch.
+        [[nodiscard]] std::expected<std::shared_ptr<lfs::core::Tensor>, std::string> readPreviewDepth(
+            VulkanContext& context,
+            OutputSlot output_slot = OutputSlot::Preview) const;
+        // Forces the non-batched per-pixel rasterizer chain (not the macro-tile
+        // HiGS chain, whose depth is one median per macro-tile, nor the batched
+        // compose, which covers only a subset of pixels) so readPreviewDepth gets
+        // full per-pixel depth. When `expected` is set, that rasterizer writes
+        // alpha-weighted (expected) depth instead of the median — hole-free in
+        // low-opacity regions. Set only around a depth-capture render.
+        void setDepthCaptureMode(bool on, bool expected = false) {
+            depth_capture_mode_ = on;
+            depth_capture_expected_ = on && expected;
+        }
         [[nodiscard]] std::expected<void, std::string> readOutputImageIntoCpuHwc(
             VulkanContext& context,
             OutputSlot output_slot,
@@ -498,6 +515,11 @@ namespace lfs::vis {
         std::array<std::uint64_t, kOutputSlotCount> output_generations_{};
         VkSemaphore render_complete_timeline_ = VK_NULL_HANDLE;
         std::uint64_t render_complete_value_ = 0;
+        // When set, render() takes the legacy per-pixel chain so the depth
+        // readback captures per-pixel depth (see setDepthCaptureMode).
+        bool depth_capture_mode_ = false;
+        // When set, the capture rasterizer writes expected (alpha-weighted) depth.
+        bool depth_capture_expected_ = false;
         std::array<std::uint64_t, kFrameRingSize> ring_completion_values_{};
         std::size_t next_ring_slot_ = 0;
         // Whether the last main render used the macro-tile chain; the

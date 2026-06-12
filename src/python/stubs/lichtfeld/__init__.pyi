@@ -1253,7 +1253,7 @@ def export_viewport_image(path: str, format: str = '', width: int = 0, height: i
         Dict with path, width, height, channels, format, and transparent.
     """
 
-def render_view(rotation: Tensor, translation: Tensor, width: int, height: int, fov: float = 60.0, bg_color: Tensor | None = None) -> Tensor | None:
+def render_view(rotation: Tensor, translation: Tensor, width: int, height: int, fov: float = 60.0, bg_color: Tensor | None = None, with_depth: bool = False, depth_mode: str = 'median') -> object:
     """
     Render scene from arbitrary camera parameters.
 
@@ -1264,9 +1264,14 @@ def render_view(rotation: Tensor, translation: Tensor, width: int, height: int, 
         height: Render height in pixels
         fov: Vertical field of view in degrees (default: 60)
         bg_color: Accepted for compatibility; the Vulkan preview path uses current render settings
+        with_depth: If True, also return the per-pixel linear depth from the same render
+        depth_mode: "median" (default) = depth at 50% transmittance (sharp, undefined where
+            coverage < 50%); "expected" = alpha-weighted depth (dense/hole-free, softer at edges)
 
     Returns:
-        CPU Tensor [H, W, 3] RGB image, or None if no active visualizer scene is available
+        with_depth=False: CPU Tensor [H, W, 3] RGB image
+        with_depth=True: tuple (image [H, W, 3], depth [H, W]) of CPU float tensors
+        or None if no active visualizer scene is available
     """
 
 def render_view_u8(rotation: Tensor, translation: Tensor, width: int, height: int, fov: float = 60.0, bg_color: Tensor | None = None, orthographic: bool | None = None, ortho_scale: float | None = None) -> Tensor | None:

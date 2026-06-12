@@ -1149,6 +1149,7 @@ void VulkanGSRenderer::executeRasterizeForward(
     const size_t num_tiles = static_cast<size_t>(uniforms.grid_height) * uniforms.grid_width;
     const bool use_batched_raster =
         !use_gut_rasterization &&
+        !depth_capture_ &&
         num_tiles > 0 &&
         buffers.num_indices >= kMinLoadBalancedRasterInstances &&
         buffers.num_indices / num_tiles >= kMinLoadBalancedAverageTileInstances;

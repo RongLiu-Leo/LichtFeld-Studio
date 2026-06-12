@@ -143,6 +143,21 @@ namespace lfs::vis {
                                                                   std::optional<glm::vec3> background_color_override = std::nullopt,
                                                                   std::optional<bool> orthographic_override = std::nullopt,
                                                                   std::optional<float> ortho_scale_override = std::nullopt);
+
+        // Image + raw per-pixel linear depth from the same viewport (inference)
+        // render — both EWA and 3DGUT chains write the depth. image is [H,W,3]
+        // and depth is [H,W], both CPU float32; either is null on failure.
+        struct PreviewRgbd {
+            std::shared_ptr<lfs::core::Tensor> image;
+            std::shared_ptr<lfs::core::Tensor> depth;
+        };
+        PreviewRgbd renderPreviewImageAndDepth(SceneManager* scene_manager,
+                                               const glm::mat3& camera_rotation,
+                                               const glm::vec3& camera_position,
+                                               float focal_length_mm,
+                                               int width, int height,
+                                               bool expected_depth = false,
+                                               std::optional<glm::vec3> background_color_override = std::nullopt);
         std::shared_ptr<lfs::core::Tensor> renderPreviewImageRgba8(SceneManager* scene_manager,
                                                                    const glm::mat3& camera_rotation,
                                                                    const glm::vec3& camera_position,

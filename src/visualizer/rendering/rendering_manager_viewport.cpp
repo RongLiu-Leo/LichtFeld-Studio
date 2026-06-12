@@ -374,6 +374,86 @@ namespace lfs::vis {
             PreviewImageReadback::FloatRgb);
     }
 
+    RenderingManager::PreviewRgbd RenderingManager::renderPreviewImageAndDepth(
+        SceneManager* const scene_manager,
+        const glm::mat3& rotation,
+        const glm::vec3& position,
+        const float focal_length_mm,
+        const int width,
+        const int height,
+        const bool expected_depth,
+        std::optional<glm::vec3> background_color_override) {
+        PreviewRgbd result{};
+        if (width <= 0 || height <= 0) {
+            return result;
+        }
+        auto render_lock = acquireLiveModelRenderLock(scene_manager);
+        auto render_state = scene_manager ? scene_manager->buildRenderState() : SceneRenderState{};
+        const auto* const model = render_state.combined_model;
+        if (!hasRenderableGaussians(model)) {
+            return result;
+        }
+        if (previewRenderNeedsTiling(width, height)) {
+            // Depth comes from the single per-frame pixel_depth scratch; a tiled
+            // render would need per-tile depth assembly, which isn't wired yet.
+            LOG_WARN("render_view depth unavailable for tiled preview size {}x{}", width, height);
+            return result;
+        }
+
+        // The macro-tile (HiGS) chain only yields per-macro-tile median depth;
+        // force the legacy per-pixel chain for the depth-capture render so the
+        // readback matches the image resolution.
+        if (!vksplat_viewport_renderer_) {
+            vksplat_viewport_renderer_ = std::make_unique<VksplatViewportRenderer>();
+        }
+        vksplat_viewport_renderer_->setDepthCaptureMode(true, expected_depth);
+        struct DepthCaptureModeGuard {
+            VksplatViewportRenderer* renderer;
+            ~DepthCaptureModeGuard() { renderer->setDepthCaptureMode(false); }
+        } depth_capture_guard{vksplat_viewport_renderer_.get()};
+
+        auto rendered = renderPreviewImageToPreviewSlotWithState(
+            scene_manager,
+            *model,
+            std::move(render_state),
+            rotation,
+            position,
+            focal_length_mm,
+            width,
+            height,
+            render_lock.has_value(),
+            std::nullopt,
+            {},
+            {},
+            std::nullopt,
+            std::nullopt,
+            background_color_override,
+            std::nullopt);
+        if (!rendered) {
+            LOG_ERROR("Gaussian preview rgbd render failed: {}", rendered.error());
+            return result;
+        }
+
+        // image and depth are read from the same render: the Preview output slot
+        // and the pixel_depth scratch it just wrote (still resident — the Preview
+        // path uses private scratch, which render() does not release).
+        auto image = vksplat_viewport_renderer_->readOutputImage(
+            *last_vulkan_context_, VksplatViewportRenderer::OutputSlot::Preview);
+        if (!image) {
+            LOG_ERROR("Gaussian preview rgbd image readback failed: {}", image.error());
+            return result;
+        }
+        auto depth = vksplat_viewport_renderer_->readPreviewDepth(
+            *last_vulkan_context_, VksplatViewportRenderer::OutputSlot::Preview);
+        if (!depth) {
+            LOG_ERROR("Gaussian preview depth readback failed: {}", depth.error());
+            return result;
+        }
+        result.image = std::move(*image);
+        result.depth = std::move(*depth);
+        return result;
+    }
+
     std::shared_ptr<lfs::core::Tensor> RenderingManager::renderPreviewImageRgb8(SceneManager* const scene_manager,
                                                                                 const glm::mat3& rotation,
                                                                                 const glm::vec3& position,

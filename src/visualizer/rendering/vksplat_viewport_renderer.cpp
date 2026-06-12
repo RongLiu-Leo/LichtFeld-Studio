@@ -4863,6 +4863,145 @@ namespace lfs::vis {
         return std::make_shared<lfs::core::Tensor>(std::move(tensor));
     }
 
+    std::expected<std::shared_ptr<lfs::core::Tensor>, std::string>
+    VksplatViewportRenderer::readPreviewDepth(VulkanContext& context, const OutputSlot output_slot) const {
+        const auto size = latestOutputImageSize(output_slot);
+        if (!size) {
+            return std::unexpected(size.error());
+        }
+
+        std::lock_guard<std::mutex> readback_lock(readback_mutex_);
+        if (!context_) {
+            return std::unexpected("VkSplat depth readback requested before renderer initialization");
+        }
+        if (&context != context_) {
+            return std::unexpected("VkSplat depth readback received a different Vulkan context");
+        }
+        // The render batch signals completion through a timeline semaphore, not a
+        // blocking fence; wait for it (and any in-flight frames) so the copy reads
+        // the depth this render wrote rather than a previous frame's residue.
+        try {
+            const_cast<VulkanGSRenderer&>(renderer_).waitForPendingBatch();
+        } catch (const std::exception& e) {
+            return std::unexpected(std::format("VkSplat depth readback pending-batch wait failed: {}", e.what()));
+        }
+        if (!context.waitForSubmittedFrames()) {
+            return std::unexpected(context.lastError());
+        }
+
+        const auto& depth_buffer = buffers_.pixel_depth.deviceBuffer;
+        const std::size_t pixel_count =
+            static_cast<std::size_t>(size->x) * static_cast<std::size_t>(size->y);
+        const VkDeviceSize byte_count = static_cast<VkDeviceSize>(pixel_count) * sizeof(float);
+        if (byte_count == 0 || depth_buffer.buffer == VK_NULL_HANDLE || depth_buffer.size < byte_count) {
+            return std::unexpected("VkSplat depth readback: pixel_depth buffer is unavailable for this slot");
+        }
+
+        ScopedStagingBuffer staging{};
+        staging.allocator = context.allocator();
+        VkBufferCreateInfo buffer_info{};
+        buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        buffer_info.size = byte_count;
+        buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        VmaAllocationCreateInfo alloc_info{};
+        alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+        alloc_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        VkResult result = vmaCreateBuffer(
+            staging.allocator, &buffer_info, &alloc_info,
+            &staging.buffer, &staging.allocation, &staging.allocation_info);
+        if (result != VK_SUCCESS || staging.buffer == VK_NULL_HANDLE) {
+            return std::unexpected(vkError("vmaCreateBuffer(VkSplat depth readback)", result));
+        }
+        staging.vram_scope = "vulkan.vksplat.depth_readback_buffer";
+        staging.vram_label = std::format("depth:{}x{}", size->x, size->y);
+        lfs::diagnostics::VramProfiler::instance().recordCurrentBytes(
+            staging.vram_scope, staging.vram_label,
+            static_cast<std::size_t>(staging.allocation_info.size));
+        if (staging.allocation_info.pMappedData == nullptr) {
+            return std::unexpected("VkSplat depth readback staging buffer is not host-mapped");
+        }
+
+        if (const auto ready = ensureReadbackContext(); !ready) {
+            return std::unexpected(ready.error());
+        }
+        const VkDevice device = context.device();
+        const VkCommandBuffer command_buffer = readback_cmd_;
+        result = vkResetCommandBuffer(command_buffer, 0);
+        if (result != VK_SUCCESS) {
+            return std::unexpected(vkError("vkResetCommandBuffer(VkSplat depth readback)", result));
+        }
+        VkCommandBufferBeginInfo begin_info{};
+        begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        result = vkBeginCommandBuffer(command_buffer, &begin_info);
+        if (result != VK_SUCCESS) {
+            return std::unexpected(vkError("vkBeginCommandBuffer(VkSplat depth readback)", result));
+        }
+
+        // pixel_depth was written by the render's compute pass, completed by the
+        // waits above; this barrier makes those writes visible to the transfer copy.
+        VkBufferMemoryBarrier depth_barrier{};
+        depth_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        depth_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        depth_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        depth_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        depth_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        depth_barrier.buffer = depth_buffer.buffer;
+        depth_barrier.offset = depth_buffer.offset;
+        depth_barrier.size = byte_count;
+        vkCmdPipelineBarrier(command_buffer,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, nullptr, 1, &depth_barrier, 0, nullptr);
+
+        VkBufferCopy copy_region{};
+        copy_region.srcOffset = depth_buffer.offset;
+        copy_region.dstOffset = 0;
+        copy_region.size = byte_count;
+        vkCmdCopyBuffer(command_buffer, depth_buffer.buffer, staging.buffer, 1, &copy_region);
+
+        result = vkEndCommandBuffer(command_buffer);
+        if (result != VK_SUCCESS) {
+            return std::unexpected(vkError("vkEndCommandBuffer(VkSplat depth readback)", result));
+        }
+        result = vkResetFences(device, 1, &readback_fence_);
+        if (result != VK_SUCCESS) {
+            return std::unexpected(vkError("vkResetFences(VkSplat depth readback)", result));
+        }
+        VkSubmitInfo submit_info{};
+        submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit_info.commandBufferCount = 1;
+        submit_info.pCommandBuffers = &command_buffer;
+        result = vkQueueSubmit(context.graphicsQueue(), 1, &submit_info, readback_fence_);
+        if (result != VK_SUCCESS) {
+            return std::unexpected(vkError("vkQueueSubmit(VkSplat depth readback)", result));
+        }
+        result = vkWaitForFences(device, 1, &readback_fence_, VK_TRUE, UINT64_MAX);
+        if (result != VK_SUCCESS) {
+            return std::unexpected(vkError("vkWaitForFences(VkSplat depth readback)", result));
+        }
+        result = vmaInvalidateAllocation(staging.allocator, staging.allocation, 0, byte_count);
+        if (result != VK_SUCCESS) {
+            return std::unexpected(vkError("vmaInvalidateAllocation(VkSplat depth readback)", result));
+        }
+
+        auto tensor = lfs::core::Tensor::empty(
+            {static_cast<std::size_t>(size->y), static_cast<std::size_t>(size->x)},
+            lfs::core::Device::CPU,
+            lfs::core::DataType::Float32);
+        if (!tensor.is_valid()) {
+            return std::unexpected("VkSplat depth readback failed to allocate CPU tensor");
+        }
+        const auto* const src = static_cast<const float*>(staging.allocation_info.pMappedData);
+        auto* const dst = tensor.ptr<float>();
+        if (src == nullptr || dst == nullptr) {
+            return std::unexpected("VkSplat depth readback has null mapped data");
+        }
+        std::memcpy(dst, src, static_cast<std::size_t>(byte_count));
+        return std::make_shared<lfs::core::Tensor>(std::move(tensor));
+    }
+
     std::expected<void, std::string> VksplatViewportRenderer::readOutputImageIntoCpuHwc(
         VulkanContext& context,
         const OutputSlot output_slot,
@@ -6449,7 +6588,15 @@ namespace lfs::vis {
         // it reads the model mid-mutation and flickers. The legacy chain's
         // synchronous readback orders the read after the writes; use it then.
         const bool higs_active =
-            !request.gut && renderer_.supportsFloat16Storage() && !synchronize_input_upload;
+            !request.gut && renderer_.supportsFloat16Storage() && !synchronize_input_upload &&
+            !depth_capture_mode_;
+        // Capture forces the non-batched per-pixel rasterizer (full pixel_depth
+        // coverage); the batched compose only writes a subset of pixels.
+        renderer_.setDepthCapture(depth_capture_mode_);
+        // Median vs. expected (alpha-weighted, hole-free) depth is a per-render
+        // uniform the selected rasterizer reads — no backend-specific pipeline. The
+        // far plane doubles as the expected-mode flag and bounds out junk far splats.
+        uniforms.expected_far = depth_capture_expected_ ? request.frame_view.far_plane : 0.0f;
         // Visible capacity follows the decaying high-water mark; until the
         // first readback lands, size at the render domain (always sufficient).
         // A clamped frame self-heals: the raw emit count grows the mark and
