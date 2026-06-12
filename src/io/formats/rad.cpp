@@ -5,6 +5,8 @@
 #include "rad.hpp"
 #include "rad_dequant_math.hpp"
 
+#include "io/cuda/rad_encode_quant.hpp"
+
 #include "core/bhatt_lod.hpp"
 #include "core/logger.hpp"
 #include "core/mapped_file.hpp"
@@ -2002,6 +2004,7 @@ namespace lfs::io {
             const uint32_t* child_start_ptr,
             bool lod_tree,
             int compression_level,
+            const cuda::RadEncodeQuantChunkOut* gpu_planes = nullptr,
             const std::function<bool(float)>& progress_callback = nullptr) {
 
             RadChunkMeta chunk_meta;
@@ -2022,9 +2025,19 @@ namespace lfs::io {
 
             // Encode center (3 components together as single property)
             {
-                // Encode all 3 components together as "center" property
-                auto encoded = PropertyEncoder::encode_center(means_ptr, 3, count, RadCenterEncoding::Auto);
-                auto compressed = rad_compress(encoded.data.data(), encoded.data.size(), compression_level);
+                EncodedProperty encoded;
+                const uint8_t* enc_data = nullptr;
+                size_t enc_size = 0;
+                if (gpu_planes != nullptr) {
+                    encoded.encoding = "f32_lebytes";
+                    enc_data = gpu_planes->center;
+                    enc_size = static_cast<size_t>(count) * 12;
+                } else {
+                    encoded = PropertyEncoder::encode_center(means_ptr, 3, count, RadCenterEncoding::Auto);
+                    enc_data = encoded.data.data();
+                    enc_size = encoded.data.size();
+                }
+                auto compressed = rad_compress(enc_data, enc_size, compression_level);
 
                 RadChunkProperty prop;
                 prop.property = PROP_CENTER;
@@ -2044,8 +2057,26 @@ namespace lfs::io {
 
             // Encode alpha
             {
-                auto encoded = PropertyEncoder::encode_alpha(opacity_ptr, count, RadAlphaEncoding::Auto, lod_tree);
-                auto compressed = rad_compress(encoded.data.data(), encoded.data.size(), compression_level);
+                EncodedProperty encoded;
+                const uint8_t* enc_data = nullptr;
+                size_t enc_size = 0;
+                if (gpu_planes != nullptr) {
+                    enc_data = gpu_planes->alpha;
+                    if (gpu_planes->alpha_f16) {
+                        encoded.encoding = "f16";
+                        enc_size = static_cast<size_t>(count) * 2;
+                    } else {
+                        encoded.encoding = "r8";
+                        encoded.min_val = gpu_planes->alpha_min;
+                        encoded.max_val = gpu_planes->alpha_max;
+                        enc_size = count;
+                    }
+                } else {
+                    encoded = PropertyEncoder::encode_alpha(opacity_ptr, count, RadAlphaEncoding::Auto, lod_tree);
+                    enc_data = encoded.data.data();
+                    enc_size = encoded.data.size();
+                }
+                auto compressed = rad_compress(enc_data, enc_size, compression_level);
 
                 RadChunkProperty prop;
                 prop.property = PROP_ALPHA;
@@ -2069,9 +2100,21 @@ namespace lfs::io {
 
             // Encode RGB (sh0) - all 3 components together as single property
             {
-                // Encode all 3 components together as "rgb" property
-                auto encoded = PropertyEncoder::encode_rgb(sh0_ptr, 3, count, RadRgbEncoding::Auto);
-                auto compressed = rad_compress(encoded.data.data(), encoded.data.size(), compression_level);
+                EncodedProperty encoded;
+                const uint8_t* enc_data = nullptr;
+                size_t enc_size = 0;
+                if (gpu_planes != nullptr) {
+                    encoded.encoding = "r8_delta";
+                    encoded.min_val = gpu_planes->rgb_min;
+                    encoded.max_val = gpu_planes->rgb_max;
+                    enc_data = gpu_planes->rgb;
+                    enc_size = static_cast<size_t>(count) * 3;
+                } else {
+                    encoded = PropertyEncoder::encode_rgb(sh0_ptr, 3, count, RadRgbEncoding::Auto);
+                    enc_data = encoded.data.data();
+                    enc_size = encoded.data.size();
+                }
+                auto compressed = rad_compress(enc_data, enc_size, compression_level);
 
                 RadChunkProperty prop;
                 prop.property = PROP_RGB;
@@ -2151,23 +2194,36 @@ namespace lfs::io {
 
             // Encode SH if present
             if (sh_coeffs > 0 && shN_ptr != nullptr) {
-                auto encode_sh_band = [&](const char* prop_name, int coeff_start, int coeff_count) {
+                auto encode_sh_band = [&](const char* prop_name, int band, int coeff_start, int coeff_count) {
                     if (sh_coeffs < coeff_start + coeff_count) {
                         return;
                     }
                     const size_t dims = static_cast<size_t>(coeff_count) * 3;
-                    tl_sh_data.resize(static_cast<size_t>(count) * dims);
-                    for (uint32_t i = 0; i < count; ++i) {
-                        for (int c = 0; c < coeff_count; ++c) {
-                            for (int ch = 0; ch < 3; ++ch) {
-                                tl_sh_data[i * dims + c * 3 + ch] =
-                                    shN_ptr[static_cast<size_t>(i) * sh_coeffs * 3 + (coeff_start + c) * 3 + ch];
+                    EncodedProperty encoded;
+                    const uint8_t* enc_data = nullptr;
+                    size_t enc_size = 0;
+                    if (gpu_planes != nullptr && gpu_planes->sh[band] != nullptr) {
+                        encoded.encoding = "s8";
+                        encoded.min_val = -gpu_planes->sh_max_abs[band];
+                        encoded.max_val = gpu_planes->sh_max_abs[band];
+                        enc_data = gpu_planes->sh[band];
+                        enc_size = static_cast<size_t>(count) * dims;
+                    } else {
+                        tl_sh_data.resize(static_cast<size_t>(count) * dims);
+                        for (uint32_t i = 0; i < count; ++i) {
+                            for (int c = 0; c < coeff_count; ++c) {
+                                for (int ch = 0; ch < 3; ++ch) {
+                                    tl_sh_data[i * dims + c * 3 + ch] =
+                                        shN_ptr[static_cast<size_t>(i) * sh_coeffs * 3 + (coeff_start + c) * 3 + ch];
+                                }
                             }
                         }
-                    }
 
-                    auto encoded = PropertyEncoder::encode_sh(tl_sh_data.data(), dims, count, RadShEncoding::Auto);
-                    auto compressed = rad_compress(encoded.data.data(), encoded.data.size(), compression_level);
+                        encoded = PropertyEncoder::encode_sh(tl_sh_data.data(), dims, count, RadShEncoding::Auto);
+                        enc_data = encoded.data.data();
+                        enc_size = encoded.data.size();
+                    }
+                    auto compressed = rad_compress(enc_data, enc_size, compression_level);
 
                     RadChunkProperty prop;
                     prop.property = prop_name;
@@ -2188,9 +2244,9 @@ namespace lfs::io {
                     chunk_meta.properties.push_back(prop);
                 };
 
-                encode_sh_band(PROP_SH1, 0, 3);
-                encode_sh_band(PROP_SH2, 3, 5);
-                encode_sh_band(PROP_SH3, 8, 7);
+                encode_sh_band(PROP_SH1, 0, 0, 3);
+                encode_sh_band(PROP_SH2, 1, 3, 5);
+                encode_sh_band(PROP_SH3, 2, 8, 7);
 
                 // Report progress after encoding SH: 0.9f
                 if (progress_callback && !progress_callback(0.9f)) {
@@ -2407,6 +2463,7 @@ namespace lfs::io {
                                 lod_tree ? packed.child_start.data() + base : nullptr,
                                 lod_tree,
                                 compression_level_,
+                                nullptr,
                                 chunk_progress_cb);
 
                             chunk_ranges[chunk_idx].base = base;
@@ -4452,6 +4509,24 @@ namespace lfs::io {
         bool emit_meta_sidecar = false;
         RadMetaInlineWriter meta_writer;
 
+        // GPU chunk quantization (bit-identical planes; DEFLATE stays on the
+        // CPU). LFS_RAD_GPU_ENCODE=0 forces the CPU encoders; any CUDA
+        // failure falls back permanently for this writer.
+        std::unique_ptr<cuda::RadEncodeGpuQuantizer> gpu_quant;
+        bool gpu_quant_resolved = false;
+
+        bool gpuQuantEnabled() {
+            if (!gpu_quant_resolved) {
+                gpu_quant_resolved = true;
+                const char* const env = std::getenv("LFS_RAD_GPU_ENCODE");
+                const bool env_off = env != nullptr && env[0] == '0';
+                if (!env_off && cuda::rad_encode_gpu_available()) {
+                    gpu_quant = std::make_unique<cuda::RadEncodeGpuQuantizer>();
+                }
+            }
+            return gpu_quant != nullptr;
+        }
+
         void dropMetaWriter(const std::string& reason) {
             LOG_WARN("RAD sidecar inline emission disabled: {}; loader rebuilds on demand", reason);
             meta_writer.abandon();
@@ -4576,6 +4651,24 @@ namespace lfs::io {
         const bool emit_meta = s.meta_writer.isOpen();
         std::vector<MetaSlice> meta(emit_meta ? chunks.size() : 0);
 
+        // Batch-quantize the pure-arithmetic planes on the GPU while the TBB
+        // workers keep the libm encoders (scales, orientation) and DEFLATE.
+        std::vector<cuda::RadEncodeQuantChunkOut> gpu_planes;
+        if (s.gpuQuantEnabled()) {
+            std::vector<cuda::RadEncodeQuantChunkIn> gpu_in(chunks.size());
+            for (std::size_t i = 0; i < chunks.size(); ++i) {
+                const auto& chunk = chunks[i];
+                gpu_in[i] = {chunk.count, chunk.means, chunk.alpha, chunk.rgb,
+                             s.sh_coeffs > 0 ? chunk.shN : nullptr};
+            }
+            gpu_planes.resize(chunks.size());
+            if (!s.gpu_quant->quantize_batch(gpu_in, s.sh_coeffs, s.lod_tree, gpu_planes)) {
+                gpu_planes.clear();
+                s.gpu_quant.reset();
+                LOG_WARN("RAD GPU encode quantization failed; using CPU encoders");
+            }
+        }
+
         std::vector<std::pair<RadChunkMeta, std::vector<uint8_t>>> encoded(chunks.size());
         tbb::parallel_for(std::size_t{0}, chunks.size(), [&](const std::size_t i) {
             const auto& chunk = chunks[i];
@@ -4593,7 +4686,8 @@ namespace lfs::io {
                 s.lod_tree ? chunk.child_count : nullptr,
                 s.lod_tree ? chunk.child_start : nullptr,
                 s.lod_tree,
-                s.compression_level);
+                s.compression_level,
+                gpu_planes.empty() ? nullptr : &gpu_planes[i]);
 
             if (!emit_meta) {
                 return;

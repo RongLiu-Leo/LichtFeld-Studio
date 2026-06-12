@@ -1671,6 +1671,7 @@ namespace lfs::io {
         if (!report(0.78f, "Writing RAD chunks")) {
             return cancelled();
         }
+        const auto t_write_start = std::chrono::high_resolution_clock::now();
 
         RadStreamWriter writer(output_path, total_nodes, layout.sh_degree, true,
                                options.compression_level, /*emit_meta_sidecar=*/true);
@@ -1815,10 +1816,13 @@ namespace lfs::io {
             return make_error(ErrorCode::WRITE_FAILURE, ok.error(), output_path);
         }
 
-        const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::high_resolution_clock::now() - t_start);
-        LOG_INFO("ply_to_rad_lod: wrote {} ({} nodes from {} splats) in {}s",
-                 lfs::core::path_to_utf8(output_path), total_nodes, total_leaves, elapsed.count());
+        const auto t_end = std::chrono::high_resolution_clock::now();
+        const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(t_end - t_start);
+        const auto write_elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_write_start);
+        LOG_INFO("ply_to_rad_lod: wrote {} ({} nodes from {} splats) in {}s (chunk encode+write {:.1f}s)",
+                 lfs::core::path_to_utf8(output_path), total_nodes, total_leaves, elapsed.count(),
+                 static_cast<double>(write_elapsed.count()) / 1000.0);
 
         if (!report(1.0f, "Conversion complete")) {
             return cancelled();
