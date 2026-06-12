@@ -22,7 +22,7 @@
 #include <tbb/blocked_range.h>
 #include <tbb/enumerable_thread_specific.h>
 #include <tbb/parallel_for.h>
-#include <zlib.h>
+#include <zstd.h>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -76,7 +76,14 @@ namespace lfs::io {
         constexpr uint32_t CHUNK_SIZE = 2048;            // Splats per chunk
         static_assert(CHUNK_SIZE == lfs::core::SplatLodTree::kChunkSplats,
                       "RAD chunk size and LOD page size are the same unit");
-        constexpr int GZ_LEVEL = 6;                   // Default gzip compression level
+        // Chosen by measurement on quantized chunk streams (synthetic SH3 set +
+        // real lubin chunks): the encode-speed knee with decode >= 2x libdeflate.
+        constexpr int ZSTD_LEVEL = 3;
+        constexpr const char* COMPRESSION_ZSTD = "zst";
+        // Hard format break: only rechunk_rad_lod may read DEFLATE chunks.
+        constexpr const char* LEGACY_DEFLATE_ERROR =
+            "RAD file uses legacy DEFLATE chunk compression; re-convert it with "
+            "the LichtFeld converter: LichtFeld-Studio convert old.rad new.rad -f rad";
         constexpr float SH_C0 = 0.28209479177387814f; // Degree-0 SH basis constant
 
         // SH coefficient count per degree: 0->0, 1->3, 2->8, 3->15
@@ -234,28 +241,42 @@ namespace lfs::io {
         // RAD Compression/Decompression
         // ============================================================================
 
-        struct TlsDeflateCompressor {
-            libdeflate_compressor* handle = nullptr;
-            int level = -1;
+        struct TlsZstdCompressor {
+            ZSTD_CCtx* handle = nullptr;
 
-            ~TlsDeflateCompressor() {
+            ~TlsZstdCompressor() {
                 if (handle != nullptr) {
-                    libdeflate_free_compressor(handle);
+                    ZSTD_freeCCtx(handle);
                 }
             }
 
-            libdeflate_compressor* get(int requested_level) {
-                if (handle == nullptr || level != requested_level) {
-                    if (handle != nullptr) {
-                        libdeflate_free_compressor(handle);
-                    }
-                    handle = libdeflate_alloc_compressor(requested_level);
-                    level = requested_level;
+            ZSTD_CCtx* get() {
+                if (handle == nullptr) {
+                    handle = ZSTD_createCCtx();
                 }
                 return handle;
             }
         };
 
+        struct TlsZstdDecompressor {
+            ZSTD_DCtx* handle = nullptr;
+
+            ~TlsZstdDecompressor() {
+                if (handle != nullptr) {
+                    ZSTD_freeDCtx(handle);
+                }
+            }
+
+            ZSTD_DCtx* get() {
+                if (handle == nullptr) {
+                    handle = ZSTD_createDCtx();
+                }
+                return handle;
+            }
+        };
+
+        // Legacy DEFLATE decode survives solely for the rad->rad migrator
+        // (rechunk_rad_lod); every other reader hard-errors on "gz" chunks.
         struct TlsDeflateDecompressor {
             libdeflate_decompressor* handle = nullptr;
 
@@ -273,196 +294,100 @@ namespace lfs::io {
             }
         };
 
-        thread_local TlsDeflateCompressor tls_compressor;
-        thread_local TlsDeflateDecompressor tls_decompressor;
+        thread_local TlsZstdCompressor tls_zstd_compressor;
+        thread_local TlsZstdDecompressor tls_zstd_decompressor;
+        thread_local TlsDeflateDecompressor tls_deflate_decompressor;
 
-        // Reference RAD writers mark compression as "gz" but emit raw DEFLATE streams
-        // (without gzip/zlib wrapper bytes).
-        std::vector<uint8_t> rad_compress_zlib(const uint8_t* data, size_t size, int level = GZ_LEVEL) {
-            if (size == 0) {
-                return {};
+        enum class RadCodec : uint8_t {
+            None,
+            Zstd,
+            LegacyDeflate,
+            Unknown,
+        };
+
+        RadCodec rad_codec_of(const std::optional<std::string>& compression) {
+            if (!compression.has_value() || *compression == "none") {
+                return RadCodec::None;
             }
-
-            z_stream strm{};
-            const int init_ret = deflateInit2(&strm, level, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY);
-            if (init_ret != Z_OK) {
-                LOG_ERROR("rad_compress: deflateInit2 failed (ret={}, level={})", init_ret, level);
-                return {};
+            if (*compression == COMPRESSION_ZSTD || *compression == "zstd") {
+                return RadCodec::Zstd;
             }
-
-            strm.next_in = const_cast<Bytef*>(data);
-            strm.avail_in = static_cast<uInt>(size);
-
-            std::vector<uint8_t> output;
-            output.reserve(deflateBound(&strm, static_cast<uLong>(size)));
-
-            const size_t chunk_size = 65536;
-            std::vector<uint8_t> chunk(chunk_size);
-            bool success = false;
-
-            while (true) {
-                strm.next_out = chunk.data();
-                strm.avail_out = static_cast<uInt>(chunk.size());
-
-                int ret = deflate(&strm, Z_FINISH);
-                if (ret != Z_OK && ret != Z_STREAM_END) {
-                    LOG_ERROR("rad_compress: deflate failed with error {}", ret);
-                    break;
-                }
-
-                size_t have = chunk.size() - strm.avail_out;
-                output.insert(output.end(), chunk.begin(), chunk.begin() + have);
-
-                if (ret == Z_STREAM_END) {
-                    success = true;
-                    break;
-                }
+            if (*compression == "gz" || *compression == "gzip") {
+                return RadCodec::LegacyDeflate;
             }
-
-            deflateEnd(&strm);
-
-            if (!success) {
-                LOG_ERROR("rad_compress: compression failed");
-                return {};
-            }
-
-            return output;
+            return RadCodec::Unknown;
         }
 
-        std::vector<uint8_t> rad_compress(const uint8_t* data, size_t size, int level = GZ_LEVEL) {
+        std::vector<uint8_t> rad_compress(const uint8_t* data, size_t size, int level = ZSTD_LEVEL) {
             if (size == 0) {
                 return {};
             }
-
-            const int effective_level = std::clamp(level == Z_DEFAULT_COMPRESSION ? GZ_LEVEL : level, 0, 9);
-            libdeflate_compressor* compressor = tls_compressor.get(effective_level);
-            if (compressor == nullptr) {
-                return rad_compress_zlib(data, size, level);
+            ZSTD_CCtx* const cctx = tls_zstd_compressor.get();
+            if (cctx == nullptr) {
+                LOG_ERROR("rad_compress: failed to allocate zstd context");
+                return {};
             }
-
-            std::vector<uint8_t> output(libdeflate_deflate_compress_bound(compressor, size));
-            const size_t written = libdeflate_deflate_compress(compressor, data, size, output.data(), output.size());
-            if (written == 0) {
-                return rad_compress_zlib(data, size, level);
+            std::vector<uint8_t> output(ZSTD_compressBound(size));
+            const size_t written = ZSTD_compressCCtx(cctx, output.data(), output.size(),
+                                                     data, size, level);
+            if (ZSTD_isError(written)) {
+                LOG_ERROR("rad_compress: zstd failed (level={}): {}", level, ZSTD_getErrorName(written));
+                return {};
             }
             output.resize(written);
             return output;
         }
 
-        std::optional<std::vector<uint8_t>> inflate_with_window_bits(const uint8_t* data, size_t size, int window_bits) {
-            z_stream strm = {};
-            strm.zalloc = Z_NULL;
-            strm.zfree = Z_NULL;
-            strm.opaque = Z_NULL;
-            strm.avail_in = static_cast<uInt>(size);
-            strm.next_in = const_cast<Bytef*>(data);
-
-            int ret = inflateInit2(&strm, window_bits);
-            if (ret != Z_OK) {
-                return std::nullopt;
-            }
-
-            std::vector<uint8_t> output;
-            const size_t chunk_size = 65536;
-            std::vector<uint8_t> chunk(chunk_size);
-            bool success = false;
-
-            do {
-                strm.avail_out = static_cast<uInt>(chunk.size());
-                strm.next_out = chunk.data();
-
-                ret = inflate(&strm, Z_NO_FLUSH);
-                if (ret == Z_STREAM_ERROR || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR) {
-                    inflateEnd(&strm);
-                    return std::nullopt;
-                }
-
-                size_t have = chunk.size() - strm.avail_out;
-                output.insert(output.end(), chunk.begin(), chunk.begin() + have);
-                if (ret == Z_STREAM_END) {
-                    success = true;
-                }
-            } while (ret != Z_STREAM_END);
-
-            inflateEnd(&strm);
-            if (!success) {
-                return std::nullopt;
-            }
-            return output;
-        }
-
-        std::vector<uint8_t> rad_decompress(const uint8_t* data, size_t size) {
-            // Match reference first.
-            if (auto raw = inflate_with_window_bits(data, size, -15)) {
-                return std::move(*raw);
-            }
-            // Backward compatibility for older local files.
-            if (auto gzip = inflate_with_window_bits(data, size, 15 + 16)) {
-                return std::move(*gzip);
-            }
-            // Accept zlib wrapper as a permissive fallback.
-            if (auto zlib = inflate_with_window_bits(data, size, 15)) {
-                return std::move(*zlib);
-            }
-            return {};
-        }
-
-        // Fast one-shot decompression when the decoded size is known from the
-        // property layout. Falls back to streaming zlib for size mismatches and
-        // wrapped/legacy streams.
-        std::vector<uint8_t> rad_decompress_sized(const uint8_t* data, size_t size, size_t expected_bytes) {
-            if (expected_bytes > 0 && size > 0) {
-                if (libdeflate_decompressor* decompressor = tls_decompressor.get()) {
-                    std::vector<uint8_t> output(expected_bytes);
-                    size_t actual = 0;
-                    if (libdeflate_deflate_decompress(decompressor, data, size,
-                                                      output.data(), output.size(), &actual) == LIBDEFLATE_SUCCESS &&
-                        actual == expected_bytes) {
-                        return output;
-                    }
-                    if (libdeflate_gzip_decompress(decompressor, data, size,
-                                                   output.data(), output.size(), &actual) == LIBDEFLATE_SUCCESS &&
-                        actual == expected_bytes) {
-                        return output;
-                    }
-                    if (libdeflate_zlib_decompress(decompressor, data, size,
-                                                   output.data(), output.size(), &actual) == LIBDEFLATE_SUCCESS &&
-                        actual == expected_bytes) {
-                        return output;
-                    }
-                }
-            }
-            return rad_decompress(data, size);
-        }
-
-        // Decompress a property stream directly into a caller buffer of the
-        // exact expected size. Streaming-profile planes always have a known
-        // decoded size; any mismatch is a hard error at the caller.
-        bool rad_decompress_into(const uint8_t* data, size_t size, uint8_t* dst, size_t expected_bytes) {
+        // Codec-keyed one-shot property decompress into a caller buffer of the
+        // exact decoded size; property layouts always imply the decoded size,
+        // so any mismatch is corruption. Legacy "gz" streams may carry raw
+        // DEFLATE, gzip, or zlib framing depending on the writer.
+        bool rad_decompress_into(const RadCodec codec, const uint8_t* data, size_t size,
+                                 uint8_t* dst, size_t expected_bytes) {
             if (expected_bytes == 0 || size == 0) {
                 return false;
             }
-            libdeflate_decompressor* const decompressor = tls_decompressor.get();
-            if (decompressor == nullptr) {
+            if (codec == RadCodec::Zstd) {
+                ZSTD_DCtx* const dctx = tls_zstd_decompressor.get();
+                if (dctx == nullptr) {
+                    return false;
+                }
+                const size_t actual = ZSTD_decompressDCtx(dctx, dst, expected_bytes, data, size);
+                return !ZSTD_isError(actual) && actual == expected_bytes;
+            }
+            if (codec == RadCodec::LegacyDeflate) {
+                libdeflate_decompressor* const decompressor = tls_deflate_decompressor.get();
+                if (decompressor == nullptr) {
+                    return false;
+                }
+                size_t actual = 0;
+                if (libdeflate_deflate_decompress(decompressor, data, size, dst, expected_bytes, &actual) ==
+                        LIBDEFLATE_SUCCESS &&
+                    actual == expected_bytes) {
+                    return true;
+                }
+                if (libdeflate_gzip_decompress(decompressor, data, size, dst, expected_bytes, &actual) ==
+                        LIBDEFLATE_SUCCESS &&
+                    actual == expected_bytes) {
+                    return true;
+                }
+                if (libdeflate_zlib_decompress(decompressor, data, size, dst, expected_bytes, &actual) ==
+                        LIBDEFLATE_SUCCESS &&
+                    actual == expected_bytes) {
+                    return true;
+                }
                 return false;
             }
-            size_t actual = 0;
-            if (libdeflate_deflate_decompress(decompressor, data, size, dst, expected_bytes, &actual) ==
-                    LIBDEFLATE_SUCCESS &&
-                actual == expected_bytes) {
-                return true;
-            }
-            if (libdeflate_gzip_decompress(decompressor, data, size, dst, expected_bytes, &actual) ==
-                    LIBDEFLATE_SUCCESS &&
-                actual == expected_bytes) {
-                return true;
-            }
-            if (libdeflate_zlib_decompress(decompressor, data, size, dst, expected_bytes, &actual) ==
-                    LIBDEFLATE_SUCCESS &&
-                actual == expected_bytes) {
-                return true;
-            }
             return false;
+        }
+
+        std::vector<uint8_t> rad_decompress_sized(const RadCodec codec, const uint8_t* data,
+                                                  size_t size, size_t expected_bytes) {
+            std::vector<uint8_t> output(expected_bytes);
+            if (!rad_decompress_into(codec, data, size, output.data(), expected_bytes)) {
+                return {};
+            }
+            return output;
         }
 
         // In-place dimension-wise prefix sum reversing r8_delta/s8_delta; the
@@ -1623,6 +1548,8 @@ namespace lfs::io {
         // Decode one chunk's properties into caller-provided buffers holding
         // display-space values. Offsets are absolute positions in `data`;
         // `chunk_origin` anchors legacy chunk-relative property offsets.
+        // allow_legacy_deflate is the migrator's (rechunk_rad_lod) read path;
+        // every other caller hard-errors on DEFLATE chunks.
         std::optional<std::string> decode_chunk_properties(
             const uint8_t* data,
             const RadChunkMeta& chunk,
@@ -1630,6 +1557,7 @@ namespace lfs::io {
             const size_t payload_start,
             const bool has_payload_prefix,
             const size_t chunk_end,
+            const bool allow_legacy_deflate,
             const int sh_coeffs,
             float* const means,
             float* const opacity,
@@ -1687,11 +1615,23 @@ namespace lfs::io {
                         return "RAD chunk property data exceeds file bounds";
                     }
 
+                    const RadCodec codec = rad_codec_of(prop.compression);
+                    if (codec == RadCodec::LegacyDeflate && !allow_legacy_deflate) {
+                        return std::string(LEGACY_DEFLATE_ERROR);
+                    }
+                    if (codec == RadCodec::Unknown) {
+                        return "Unknown RAD chunk compression '" + *prop.compression +
+                               "' for property: " + prop.property;
+                    }
+
                     std::vector<uint8_t> prop_data;
-                    if (prop.compression.has_value() &&
-                        (prop.compression.value() == "gz" || prop.compression.value() == "gzip")) {
+                    if (codec != RadCodec::None) {
                         const size_t decoded_bytes = rad_property_decoded_bytes(prop.property, prop.encoding, chunk_count);
-                        prop_data = rad_decompress_sized(&data[absolute_offset], prop_bytes, decoded_bytes);
+                        if (decoded_bytes == 0) {
+                            return "Cannot size RAD chunk property: " + prop.property +
+                                   " (" + prop.encoding + ")";
+                        }
+                        prop_data = rad_decompress_sized(codec, &data[absolute_offset], prop_bytes, decoded_bytes);
                         if (prop_data.empty()) {
                             return "Failed to decompress RAD chunk property: " + prop.property;
                         }
@@ -1941,6 +1881,7 @@ namespace lfs::io {
                                                    payload_start,
                                                    has_payload_prefix,
                                                    chunk_end,
+                                                   /*allow_legacy_deflate=*/false,
                                                    sh_coeffs,
                                                    chunk_means.data(),
                                                    chunk_opacity.data(),
@@ -2042,10 +1983,10 @@ namespace lfs::io {
                 RadChunkProperty prop;
                 prop.property = PROP_CENTER;
                 prop.encoding = encoded.encoding;
-                prop.compression = "gz";
+                prop.compression = COMPRESSION_ZSTD;
                 prop.bytes = compressed.size();
 
-                encoded_props.push_back({std::move(compressed), encoded.encoding, "gz",
+                encoded_props.push_back({std::move(compressed), encoded.encoding, COMPRESSION_ZSTD,
                                          encoded.min_val, encoded.max_val, encoded.base, encoded.scale});
                 chunk_meta.properties.push_back(prop);
 
@@ -2081,14 +2022,14 @@ namespace lfs::io {
                 RadChunkProperty prop;
                 prop.property = PROP_ALPHA;
                 prop.encoding = encoded.encoding;
-                prop.compression = "gz";
+                prop.compression = COMPRESSION_ZSTD;
                 prop.bytes = compressed.size();
                 if (encoded.min_val.has_value())
                     prop.min_val = encoded.min_val.value();
                 if (encoded.max_val.has_value())
                     prop.max_val = encoded.max_val.value();
 
-                encoded_props.push_back({std::move(compressed), encoded.encoding, "gz",
+                encoded_props.push_back({std::move(compressed), encoded.encoding, COMPRESSION_ZSTD,
                                          encoded.min_val, encoded.max_val, encoded.base, encoded.scale});
                 chunk_meta.properties.push_back(prop);
 
@@ -2119,7 +2060,7 @@ namespace lfs::io {
                 RadChunkProperty prop;
                 prop.property = PROP_RGB;
                 prop.encoding = encoded.encoding;
-                prop.compression = "gz";
+                prop.compression = COMPRESSION_ZSTD;
                 prop.bytes = compressed.size();
                 if (encoded.min_val.has_value())
                     prop.min_val = encoded.min_val.value();
@@ -2130,7 +2071,7 @@ namespace lfs::io {
                 if (encoded.scale.has_value())
                     prop.scale = encoded.scale.value();
 
-                encoded_props.push_back({std::move(compressed), encoded.encoding, "gz",
+                encoded_props.push_back({std::move(compressed), encoded.encoding, COMPRESSION_ZSTD,
                                          encoded.min_val, encoded.max_val, encoded.base, encoded.scale});
                 chunk_meta.properties.push_back(prop);
 
@@ -2149,7 +2090,7 @@ namespace lfs::io {
                 RadChunkProperty prop;
                 prop.property = PROP_SCALES;
                 prop.encoding = encoded.encoding;
-                prop.compression = "gz";
+                prop.compression = COMPRESSION_ZSTD;
                 prop.bytes = compressed.size();
                 if (encoded.min_val.has_value())
                     prop.min_val = encoded.min_val.value();
@@ -2158,7 +2099,7 @@ namespace lfs::io {
                 if (encoded.scale.has_value())
                     prop.scale = encoded.scale.value();
 
-                encoded_props.push_back({std::move(compressed), encoded.encoding, "gz",
+                encoded_props.push_back({std::move(compressed), encoded.encoding, COMPRESSION_ZSTD,
                                          encoded.min_val, encoded.max_val, encoded.base, encoded.scale});
                 chunk_meta.properties.push_back(prop);
 
@@ -2179,10 +2120,10 @@ namespace lfs::io {
                 RadChunkProperty prop;
                 prop.property = PROP_ORIENTATION;
                 prop.encoding = encoded.encoding;
-                prop.compression = "gz";
+                prop.compression = COMPRESSION_ZSTD;
                 prop.bytes = compressed.size();
 
-                encoded_props.push_back({std::move(compressed), encoded.encoding, "gz",
+                encoded_props.push_back({std::move(compressed), encoded.encoding, COMPRESSION_ZSTD,
                                          encoded.min_val, encoded.max_val, encoded.base, encoded.scale});
                 chunk_meta.properties.push_back(prop);
 
@@ -2228,7 +2169,7 @@ namespace lfs::io {
                     RadChunkProperty prop;
                     prop.property = prop_name;
                     prop.encoding = encoded.encoding;
-                    prop.compression = "gz";
+                    prop.compression = COMPRESSION_ZSTD;
                     prop.bytes = compressed.size();
                     if (encoded.min_val.has_value())
                         prop.min_val = encoded.min_val.value();
@@ -2239,7 +2180,7 @@ namespace lfs::io {
                     if (encoded.scale.has_value())
                         prop.scale = encoded.scale.value();
 
-                    encoded_props.push_back({std::move(compressed), encoded.encoding, "gz",
+                    encoded_props.push_back({std::move(compressed), encoded.encoding, COMPRESSION_ZSTD,
                                              encoded.min_val, encoded.max_val, encoded.base, encoded.scale});
                     chunk_meta.properties.push_back(prop);
                 };
@@ -2265,10 +2206,10 @@ namespace lfs::io {
                 RadChunkProperty count_prop;
                 count_prop.property = PROP_CHILD_COUNT;
                 count_prop.encoding = "u16";
-                count_prop.compression = "gz";
+                count_prop.compression = COMPRESSION_ZSTD;
                 count_prop.bytes = child_count_compressed.size();
 
-                encoded_props.push_back({std::move(child_count_compressed), "u16", "gz",
+                encoded_props.push_back({std::move(child_count_compressed), "u16", COMPRESSION_ZSTD,
                                          std::nullopt, std::nullopt, std::nullopt, std::nullopt});
                 chunk_meta.properties.push_back(count_prop);
 
@@ -2282,10 +2223,10 @@ namespace lfs::io {
                 RadChunkProperty start_prop;
                 start_prop.property = PROP_CHILD_START;
                 start_prop.encoding = "u32";
-                start_prop.compression = "gz";
+                start_prop.compression = COMPRESSION_ZSTD;
                 start_prop.bytes = child_start_compressed.size();
 
-                encoded_props.push_back({std::move(child_start_compressed), "u32", "gz",
+                encoded_props.push_back({std::move(child_start_compressed), "u32", COMPRESSION_ZSTD,
                                          std::nullopt, std::nullopt, std::nullopt, std::nullopt});
                 chunk_meta.properties.push_back(start_prop);
 
@@ -2346,7 +2287,7 @@ namespace lfs::io {
 
         class RadEncoder {
         public:
-            explicit RadEncoder(int compression_level = GZ_LEVEL,
+            explicit RadEncoder(int compression_level = ZSTD_LEVEL,
                                 bool flip_y = false,
                                 ExportProgressCallback progress_callback = nullptr)
                 : compression_level_(compression_level),
@@ -2876,7 +2817,8 @@ namespace lfs::io {
 
                             auto err = decode_chunk_properties(
                                 data.data(), slice.meta, slice.origin, slice.payload_start,
-                                slice.has_payload_prefix, slice.chunk_end, sh_coeffs,
+                                slice.has_payload_prefix, slice.chunk_end,
+                                /*allow_legacy_deflate=*/false, sh_coeffs,
                                 means, opacity, sh0, scales, rotation, shN,
                                 has_lod_tree ? all_child_count.data() + base : nullptr,
                                 has_lod_tree ? all_child_start.data() + base : nullptr);
@@ -3589,7 +3531,8 @@ namespace lfs::io {
 
                         auto err = decode_chunk_properties(
                             scratch.raw.data(), chunk, 0, parsed->payload_start,
-                            parsed->has_payload_prefix, parsed->chunk_end, sh_coeffs,
+                            parsed->has_payload_prefix, parsed->chunk_end,
+                            /*allow_legacy_deflate=*/false, sh_coeffs,
                             means_dst, opacity_dst, sh0_dst, scales_dst, rotation_dst, shN_dst,
                             has_lod_tree && !use_view ? all_child_count.data() + base : nullptr,
                             has_lod_tree && !use_view ? all_child_start.data() + base : nullptr);
@@ -3870,6 +3813,7 @@ namespace lfs::io {
                                                parsed->payload_start,
                                                parsed->has_payload_prefix,
                                                parsed->chunk_end,
+                                               /*allow_legacy_deflate=*/false,
                                                sh_coeffs,
                                                dsts.means,
                                                dsts.opacity_raw,
@@ -4085,11 +4029,17 @@ namespace lfs::io {
             }
 
             std::uint8_t* const plane = dst.data() + *plane_offset;
-            const bool compressed =
-                prop.compression.has_value() &&
-                (prop.compression.value() == "gz" || prop.compression.value() == "gzip");
-            if (compressed) {
-                if (!rad_decompress_into(&data[absolute_offset], prop_bytes, plane, plane_bytes)) {
+            const RadCodec codec = rad_codec_of(prop.compression);
+            if (codec == RadCodec::LegacyDeflate) {
+                return std::unexpected(std::string(LEGACY_DEFLATE_ERROR));
+            }
+            if (codec == RadCodec::Unknown) {
+                return std::unexpected(std::format(
+                    "Unknown RAD chunk compression '{}' for property: {}",
+                    *prop.compression, prop.property));
+            }
+            if (codec == RadCodec::Zstd) {
+                if (!rad_decompress_into(codec, &data[absolute_offset], prop_bytes, plane, plane_bytes)) {
                     return std::unexpected(std::format(
                         "Failed to decompress RAD chunk property: {}", prop.property));
                 }
@@ -4222,11 +4172,10 @@ namespace lfs::io {
         LOG_INFO("Saving RAD file: {}", lfs::core::path_to_utf8(options.output_path));
 
         int compression_level = options.compression_level;
-        if (compression_level != Z_DEFAULT_COMPRESSION &&
-            (compression_level < Z_NO_COMPRESSION || compression_level > Z_BEST_COMPRESSION)) {
-            LOG_WARN("save_rad: invalid compression_level={} (expected 0..9 or -1), falling back to {}",
-                     compression_level, GZ_LEVEL);
-            compression_level = GZ_LEVEL;
+        if (compression_level < 1 || compression_level > ZSTD_maxCLevel()) {
+            LOG_WARN("save_rad: invalid compression_level={} (expected 1..{}), falling back to {}",
+                     compression_level, ZSTD_maxCLevel(), ZSTD_LEVEL);
+            compression_level = ZSTD_LEVEL;
         }
 
         // Encode
@@ -4495,7 +4444,7 @@ namespace lfs::io {
         int sh_degree = 0;
         int sh_coeffs = 0;
         bool lod_tree = false;
-        int compression_level = GZ_LEVEL;
+        int compression_level = ZSTD_LEVEL;
 
         std::optional<ScopedAtomicOutputFile> atomic_output;
         std::ofstream out;
@@ -4546,9 +4495,9 @@ namespace lfs::io {
         impl_->sh_coeffs = impl_->sh_degree > 0 ? SH_COEFFS_FOR_DEGREE[impl_->sh_degree] : 0;
         impl_->lod_tree = lod_tree;
         impl_->compression_level =
-            (compression_level >= Z_NO_COMPRESSION && compression_level <= Z_BEST_COMPRESSION)
+            (compression_level >= 1 && compression_level <= ZSTD_maxCLevel())
                 ? compression_level
-                : GZ_LEVEL;
+                : ZSTD_LEVEL;
         impl_->emit_meta_sidecar = emit_meta_sidecar && lod_tree;
     }
 
@@ -4705,7 +4654,8 @@ namespace lfs::io {
             std::vector<float> alpha(count);
             auto err = decode_chunk_properties(
                 bytes.data(), parsed->meta, 0, parsed->payload_start,
-                parsed->has_payload_prefix, parsed->chunk_end, 0,
+                parsed->has_payload_prefix, parsed->chunk_end,
+                /*allow_legacy_deflate=*/false, 0,
                 means.data(), alpha.data(), nullptr,
                 scales.data(), nullptr, nullptr, nullptr, nullptr);
             if (err.has_value()) {
@@ -5168,7 +5118,8 @@ namespace lfs::io {
                     scratch.child_start.assign(count, 0);
                     auto err = decode_chunk_properties(
                         scratch.raw.data(), chunk, 0, parsed->payload_start,
-                        parsed->has_payload_prefix, parsed->chunk_end, 0,
+                        parsed->has_payload_prefix, parsed->chunk_end,
+                        /*allow_legacy_deflate=*/false, 0,
                         scratch.means.data(), scratch.alpha.data(), nullptr,
                         scratch.scales.data(), nullptr, nullptr,
                         scratch.child_count.data(), scratch.child_start.data());
@@ -5289,6 +5240,39 @@ namespace lfs::io {
         return {};
     }
 
+    // The chunk codec lives in per-property chunk metadata, not the file
+    // header; probing the first chunk decides whether a file predates the
+    // zstd format break.
+    static std::expected<bool, std::string> rad_file_uses_legacy_deflate(
+        const std::filesystem::path& path, const RadFileInfo& info) {
+        if (info.meta.chunks.empty()) {
+            return false;
+        }
+        const auto& range = info.meta.chunks.front();
+        std::ifstream in;
+        if (!lfs::core::open_file_for_read(path, std::ios::binary, in)) {
+            return std::unexpected(std::format("Failed to open RAD file: {}",
+                                               lfs::core::path_to_utf8(path)));
+        }
+        std::vector<std::uint8_t> chunk_bytes(range.bytes);
+        in.seekg(static_cast<std::streamoff>(info.chunk_area_start + range.offset), std::ios::beg);
+        in.read(reinterpret_cast<char*>(chunk_bytes.data()),
+                static_cast<std::streamsize>(chunk_bytes.size()));
+        if (!in.good()) {
+            return std::unexpected("Failed to read first RAD chunk");
+        }
+        auto parsed = parse_rad_chunk_header(chunk_bytes.data(), chunk_bytes.size());
+        if (!parsed) {
+            return std::unexpected(parsed.error());
+        }
+        for (const auto& prop : parsed->meta.properties) {
+            if (rad_codec_of(prop.compression) == RadCodec::LegacyDeflate) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     std::expected<bool, std::string> rad_lod_needs_rechunk(const std::filesystem::path& input) {
         auto info = read_rad_file_info(input);
         if (!info) {
@@ -5297,7 +5281,10 @@ namespace lfs::io {
         if (!info->meta.lod_tree.value_or(false)) {
             return false;
         }
-        return info->meta.chunk_size.value_or(0) != CHUNK_SIZE;
+        if (info->meta.chunk_size.value_or(0) != CHUNK_SIZE) {
+            return true;
+        }
+        return rad_file_uses_legacy_deflate(input, *info);
     }
 
     Result<void> rechunk_rad_lod(const std::filesystem::path& input,
@@ -5318,8 +5305,15 @@ namespace lfs::io {
         }
         const std::uint32_t source_chunk = meta.chunk_size.value_or(0);
         if (source_chunk == CHUNK_SIZE) {
-            return make_error(ErrorCode::CORRUPTED_DATA,
-                              "RAD file already uses the current chunk size", input);
+            const auto legacy = rad_file_uses_legacy_deflate(input, *info);
+            if (!legacy) {
+                return make_error(ErrorCode::CORRUPTED_DATA, legacy.error(), input);
+            }
+            if (!*legacy) {
+                return make_error(ErrorCode::CORRUPTED_DATA,
+                                  "RAD file already uses the current chunk size and codec",
+                                  input);
+            }
         }
         if (source_chunk == 0 || source_chunk % CHUNK_SIZE != 0) {
             return make_error(ErrorCode::CORRUPTED_DATA,
@@ -5379,6 +5373,7 @@ namespace lfs::io {
                                                    parsed->payload_start,
                                                    parsed->has_payload_prefix,
                                                    parsed->chunk_end,
+                                                   /*allow_legacy_deflate=*/true,
                                                    sh_coeffs,
                                                    means.data(),
                                                    opacity.data(),

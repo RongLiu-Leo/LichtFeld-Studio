@@ -123,11 +123,13 @@ namespace lfs::io {
         const std::filesystem::path& rad_path,
         const ExportProgressCallback& progress = nullptr);
     // One-time migration for RAD LOD files written with a different
-    // splats-per-chunk: decodes each source chunk to display-space values and
-    // streams them back out through the current encoders at CHUNK_SIZE. Node
-    // order, tree links, and logical indices are unchanged.
+    // splats-per-chunk or the legacy DEFLATE codec: decodes each source chunk
+    // to display-space values and streams them back out through the current
+    // encoders (zstd, CHUNK_SIZE). The only DEFLATE read path in the loader.
+    // Node order, tree links, and logical indices are unchanged.
     // True when the file is a RAD LOD written with a different
-    // splats-per-chunk than this build (header probe only, no decode).
+    // splats-per-chunk or codec than this build (header + first-chunk probe,
+    // no payload decode).
     [[nodiscard]] std::expected<bool, std::string> rad_lod_needs_rechunk(
         const std::filesystem::path& input);
     using RechunkProgressCallback = std::function<bool(float)>;
@@ -178,7 +180,7 @@ namespace lfs::io {
                         std::uint64_t total_count,
                         int sh_degree,
                         bool lod_tree,
-                        int compression_level = 6,
+                        int compression_level = 3,
                         bool emit_meta_sidecar = false);
         ~RadStreamWriter();
         RadStreamWriter(const RadStreamWriter&) = delete;

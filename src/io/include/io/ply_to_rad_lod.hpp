@@ -47,7 +47,7 @@ namespace lfs::io {
         // 0 = derive from available memory.
         std::size_t max_concurrent_buckets = 0;
         float lod_base = 1.25f;
-        int compression_level = 6;
+        int compression_level = 3;
         LodBuilder builder = LodBuilder::kBhatt;
         // Replicates the source across a tiles_x by tiles_y grid on the X/Y
         // ground plane, offsetting each instance by the scene extent plus a
