@@ -81,8 +81,7 @@
       ]
     },
     "shader-slang",
-    "usd",
-    "zstd"
+    "usd"
   ],
   "overrides": [
     {
