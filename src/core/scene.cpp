@@ -1118,7 +1118,9 @@ namespace lfs::core {
         }
 
         if (visible_nodes.size() == 1 &&
-            (!combined_model_allocator_ || splat_uses_vulkan_external_storage(*visible_nodes[0]->model))) {
+            (!combined_model_allocator_ ||
+             visible_nodes[0]->model->lod_tree ||
+             splat_uses_vulkan_external_storage(*visible_nodes[0]->model))) {
             const auto* node = visible_nodes[0];
             single_node_model_ = node->model.get();
             cached_combined_.reset();
