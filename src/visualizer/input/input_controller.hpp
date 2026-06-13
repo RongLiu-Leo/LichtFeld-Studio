@@ -104,7 +104,16 @@ namespace lfs::vis {
             const bool camera_drag = drag_mode_ == DragMode::Orbit ||
                                      drag_mode_ == DragMode::Pan ||
                                      drag_mode_ == DragMode::Rotate;
-            return movement_active || camera_drag;
+            auto& keyboard_camera = activeKeyboardViewport().camera;
+            const bool orbit_coasting =
+                orbit_coast_viewport_ && orbit_coast_viewport_->camera.hasOrbitMomentum();
+            const bool pan_coasting =
+                pan_coast_viewport_ && pan_coast_viewport_->camera.hasPanMomentum();
+            const bool wasd_coasting =
+                (wasd_momentum_viewport_ && wasd_momentum_viewport_->camera.hasWasdMomentum()) ||
+                keyboard_camera.hasWasdMomentum();
+            return movement_active || camera_drag || orbit_coasting || pan_coasting ||
+                   keyboard_camera.isGliding() || wasd_coasting;
         }
         [[nodiscard]] bool hasViewportKeyboardFocus() const;
         [[nodiscard]] bool isViewportPoint(double x, double y) const { return isInViewport(x, y); }
@@ -166,6 +175,7 @@ namespace lfs::vis {
         std::pair<glm::vec3, glm::vec3> computePickRay(double x, double y) const;
         input::ToolMode getCurrentToolMode() const;
         void clearViewportDragState();
+        void clearWasdMomentumViewport();
         void clearSelectedCameraContextMenuGesture();
         void beginPanDrag(const PanelInteractionState& interaction, int button, double x, double y);
         [[nodiscard]] bool canOpenSelectedCameraContextMenu(int hovered_camera_uid) const;
@@ -212,6 +222,9 @@ namespace lfs::vis {
         float splitter_start_pos_ = 0.5f;
         double splitter_start_x_ = 0.0;
         Viewport* drag_viewport_ = nullptr;
+        Viewport* orbit_coast_viewport_ = nullptr;
+        Viewport* pan_coast_viewport_ = nullptr;
+        Viewport* wasd_momentum_viewport_ = nullptr;
         SplitViewPanelId drag_split_panel_ = SplitViewPanelId::Left;
         SplitViewPanelId node_rect_panel_ = SplitViewPanelId::Left;
         int node_rect_button_ = -1;

@@ -5,10 +5,13 @@
 #include "io/ply_to_rad_lod.hpp"
 #include "core/bhatt_lod.hpp"
 #include "core/logger.hpp"
+#include "core/mapped_file.hpp"
+#include "core/octree_lod.hpp"
 #include "core/path_utils.hpp"
 #include "core/splat_data.hpp"
 #include "core/tensor.hpp"
 #include "formats/rad.hpp"
+#include "formats/rad_dequant_math.hpp"
 
 #include <tbb/blocked_range.h>
 #include <tbb/enumerable_thread_specific.h>
@@ -28,6 +31,7 @@
 #include <expected>
 #include <format>
 #include <fstream>
+#include <future>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -59,107 +63,12 @@ namespace lfs::io {
     namespace {
 
         constexpr float SH_C0 = 0.28209479177387814f;
-        // Pack-domain node payload: means3, rgb3, alpha, scales3, rot4.
-        constexpr std::size_t kBaseNodeFloats = 14;
         constexpr std::size_t kChunkSplats = lfs::core::SplatLodTree::kChunkSplats;
         constexpr int kCellBitsPerAxis = 8;
         constexpr std::size_t kCellsPerAxis = std::size_t{1} << kCellBitsPerAxis;
         constexpr std::size_t kCellCount = kCellsPerAxis * kCellsPerAxis * kCellsPerAxis;
 
-        // ====================================================================
-        // Memory-mapped input
-        // ====================================================================
-
-        class MappedFile {
-        public:
-            ~MappedFile() { close(); }
-
-            [[nodiscard]] bool open(const std::filesystem::path& path) {
-#ifdef _WIN32
-                file_ = CreateFileW(path.wstring().c_str(), GENERIC_READ, FILE_SHARE_READ,
-                                    nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-                if (file_ == INVALID_HANDLE_VALUE) {
-                    return false;
-                }
-                LARGE_INTEGER file_size{};
-                if (!GetFileSizeEx(file_, &file_size) || file_size.QuadPart <= 0) {
-                    close();
-                    return false;
-                }
-                size_ = static_cast<std::size_t>(file_size.QuadPart);
-                mapping_ = CreateFileMappingW(file_, nullptr, PAGE_READONLY, 0, 0, nullptr);
-                if (mapping_ == nullptr) {
-                    close();
-                    return false;
-                }
-                data_ = static_cast<const std::uint8_t*>(
-                    MapViewOfFile(mapping_, FILE_MAP_READ, 0, 0, 0));
-                if (data_ == nullptr) {
-                    close();
-                    return false;
-                }
-#else
-                fd_ = ::open(path.c_str(), O_RDONLY);
-                if (fd_ < 0) {
-                    return false;
-                }
-                struct stat st {};
-                if (fstat(fd_, &st) != 0 || st.st_size <= 0) {
-                    close();
-                    return false;
-                }
-                size_ = static_cast<std::size_t>(st.st_size);
-                void* mapped = mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd_, 0);
-                if (mapped == MAP_FAILED) {
-                    close();
-                    return false;
-                }
-                data_ = static_cast<const std::uint8_t*>(mapped);
-                madvise(mapped, size_, MADV_SEQUENTIAL);
-#endif
-                return true;
-            }
-
-            void close() {
-#ifdef _WIN32
-                if (data_ != nullptr) {
-                    UnmapViewOfFile(data_);
-                    data_ = nullptr;
-                }
-                if (mapping_ != nullptr) {
-                    CloseHandle(mapping_);
-                    mapping_ = nullptr;
-                }
-                if (file_ != INVALID_HANDLE_VALUE) {
-                    CloseHandle(file_);
-                    file_ = INVALID_HANDLE_VALUE;
-                }
-#else
-                if (data_ != nullptr) {
-                    munmap(const_cast<std::uint8_t*>(data_), size_);
-                    data_ = nullptr;
-                }
-                if (fd_ >= 0) {
-                    ::close(fd_);
-                    fd_ = -1;
-                }
-#endif
-                size_ = 0;
-            }
-
-            [[nodiscard]] const std::uint8_t* data() const { return data_; }
-            [[nodiscard]] std::size_t size() const { return size_; }
-
-        private:
-            const std::uint8_t* data_ = nullptr;
-            std::size_t size_ = 0;
-#ifdef _WIN32
-            HANDLE file_ = INVALID_HANDLE_VALUE;
-            HANDLE mapping_ = nullptr;
-#else
-            int fd_ = -1;
-#endif
-        };
+        using lfs::core::MappedFile;
 
         // ====================================================================
         // PLY header
@@ -508,6 +417,26 @@ namespace lfs::io {
             return std::fread(data, 1, bytes, f) == bytes;
         }
 
+        // Scratch files quantize everything except positions and tree links:
+        // f16 is strictly finer than the 8-bit encodings the final RAD encode
+        // applies to color/alpha/scales/SH, and rotations use the file's own
+        // oct88r8 grid, so scratch roundtrips cost no extra output precision.
+        inline void put_f16(std::uint8_t* const dst, const float v) {
+            const std::uint16_t h = radmath::floatToHalf(v);
+            std::memcpy(dst, &h, sizeof(h));
+        }
+
+        inline float get_f16(const std::uint8_t* const src) {
+            std::uint16_t h;
+            std::memcpy(&h, src, sizeof(h));
+            return radmath::halfToFloat(h);
+        }
+
+        // Raw scatter records: positions f32x3, every other field f16.
+        std::size_t scatter_record_bytes(const std::size_t record_floats) {
+            return 3 * sizeof(float) + (record_floats - 3) * sizeof(std::uint16_t);
+        }
+
         // ====================================================================
         // Per-bucket subtree build
         // ====================================================================
@@ -685,8 +614,11 @@ namespace lfs::io {
             return nodes;
         }
 
+        // means f32x3 | rgb f16x3 | alpha f16 | scales f16x3 | rot oct88r8 |
+        // shN f16 | child_count u16 | child_start u32.
         std::size_t bucket_node_record_bytes(const int rest_coeffs) {
-            return (kBaseNodeFloats + static_cast<std::size_t>(rest_coeffs) * 3) * sizeof(float) +
+            return 3 * sizeof(float) + (3 + 1 + 3) * sizeof(std::uint16_t) + 3 +
+                   static_cast<std::size_t>(rest_coeffs) * 3 * sizeof(std::uint16_t) +
                    sizeof(std::uint16_t) + sizeof(std::uint32_t);
         }
 
@@ -710,14 +642,23 @@ namespace lfs::io {
                     const std::size_t i = first + k;
                     std::uint8_t* rec = buffer.data() + k * record_bytes;
                     std::memcpy(rec, nodes.means.data() + i * 3, 3 * sizeof(float));
-                    std::memcpy(rec + 12, nodes.rgb.data() + i * 3, 3 * sizeof(float));
-                    std::memcpy(rec + 24, &nodes.alpha[i], sizeof(float));
-                    std::memcpy(rec + 28, nodes.scales.data() + i * 3, 3 * sizeof(float));
-                    std::memcpy(rec + 40, nodes.rotation.data() + i * 4, 4 * sizeof(float));
-                    std::size_t off = 56;
-                    if (sh_floats > 0) {
-                        std::memcpy(rec + off, nodes.shN.data() + i * sh_floats, sh_floats * sizeof(float));
-                        off += sh_floats * sizeof(float);
+                    std::size_t off = 12;
+                    for (int d = 0; d < 3; ++d, off += 2) {
+                        put_f16(rec + off, nodes.rgb[i * 3 + d]);
+                    }
+                    put_f16(rec + off, nodes.alpha[i]);
+                    off += 2;
+                    for (int d = 0; d < 3; ++d, off += 2) {
+                        put_f16(rec + off, nodes.scales[i * 3 + d]);
+                    }
+                    radmath::quantQuatOct88R8(nodes.rotation[i * 4 + 1],
+                                              nodes.rotation[i * 4 + 2],
+                                              nodes.rotation[i * 4 + 3],
+                                              nodes.rotation[i * 4 + 0],
+                                              rec + off);
+                    off += 3;
+                    for (std::size_t s = 0; s < sh_floats; ++s, off += 2) {
+                        put_f16(rec + off, nodes.shN[i * sh_floats + s]);
                     }
                     std::memcpy(rec + off, &nodes.child_count[i], sizeof(std::uint16_t));
                     std::memcpy(rec + off + 2, &nodes.child_start[i], sizeof(std::uint32_t));
@@ -752,14 +693,24 @@ namespace lfs::io {
                     for (std::size_t i = range.begin(); i != range.end(); ++i) {
                         const std::uint8_t* rec = buffer.data() + i * record_bytes;
                         std::memcpy(nodes.means.data() + i * 3, rec, 3 * sizeof(float));
-                        std::memcpy(nodes.rgb.data() + i * 3, rec + 12, 3 * sizeof(float));
-                        std::memcpy(&nodes.alpha[i], rec + 24, sizeof(float));
-                        std::memcpy(nodes.scales.data() + i * 3, rec + 28, 3 * sizeof(float));
-                        std::memcpy(nodes.rotation.data() + i * 4, rec + 40, 4 * sizeof(float));
-                        std::size_t off = 56;
-                        if (sh_floats > 0) {
-                            std::memcpy(nodes.shN.data() + i * sh_floats, rec + off, sh_floats * sizeof(float));
-                            off += sh_floats * sizeof(float);
+                        std::size_t off = 12;
+                        for (int d = 0; d < 3; ++d, off += 2) {
+                            nodes.rgb[i * 3 + d] = get_f16(rec + off);
+                        }
+                        nodes.alpha[i] = get_f16(rec + off);
+                        off += 2;
+                        for (int d = 0; d < 3; ++d, off += 2) {
+                            nodes.scales[i * 3 + d] = get_f16(rec + off);
+                        }
+                        float xyzw[4];
+                        radmath::dequantQuatOct88R8(rec[off], rec[off + 1], rec[off + 2], xyzw);
+                        nodes.rotation[i * 4 + 0] = xyzw[3];
+                        nodes.rotation[i * 4 + 1] = xyzw[0];
+                        nodes.rotation[i * 4 + 2] = xyzw[1];
+                        nodes.rotation[i * 4 + 3] = xyzw[2];
+                        off += 3;
+                        for (std::size_t s = 0; s < sh_floats; ++s, off += 2) {
+                            nodes.shN[i * sh_floats + s] = get_f16(rec + off);
                         }
                         std::memcpy(&nodes.child_count[i], rec + off, sizeof(std::uint16_t));
                         std::memcpy(&nodes.child_start[i], rec + off + 2, sizeof(std::uint32_t));
@@ -871,8 +822,10 @@ namespace lfs::io {
 
         // Stages whole chunks and hands them to the writer in batches so the
         // per-chunk DEFLATE runs in parallel instead of serializing the final
-        // assembly phase. Staging is bounded (~256 MB) and reused across
-        // batches.
+        // assembly phase. Full batches flush on a background thread (one in
+        // flight), overlapping the fill thread's bucket-file reads with the
+        // previous batch's quantize+DEFLATE. Two bounded stage pools are
+        // reused across batches.
         class ChunkAccumulator {
         public:
             ChunkAccumulator(RadStreamWriter& writer, const int rest_coeffs)
@@ -896,9 +849,9 @@ namespace lfs::io {
                     first += take;
                     count -= take;
                     if (stage.fill == kChunkSplats) {
-                        ++full_stages_;
-                        if (full_stages_ == batch_capacity_) {
-                            if (auto ok = flush_batch(); !ok) {
+                        ++fill_->full;
+                        if (fill_->full == batch_capacity_) {
+                            if (auto ok = launch_flush(); !ok) {
                                 return ok;
                             }
                         }
@@ -908,7 +861,10 @@ namespace lfs::io {
             }
 
             [[nodiscard]] std::expected<void, std::string> finish() {
-                return flush_batch();
+                if (auto ok = wait_inflight(); !ok) {
+                    return ok;
+                }
+                return append_pool(*fill_);
             }
 
         private:
@@ -919,8 +875,14 @@ namespace lfs::io {
                 std::size_t fill = 0;
             };
 
+            struct Pool {
+                std::vector<Stage> stages;
+                std::size_t full = 0;
+            };
+
             Stage& filling_stage() {
-                if (full_stages_ == stages_.size()) {
+                Pool& pool = *fill_;
+                if (pool.full == pool.stages.size()) {
                     Stage stage;
                     stage.means.resize(kChunkSplats * 3);
                     stage.rgb.resize(kChunkSplats * 3);
@@ -932,9 +894,9 @@ namespace lfs::io {
                     }
                     stage.child_count.resize(kChunkSplats);
                     stage.child_start.resize(kChunkSplats);
-                    stages_.push_back(std::move(stage));
+                    pool.stages.push_back(std::move(stage));
                 }
-                return stages_[full_stages_];
+                return pool.stages[pool.full];
             }
 
             void copy_range(Stage& stage, const BucketNodes& nodes,
@@ -961,9 +923,29 @@ namespace lfs::io {
                             take * sizeof(std::uint32_t));
             }
 
-            [[nodiscard]] std::expected<void, std::string> flush_batch() {
-                std::size_t pending = full_stages_;
-                if (pending < stages_.size() && stages_[pending].fill > 0) {
+            [[nodiscard]] std::expected<void, std::string> wait_inflight() {
+                if (!inflight_.valid()) {
+                    return {};
+                }
+                return inflight_.get();
+            }
+
+            // Hands the filled pool to a background append and keeps filling
+            // the other one; at most one append in flight preserves chunk
+            // order and bounds staging to two pools.
+            [[nodiscard]] std::expected<void, std::string> launch_flush() {
+                if (auto ok = wait_inflight(); !ok) {
+                    return ok;
+                }
+                std::swap(fill_, flight_);
+                inflight_ = std::async(std::launch::async,
+                                       [this] { return append_pool(*flight_); });
+                return {};
+            }
+
+            [[nodiscard]] std::expected<void, std::string> append_pool(Pool& pool) {
+                std::size_t pending = pool.full;
+                if (pending < pool.stages.size() && pool.stages[pending].fill > 0) {
                     ++pending; // trailing partial chunk, only legal as the file's last
                 }
                 if (pending == 0) {
@@ -971,7 +953,7 @@ namespace lfs::io {
                 }
                 std::vector<RadStreamChunkSource> sources(pending);
                 for (std::size_t i = 0; i < pending; ++i) {
-                    const Stage& stage = stages_[i];
+                    const Stage& stage = pool.stages[i];
                     auto& chunk = sources[i];
                     chunk.count = static_cast<std::uint32_t>(stage.fill);
                     chunk.means = stage.means.data();
@@ -985,17 +967,19 @@ namespace lfs::io {
                 }
                 auto ok = writer_.append_batch(sources);
                 for (std::size_t i = 0; i < pending; ++i) {
-                    stages_[i].fill = 0;
+                    pool.stages[i].fill = 0;
                 }
-                full_stages_ = 0;
+                pool.full = 0;
                 return ok;
             }
 
             RadStreamWriter& writer_;
             int rest_coeffs_;
             std::size_t batch_capacity_ = 0;
-            std::size_t full_stages_ = 0;
-            std::vector<Stage> stages_;
+            Pool pools_[2];
+            Pool* fill_ = &pools_[0];
+            Pool* flight_ = &pools_[1];
+            std::future<std::expected<void, std::string>> inflight_;
         };
 
         std::size_t available_memory_bytes() {
@@ -1072,8 +1056,25 @@ namespace lfs::io {
         const int rest_coeffs = layout.rest_coeffs;
         const std::size_t record_floats = kBaseRecordFloats + static_cast<std::size_t>(rest_coeffs) * 3;
 
+        if (options.tiles_x == 0 || options.tiles_y == 0) {
+            return make_error(ErrorCode::INVALID_DATASET, "tile grid must be at least 1x1", input_path);
+        }
+        const std::size_t tile_count =
+            static_cast<std::size_t>(options.tiles_x) * options.tiles_y;
+        const std::uint64_t total_leaves = static_cast<std::uint64_t>(N) * tile_count;
+        if (total_leaves > std::numeric_limits<std::uint32_t>::max()) {
+            return make_error(ErrorCode::INVALID_DATASET,
+                              std::format("{}x{} tiling of {} splats exceeds the RAD node limit",
+                                          options.tiles_x, options.tiles_y, N),
+                              input_path);
+        }
+
         LOG_INFO("ply_to_rad_lod: {} splats, SH degree {}, stride {} bytes",
                  N, layout.sh_degree, layout.stride);
+        if (tile_count > 1) {
+            LOG_INFO("ply_to_rad_lod: instancing {}x{} ground-plane tiles -> {} splats",
+                     options.tiles_x, options.tiles_y, total_leaves);
+        }
 
         // Scratch space lives next to the output by default (same drive). The
         // PID suffix keeps concurrent conversions of the same output from
@@ -1148,6 +1149,57 @@ namespace lfs::io {
                 bounds.max[a] = q_hi + margin;
             }
         }
+
+        // Tile offsets come from the exact X/Y extent (not the robust box):
+        // instances must never overlap, and outliers the Morton grid clamps
+        // away would otherwise leak into the neighboring tile.
+        std::vector<std::array<float, 2>> tile_offsets(tile_count, {0.0f, 0.0f});
+        if (tile_count > 1) {
+            struct XYExtent {
+                float min_x = std::numeric_limits<float>::max();
+                float max_x = std::numeric_limits<float>::lowest();
+                float min_y = std::numeric_limits<float>::max();
+                float max_y = std::numeric_limits<float>::lowest();
+            };
+            const XYExtent extent = tbb::parallel_reduce(
+                tbb::blocked_range<std::size_t>(0, N, 1 << 18), XYExtent{},
+                [&](const tbb::blocked_range<std::size_t>& range, XYExtent acc) {
+                    for (std::size_t i = range.begin(); i != range.end(); ++i) {
+                        const std::uint8_t* const vertex = vertex_base + i * layout.stride;
+                        const float x = read_f32(vertex, layout.pos[0]);
+                        const float y = read_f32(vertex, layout.pos[1]);
+                        if (std::isfinite(x)) {
+                            acc.min_x = std::min(acc.min_x, x);
+                            acc.max_x = std::max(acc.max_x, x);
+                        }
+                        if (std::isfinite(y)) {
+                            acc.min_y = std::min(acc.min_y, y);
+                            acc.max_y = std::max(acc.max_y, y);
+                        }
+                    }
+                    return acc;
+                },
+                [](const XYExtent& a, const XYExtent& b) {
+                    return XYExtent{
+                        .min_x = std::min(a.min_x, b.min_x),
+                        .max_x = std::max(a.max_x, b.max_x),
+                        .min_y = std::min(a.min_y, b.min_y),
+                        .max_y = std::max(a.max_y, b.max_y),
+                    };
+                });
+            const float step_x = (extent.max_x - extent.min_x) * 1.01f;
+            const float step_y = (extent.max_y - extent.min_y) * 1.01f;
+            for (std::uint32_t iy = 0; iy < options.tiles_y; ++iy) {
+                for (std::uint32_t ix = 0; ix < options.tiles_x; ++ix) {
+                    tile_offsets[static_cast<std::size_t>(iy) * options.tiles_x + ix] = {
+                        static_cast<float>(ix) * step_x,
+                        static_cast<float>(iy) * step_y,
+                    };
+                }
+            }
+            bounds.max[0] += static_cast<float>(options.tiles_x - 1) * step_x;
+            bounds.max[1] += static_cast<float>(options.tiles_y - 1) * step_y;
+        }
         bounds.finalize();
 
         if (!report(0.03f, "Computing spatial histogram")) {
@@ -1159,18 +1211,22 @@ namespace lfs::io {
         // ------------------------------------------------------------------
         std::unique_ptr<std::atomic<std::uint32_t>[]> cell_hist(
             new std::atomic<std::uint32_t>[kCellCount]());
-        tbb::parallel_for(
-            tbb::blocked_range<std::size_t>(0, N, 1 << 18),
-            [&](const tbb::blocked_range<std::size_t>& range) {
-                for (std::size_t i = range.begin(); i != range.end(); ++i) {
-                    const std::uint8_t* const vertex = vertex_base + i * layout.stride;
-                    const std::uint32_t cell = cell_of_position(bounds,
-                                                                read_f32(vertex, layout.pos[0]),
-                                                                read_f32(vertex, layout.pos[1]),
-                                                                read_f32(vertex, layout.pos[2]));
-                    cell_hist[cell].fetch_add(1, std::memory_order_relaxed);
-                }
-            });
+        for (std::size_t t = 0; t < tile_count; ++t) {
+            const float tile_x = tile_offsets[t][0];
+            const float tile_y = tile_offsets[t][1];
+            tbb::parallel_for(
+                tbb::blocked_range<std::size_t>(0, N, 1 << 18),
+                [&](const tbb::blocked_range<std::size_t>& range) {
+                    for (std::size_t i = range.begin(); i != range.end(); ++i) {
+                        const std::uint8_t* const vertex = vertex_base + i * layout.stride;
+                        const std::uint32_t cell = cell_of_position(bounds,
+                                                                    read_f32(vertex, layout.pos[0]) + tile_x,
+                                                                    read_f32(vertex, layout.pos[1]) + tile_y,
+                                                                    read_f32(vertex, layout.pos[2]));
+                        cell_hist[cell].fetch_add(1, std::memory_order_relaxed);
+                    }
+                });
+        }
 
         const std::size_t target_bucket = std::max<std::size_t>(options.target_bucket_splats, 65536);
         std::vector<std::uint32_t> cell_to_bucket(kCellCount, 0);
@@ -1245,58 +1301,75 @@ namespace lfs::io {
             });
 
             std::atomic<int> write_errno{0};
+            const std::size_t packed_record_bytes = scatter_record_bytes(record_floats);
             const auto flush_bucket = [&](const std::size_t b, std::vector<float>& buf) {
                 if (buf.empty()) {
                     return;
                 }
+                thread_local std::vector<std::uint8_t> packed;
+                const std::size_t record_count = buf.size() / record_floats;
+                packed.resize(record_count * packed_record_bytes);
+                for (std::size_t r = 0; r < record_count; ++r) {
+                    const float* const src = buf.data() + r * record_floats;
+                    std::uint8_t* const dst = packed.data() + r * packed_record_bytes;
+                    std::memcpy(dst, src, 3 * sizeof(float));
+                    std::size_t off = 12;
+                    for (std::size_t k = 3; k < record_floats; ++k, off += 2) {
+                        put_f16(dst + off, src[k]);
+                    }
+                }
                 std::lock_guard<std::mutex> lock(bucket_mutexes[b]);
-                if (!write_exact(bucket_files[b].get(), buf.data(), buf.size() * sizeof(float))) {
+                if (!write_exact(bucket_files[b].get(), packed.data(), packed.size())) {
                     int expected = 0;
                     write_errno.compare_exchange_strong(expected, errno != 0 ? errno : EIO);
                 }
                 buf.clear();
             };
 
-            tbb::parallel_for(
-                tbb::blocked_range<std::size_t>(0, N, 1 << 16),
-                [&](const tbb::blocked_range<std::size_t>& range) {
-                    auto& state = states.local();
-                    for (std::size_t i = range.begin(); i != range.end(); ++i) {
-                        const std::uint8_t* const vertex = vertex_base + i * layout.stride;
-                        const float x = read_f32(vertex, layout.pos[0]);
-                        const float y = read_f32(vertex, layout.pos[1]);
-                        const float z = read_f32(vertex, layout.pos[2]);
-                        const std::uint32_t bucket = cell_to_bucket[cell_of_position(bounds, x, y, z)];
-                        auto& buf = state.pending[bucket];
+            for (std::size_t t = 0; t < tile_count; ++t) {
+                const float tile_x = tile_offsets[t][0];
+                const float tile_y = tile_offsets[t][1];
+                tbb::parallel_for(
+                    tbb::blocked_range<std::size_t>(0, N, 1 << 16),
+                    [&](const tbb::blocked_range<std::size_t>& range) {
+                        auto& state = states.local();
+                        for (std::size_t i = range.begin(); i != range.end(); ++i) {
+                            const std::uint8_t* const vertex = vertex_base + i * layout.stride;
+                            const float x = read_f32(vertex, layout.pos[0]) + tile_x;
+                            const float y = read_f32(vertex, layout.pos[1]) + tile_y;
+                            const float z = read_f32(vertex, layout.pos[2]);
+                            const std::uint32_t bucket = cell_to_bucket[cell_of_position(bounds, x, y, z)];
+                            auto& buf = state.pending[bucket];
 
-                        buf.push_back(x);
-                        buf.push_back(y);
-                        buf.push_back(z);
-                        buf.push_back(read_f32(vertex, layout.dc[0]));
-                        buf.push_back(read_f32(vertex, layout.dc[1]));
-                        buf.push_back(read_f32(vertex, layout.dc[2]));
-                        buf.push_back(read_f32(vertex, layout.opacity));
-                        buf.push_back(read_f32(vertex, layout.scale[0]));
-                        buf.push_back(read_f32(vertex, layout.scale[1]));
-                        buf.push_back(read_f32(vertex, layout.scale[2]));
-                        buf.push_back(read_f32(vertex, layout.rot[0]));
-                        buf.push_back(read_f32(vertex, layout.rot[1]));
-                        buf.push_back(read_f32(vertex, layout.rot[2]));
-                        buf.push_back(read_f32(vertex, layout.rot[3]));
-                        // f_rest is channel-major in the file; records store
-                        // canonical [coeff][channel] order.
-                        for (int coeff = 0; coeff < rest_coeffs; ++coeff) {
-                            for (int ch = 0; ch < 3; ++ch) {
-                                buf.push_back(read_f32(
-                                    vertex, layout.rest[static_cast<std::size_t>(ch) * rest_coeffs + coeff]));
+                            buf.push_back(x);
+                            buf.push_back(y);
+                            buf.push_back(z);
+                            buf.push_back(read_f32(vertex, layout.dc[0]));
+                            buf.push_back(read_f32(vertex, layout.dc[1]));
+                            buf.push_back(read_f32(vertex, layout.dc[2]));
+                            buf.push_back(read_f32(vertex, layout.opacity));
+                            buf.push_back(read_f32(vertex, layout.scale[0]));
+                            buf.push_back(read_f32(vertex, layout.scale[1]));
+                            buf.push_back(read_f32(vertex, layout.scale[2]));
+                            buf.push_back(read_f32(vertex, layout.rot[0]));
+                            buf.push_back(read_f32(vertex, layout.rot[1]));
+                            buf.push_back(read_f32(vertex, layout.rot[2]));
+                            buf.push_back(read_f32(vertex, layout.rot[3]));
+                            // f_rest is channel-major in the file; records store
+                            // canonical [coeff][channel] order.
+                            for (int coeff = 0; coeff < rest_coeffs; ++coeff) {
+                                for (int ch = 0; ch < 3; ++ch) {
+                                    buf.push_back(read_f32(
+                                        vertex, layout.rest[static_cast<std::size_t>(ch) * rest_coeffs + coeff]));
+                                }
+                            }
+
+                            if (buf.size() >= kFlushFloats) {
+                                flush_bucket(bucket, buf);
                             }
                         }
-
-                        if (buf.size() >= kFlushFloats) {
-                            flush_bucket(bucket, buf);
-                        }
-                    }
-                });
+                    });
+            }
 
             for (auto& state : states) {
                 for (std::size_t b = 0; b < bucket_count; ++b) {
@@ -1353,21 +1426,54 @@ namespace lfs::io {
                 }
             };
 
+            // Adaptive admission: the in-flight count was sized from memory
+            // available at phase start, but co-tenants (and zram swap, which
+            // consumes physical RAM as it fills) move that floor over a long
+            // build. Each worker re-checks before claiming a bucket and
+            // drains instead of launching under pressure; the active counter
+            // guarantees forward progress - one bucket always runs.
+            std::atomic<std::size_t> active_builds{0};
+            const std::size_t per_splat_estimate =
+                record_floats * sizeof(float) + 240 + static_cast<std::size_t>(rest_coeffs) * 30;
+            const std::size_t admission_floor =
+                target_bucket * per_splat_estimate + (std::size_t{2} << 30);
             const auto worker = [&]() {
                 while (true) {
+                    while (active_builds.load(std::memory_order_relaxed) > 0 &&
+                           available_memory_bytes() < admission_floor &&
+                           !failed.load(std::memory_order_relaxed) &&
+                           !cancel_requested.load(std::memory_order_relaxed)) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                    }
                     const std::size_t b = next_bucket.fetch_add(1);
                     if (b >= bucket_count || failed.load(std::memory_order_relaxed) ||
                         cancel_requested.load(std::memory_order_relaxed)) {
                         return;
                     }
+                    ++active_builds;
+                    struct ActiveGuard {
+                        std::atomic<std::size_t>& count;
+                        ~ActiveGuard() { --count; }
+                    } active_guard{active_builds};
 
                     const std::size_t count = static_cast<std::size_t>(bucket_counts[b]);
                     std::vector<float> records(count * record_floats);
                     {
+                        const std::size_t packed_record_bytes = scatter_record_bytes(record_floats);
+                        std::vector<std::uint8_t> packed(count * packed_record_bytes);
                         FilePtr f(std::fopen(bucket_records_path(b).string().c_str(), "rb"));
-                        if (!f || !read_exact(f.get(), records.data(), records.size() * sizeof(float))) {
+                        if (!f || !read_exact(f.get(), packed.data(), packed.size())) {
                             fail(std::format("failed to read bucket records {}: {}", b, std::strerror(errno)));
                             return;
+                        }
+                        for (std::size_t r = 0; r < count; ++r) {
+                            const std::uint8_t* const src = packed.data() + r * packed_record_bytes;
+                            float* const dst = records.data() + r * record_floats;
+                            std::memcpy(dst, src, 3 * sizeof(float));
+                            std::size_t off = 12;
+                            for (std::size_t k = 3; k < record_floats; ++k, off += 2) {
+                                dst[k] = get_f16(src + off);
+                            }
                         }
                     }
                     std::error_code ec;
@@ -1382,9 +1488,18 @@ namespace lfs::io {
                         records.clear();
                         records.shrink_to_fit();
 
-                        lfs::core::BhattLodBuildOptions lod_options;
-                        lod_options.lod_base = options.lod_base;
-                        auto lod_result = lfs::core::build_bhatt_lod(bucket_input, lod_options);
+                        std::expected<std::unique_ptr<SplatData>, std::string> lod_result;
+                        if (options.builder == LodBuilder::kOctree) {
+                            lfs::core::OctreeLodBuildOptions octree_options;
+                            octree_options.leaf_group_splats = options.octree_leaf_splats;
+                            octree_options.bhatt_top_nodes = options.octree_bhatt_top_nodes;
+                            octree_options.bhatt_lod_base = options.lod_base;
+                            lod_result = lfs::core::build_octree_lod(bucket_input, octree_options);
+                        } else {
+                            lfs::core::BhattLodBuildOptions lod_options;
+                            lod_options.lod_base = options.lod_base;
+                            lod_result = lfs::core::build_bhatt_lod(bucket_input, lod_options);
+                        }
                         if (!lod_result) {
                             fail(std::format("bucket {} LOD build failed: {}", b, lod_result.error()));
                             return;
@@ -1533,7 +1648,7 @@ namespace lfs::io {
             }
         }
         LOG_INFO("ply_to_rad_lod: {} total LOD nodes ({} leaves, {} top-level)",
-                 total_nodes, N, top_count);
+                 total_nodes, total_leaves, top_count);
 
         const auto local_levels = [&](const std::size_t b) {
             return summaries[b].level_starts.size() - 1;
@@ -1594,9 +1709,10 @@ namespace lfs::io {
         if (!report(0.78f, "Writing RAD chunks")) {
             return cancelled();
         }
+        const auto t_write_start = std::chrono::high_resolution_clock::now();
 
         RadStreamWriter writer(output_path, total_nodes, layout.sh_degree, true,
-                               options.compression_level);
+                               options.compression_level, /*emit_meta_sidecar=*/true);
         if (auto ok = writer.open(); !ok) {
             return make_error(ErrorCode::WRITE_FAILURE, ok.error(), output_path);
         }
@@ -1738,10 +1854,13 @@ namespace lfs::io {
             return make_error(ErrorCode::WRITE_FAILURE, ok.error(), output_path);
         }
 
-        const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::high_resolution_clock::now() - t_start);
-        LOG_INFO("ply_to_rad_lod: wrote {} ({} nodes from {} splats) in {}s",
-                 lfs::core::path_to_utf8(output_path), total_nodes, N, elapsed.count());
+        const auto t_end = std::chrono::high_resolution_clock::now();
+        const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(t_end - t_start);
+        const auto write_elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_write_start);
+        LOG_INFO("ply_to_rad_lod: wrote {} ({} nodes from {} splats) in {}s (chunk encode+write {:.1f}s)",
+                 lfs::core::path_to_utf8(output_path), total_nodes, total_leaves, elapsed.count(),
+                 static_cast<double>(write_elapsed.count()) / 1000.0);
 
         if (!report(1.0f, "Conversion complete")) {
             return cancelled();

@@ -17,6 +17,13 @@ import spherical_harmonics;
 #define LFS_PROJECTION_SURVIVORS 0
 #endif
 
+// Canonical quantized LOD pool inputs (lod_pool_quant.hpp): xyz stays f32;
+// sh0/rotation/log-scale are packed f16, opacity f16 two-per-uint, shN s8
+// per swizzled-slot component with per-page band scales from page_frames.
+#ifndef LFS_QUANT_POOL
+#define LFS_QUANT_POOL 0
+#endif
+
 
 struct Gaussian_3D : IDifferentiable
 {
@@ -77,6 +84,53 @@ Gaussian_3D load_gaussian_split(
     if (lod_opacity_encoded && g_opacities > 1.0f) {
         // Spark stores high-opacity LOD nodes in the compact 1..2 range, then
         // maps them back to the 1..5 LOD kernel range in the shader.
+        g_opacities = min(g_opacities * 4.0f - 3.0f, 5.0f);
+    }
+
+    return { g_xyz_ws, g_sh_coeffs, g_rotations, g_scales, g_opacities };
+}
+
+Gaussian_3D load_gaussian_split_quant(
+    int32_t g_idx,
+    StructuredBuffer<float> xyz_ws,
+    StructuredBuffer<uint2> sh0_q,
+    StructuredBuffer<uint> shN_q,
+    StructuredBuffer<uint2> rotations_q,
+    StructuredBuffer<uint2> scaling_q,
+    StructuredBuffer<uint> opacity_q,
+    StructuredBuffer<float4> page_frames,
+    uint page_splats,
+    uint lod_flags,
+    uint active_sh,
+    uint shN_layout_slots
+) {
+    float3 g_xyz_ws = read_t3_float3(g_idx, xyz_ws);
+
+    const uint page = page_splats > 0u ? uint(g_idx) / page_splats : 0u;
+    // PageFrame float4[0] = per-band SH |max| scales.
+    const float4 frame0 = page_frames[page * 4u];
+    SpherHarmCoeffs g_sh_coeffs = read_spherical_harmonics_coeffs_split_quant(
+        g_idx, sh0_q, shN_q, frame0.xyz, active_sh, shN_layout_slots);
+
+    // Same component order as the fp32 pool: (w, x, y, z) per splat.
+    const uint2 rq = rotations_q[g_idx];
+    float4 g_rotations = float4(f16tof32(rq.x & 0xFFFFu), f16tof32(rq.x >> 16),
+                                f16tof32(rq.y & 0xFFFFu), f16tof32(rq.y >> 16));
+
+    const uint2 sq = scaling_q[g_idx];
+    float3 g_raw_scaling = float3(f16tof32(sq.x & 0xFFFFu), f16tof32(sq.x >> 16),
+                                  f16tof32(sq.y & 0xFFFFu));
+    g_raw_scaling = min(g_raw_scaling, float3(MAX_RAW_SCALE));
+    float3 g_scales = exp(g_raw_scaling);
+
+    const uint opacity_word = opacity_q[uint(g_idx) >> 1];
+    const float opacity_raw_value =
+        f16tof32((uint(g_idx) & 1u) != 0u ? (opacity_word >> 16) : (opacity_word & 0xFFFFu));
+    const bool lod_opacity_encoded = (lod_flags & 4u) != 0u;
+    float g_opacities = lod_opacity_encoded
+        ? max(opacity_raw_value, 0.0f)
+        : sigmoid_activation(opacity_raw_value);
+    if (lod_opacity_encoded && g_opacities > 1.0f) {
         g_opacities = min(g_opacities * 4.0f - 3.0f, 5.0f);
     }
 
@@ -493,11 +547,19 @@ rectangle get_wrapped_rectangle_tile_space(
 
 // Input buffers
 layout(binding=0) StructuredBuffer<float> xyz_ws;  // 3
+#if LFS_QUANT_POOL
+layout(binding=1) StructuredBuffer<uint2> sh0;  // f16x3 + pad
+layout(binding=2) StructuredBuffer<uint> shN;  // s8x4 per swizzled slot
+layout(binding=3) StructuredBuffer<uint2> rotations;  // f16x4 (w,x,y,z)
+layout(binding=4) StructuredBuffer<uint2> scaling_raw;  // log f16x3 + pad
+layout(binding=5) StructuredBuffer<uint> opacity_raw;  // f16, 2 splats per uint
+#else
 layout(binding=1) StructuredBuffer<float> sh0;  // 1*3
 layout(binding=2) StructuredBuffer<float4> shN;  // rest-only 15*3
 layout(binding=3) StructuredBuffer<float4> rotations;  // 4
 layout(binding=4) StructuredBuffer<float> scaling_raw;  // 3
 layout(binding=5) StructuredBuffer<float> opacity_raw;  // 1
+#endif
 
 // Output buffers
 #if !LFS_PROJECTION_SURVIVORS
@@ -550,6 +612,15 @@ layout(binding=26) RWStructuredBuffer<int32_t> out_sort_ids;
 layout(binding=27) RWStructuredBuffer<uint32_t> out_emit_count;
 // Model-splat index per slot, for bit-per-model-splat selection masks.
 layout(binding=28) RWStructuredBuffer<int32_t> out_orig_ids;
+#endif
+#if LFS_QUANT_POOL
+// Per-page dequant frames (lod_pool_quant.hpp PageFrame), bound after every
+// variant-specific binding so the C++ buffer list just appends it last.
+#if LFS_PROJECTION_SURVIVORS
+layout(binding=29) StructuredBuffer<float4> page_frames;
+#else
+layout(binding=24) StructuredBuffer<float4> page_frames;
+#endif
 #endif
 
 #if !LFS_PROJECTION_SURVIVORS
@@ -693,6 +764,17 @@ void main(
         camera_model, uniforms.dist_coeffs,
         camera_height, camera_width);
   #if EXPORT_MODE == EXPORT_MODE_VULKAN_FORWARD
+    #if LFS_QUANT_POOL
+    Gaussian_3D gauss = load_gaussian_split_quant(
+        g_idx, xyz_ws, sh0, shN, rotations,
+        scaling_raw, opacity_raw,
+        page_frames,
+        uniforms.lod_page_splats,
+        uniforms.lod_enabled,
+        active_sh,
+        uniforms.shN_layout_slots
+      );
+    #else
     Gaussian_3D gauss = load_gaussian_split(
         g_idx, xyz_ws, sh0, shN, rotations,
         scaling_raw, opacity_raw,
@@ -700,6 +782,7 @@ void main(
         active_sh,
         uniforms.shN_layout_slots
       );
+    #endif
     if (lod_active && (uniforms.lod_enabled & 16u) != 0u) {
         gauss.opacities *= clamp(lod_weights[render_idx], 0.0f, 1.0f);
     }
@@ -749,7 +832,7 @@ void main(
         model_transforms,
         model_transform_base,
         model_transform_enabled,
-        uniforms.mip_filter != 0u);
+        (uniforms.mip_filter & 1u) != 0u);
   #else
     Splat_2D_Vertex splat = project_gaussian_to_camera_model(
         gauss,
@@ -759,7 +842,7 @@ void main(
         model_transforms,
         model_transform_base,
         model_transform_enabled,
-        uniforms.mip_filter != 0u,
+        (uniforms.mip_filter & 1u) != 0u,
         spark_rad_opacity_path);
   #endif
   #else

@@ -255,15 +255,30 @@ namespace lfs::vis::gui {
                                     : "--";
             if (stats.pool_pages > 0 && stats.chunk_splats > 0) {
                 const std::size_t pool_splats = stats.pool_pages * stats.chunk_splats;
-                const std::string streaming =
+                std::string streaming =
                     stats.streaming_jobs > 0
                         ? std::format("{} pages loading", stats.streaming_jobs)
                         : (stats.resident_chunks >= stats.chunk_count ? "fully resident"
                                                                       : "idle");
-                state.cache_text = std::format("{}/{} pages | {} splat pool | {}",
-                                               formatLodCount(std::min(stats.resident_chunks, stats.pool_pages)),
+                if (stats.deferred_requests > 0) {
+                    streaming += std::format(" | {} deferred", stats.deferred_requests);
+                }
+                if (stats.admission_frozen) {
+                    streaming += " | FROZEN";
+                }
+                const std::size_t resident_pages = std::min(stats.resident_chunks, stats.pool_pages);
+                std::string utilization;
+                if (stats.gpu_selection && resident_pages > 0) {
+                    utilization = std::format(
+                        " | util {:.1f}%",
+                        100.0 * static_cast<double>(stats.selected_splats) /
+                            static_cast<double>(resident_pages * stats.chunk_splats));
+                }
+                state.cache_text = std::format("{}/{} pages | {} splat pool{} | {}",
+                                               formatLodCount(resident_pages),
                                                formatLodCount(stats.pool_pages),
                                                formatLodCount(pool_splats),
+                                               utilization,
                                                streaming);
             } else {
                 state.cache_text = "--";
@@ -5435,8 +5450,11 @@ namespace lfs::vis::gui {
             if (rml_menu_bar_.wantsInput())
                 guiFocusState().want_capture_mouse = true;
 
-            if (!vulkan_gui_)
+            if (!vulkan_gui_) {
+                rml_menu_bar_.setViewportRightEdge(
+                    viewport_layout_.pos.x + viewport_layout_.size.x - menu_input.screen_x);
                 rml_menu_bar_.draw(menu_input.screen_w, menu_input.screen_h);
+            }
         } else {
             LOG_TIMER_THRESHOLD("gui_render.panel_setup.menu_bar_suspend", 0.25);
             rml_menu_bar_.suspend();
@@ -6163,6 +6181,8 @@ namespace lfs::vis::gui {
             LOG_TIMER_THRESHOLD("gui_render.menu_context_modal_render", 0.25);
             if (menu_bar_ && !ui_hidden_) {
                 LOG_TIMER_THRESHOLD("gui_render.menu_context_modal_render.menu_bar", 0.25);
+                rml_menu_bar_.setViewportRightEdge(
+                    viewport_layout_.pos.x + viewport_layout_.size.x - panel_input.screen_x);
                 rml_menu_bar_.draw(panel_input.screen_w, panel_input.screen_h);
             }
             if (global_context_menu_->hasPendingRenderWork()) {

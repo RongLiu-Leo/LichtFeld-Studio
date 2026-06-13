@@ -25,6 +25,16 @@ namespace lfs::io {
     [[nodiscard]] LFS_IO_API std::expected<PlyGaussianInfo, std::string> probe_ply_gaussians(
         const std::filesystem::path& input_path);
 
+    // Per-bucket LOD tree builder. kBhatt is the quality-validated default;
+    // kOctree (Morton octree + moment matching) builds the same contract
+    // orders of magnitude faster but has not passed the real-scene PSNR gate
+    // yet. The top tree over bucket roots always uses bhatt (it is tiny and
+    // needs the leaf-index plumbing).
+    enum class LodBuilder {
+        kBhatt,
+        kOctree,
+    };
+
     struct PlyToRadLodOptions {
         // Scratch space for Morton buckets and per-bucket subtrees. Empty means
         // a directory next to the output file (same drive, atomic-rename safe).
@@ -38,6 +48,23 @@ namespace lfs::io {
         std::size_t max_concurrent_buckets = 0;
         float lod_base = 1.25f;
         int compression_level = 6;
+        LodBuilder builder = LodBuilder::kBhatt;
+        // kOctree only: splats per octree leaf group before binary pairing
+        // takes over (OctreeLodBuildOptions::leaf_group_splats, clamped to
+        // [2, 64]).
+        std::uint32_t octree_leaf_splats = 8;
+        // kOctree only: the per-bucket octree pass hands its surviving
+        // representatives to the bhatt agglomerative builder once they fit
+        // this budget, so the visible coarse levels carry similarity-ordered
+        // merges instead of compounded cell-forced pairings. 0 = pure octree
+        // to the bucket root (OctreeLodBuildOptions::bhatt_top_nodes).
+        std::uint32_t octree_bhatt_top_nodes = 32768;
+        // Replicates the source across a tiles_x by tiles_y grid on the X/Y
+        // ground plane, offsetting each instance by the scene extent plus a
+        // 1% margin. The source PLY is replayed once per tile, so no tiled
+        // intermediate file is needed; total splats multiply accordingly.
+        std::uint32_t tiles_x = 1;
+        std::uint32_t tiles_y = 1;
         ExportProgressCallback progress = nullptr;
     };
 

@@ -1806,6 +1806,9 @@ namespace lfs::vis {
                         }
                     }
                     vksplat_viewport_renderer_->setLodPagePoolBudget(pool_budget_splats);
+                    vksplat_viewport_renderer_->setLodPoolVramFraction(settings_.lod_pool_vram_fraction);
+                    vksplat_viewport_renderer_->setLodFadeFrames(
+                        static_cast<std::uint32_t>(std::max(settings_.lod_fade_frames, 0)));
                     if (auto page_snapshot = vksplat_viewport_renderer_->ensureLodPageCacheSnapshot(*model);
                         page_snapshot &&
                         page_snapshot->generation != lod_controller_page_map_generation_) {

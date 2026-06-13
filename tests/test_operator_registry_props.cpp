@@ -98,7 +98,7 @@ protected:
                       0.0f,
                       0.0f,
                   }) {
-        scene_manager_->getScene().addNode(
+        scene_manager_->getScene().addSplat(
             name,
             make_test_splat(xyz));
     }

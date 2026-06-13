@@ -236,7 +236,9 @@ namespace lfs::vis::op {
                     }
                 }
 
-                scene.reparent(node->id, desired_parent);
+                if (!scene.reparent(node->id, desired_parent)) {
+                    throw std::runtime_error("Failed to reparent node '" + current_name + "'");
+                }
                 node = scene.getMutableNode(current_name);
                 if (!node || node->parent_id != desired_parent) {
                     throw std::runtime_error("Failed to reparent node '" + current_name + "'");
@@ -1109,7 +1111,7 @@ namespace lfs::vis::op {
                 return false;
             }
 
-            auto* restored = scene.getMutableNode(snapshot.name);
+            auto* restored = scene.getNodeById(node_id);
             if (!restored) {
                 return false;
             }
@@ -1122,7 +1124,7 @@ namespace lfs::vis::op {
             restored->transform_dirty = true;
 
             if (snapshot.source_path) {
-                scene_manager.setPlyPath(snapshot.name, *snapshot.source_path);
+                scene_manager.setPlyPath(restored->name, *snapshot.source_path);
             }
 
             for (const auto& child : snapshot.children) {

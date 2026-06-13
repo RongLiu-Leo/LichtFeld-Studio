@@ -98,6 +98,14 @@ struct VulkanGSPipelineBuffers {
     Buffer<float> scaling_raw; // (N, 3), log-scale
     Buffer<float> opacity_raw; // (N, 1), logits
 
+    // Canonical quantized LOD pool (lod_pool_quant.hpp). When quant_pool is
+    // set, sh0/shN/rotations/scaling_raw/opacity_raw hold the packed formats
+    // (f16 / s8 slots) and projection uses the *_quant pipeline with the
+    // per-page dequant frames bound last.
+    Buffer<float> page_frames; // (pages, 16) floats
+    bool quant_pool = false;
+    uint32_t pool_page_splats = 0;
+
     // projection outputs
     Buffer<int32_t> tiles_touched;    // (N,)
     Buffer<int64_t> rect_tile_space;  // (N,)
@@ -186,7 +194,11 @@ struct VulkanGSPipelineBuffers {
     Buffer<float> lod_gpu_weights;            // [M] GPU-produced transition opacity weights
     Buffer<uint32_t> lod_gpu_counts;          // [0]=selected, [1]=overflow
     Buffer<uint32_t> lod_chunk_touch;         // [C] per-chunk traversal priority (0xffffffff = in use)
-    Buffer<uint32_t> lod_gpu_levels;          // [M] GPU-produced splat LOD levels
+    // GPU-compacted chunk_touch (Phase D): counts[4], protected ids, miss pairs.
+    Buffer<uint32_t> lod_compact_counts;
+    Buffer<uint32_t> lod_compact_protected;
+    Buffer<uint32_t> lod_compact_misses;
+    Buffer<uint32_t> lod_gpu_levels; // [M] GPU-produced splat LOD levels
     bool has_lod_indices = false;
     bool has_lod_logical_indices = false;
     bool has_lod_levels = false;

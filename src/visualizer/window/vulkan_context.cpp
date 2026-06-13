@@ -22,6 +22,7 @@
 #include <utility>
 
 #include <SDL3/SDL_vulkan.h>
+#include <cuda_runtime.h>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -70,6 +71,24 @@ namespace lfs::vis {
             if (existing == extensions.end()) {
                 extensions.push_back(extension_name);
             }
+        }
+
+        [[nodiscard]] bool isPreVoltaCudaDevice(const std::array<std::uint8_t, VK_UUID_SIZE>& vk_device_uuid) {
+            int device_count = 0;
+            if (cudaGetDeviceCount(&device_count) != cudaSuccess) {
+                return false;
+            }
+            for (int device = 0; device < device_count; ++device) {
+                cudaDeviceProp props{};
+                if (cudaGetDeviceProperties(&props, device) != cudaSuccess) {
+                    continue;
+                }
+                static_assert(sizeof(props.uuid.bytes) == VK_UUID_SIZE);
+                if (std::memcmp(props.uuid.bytes, vk_device_uuid.data(), VK_UUID_SIZE) == 0) {
+                    return props.major < 7;
+                }
+            }
+            return false;
         }
 
         [[nodiscard]] std::string vulkanApiVersionString(const uint32_t api_version) {
@@ -1523,8 +1542,14 @@ namespace lfs::vis {
 
         VkPhysicalDeviceHostImageCopyFeaturesEXT host_image_copy_features{};
         host_image_copy_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT;
-        const bool enable_host_image_copy_feature =
+        bool enable_host_image_copy_feature =
             enable_host_image_copy && supported_host_image_copy.hostImageCopy == VK_TRUE;
+        // Pascal drivers advertise hostImageCopy but crash inside
+        // vkTransitionImageLayoutEXT (#1298).
+        if (enable_host_image_copy_feature && isPreVoltaCudaDevice(device_uuid_)) {
+            LOG_INFO("Vulkan: disabling VK_EXT_host_image_copy on pre-Volta GPU (driver bug)");
+            enable_host_image_copy_feature = false;
+        }
         if (enable_host_image_copy_feature) {
             host_image_copy_features.hostImageCopy = VK_TRUE;
             host_image_copy_features.pNext = enabled_chain_head;

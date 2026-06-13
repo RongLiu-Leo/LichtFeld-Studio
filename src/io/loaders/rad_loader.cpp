@@ -92,6 +92,31 @@ namespace lfs::io {
 
         SplatData& data = *splat_result;
         if (radPagedGpuUploadRequested(data)) {
+            // Paged residency streams chunk payloads from disk, and that path
+            // is sidecar-backed end to end (upload engine, page sink, and
+            // selector metadata all gate on the meta view). Out-of-core loads
+            // attach it inside load_rad; in-core paged loads ensure it here.
+            if (!data.lod_tree->meta_view.valid()) {
+                auto view = open_rad_meta_sidecar(path);
+                if (!view) {
+                    if (auto built = build_rad_meta_sidecar(path); !built) {
+                        return make_error(ErrorCode::CORRUPTED_DATA,
+                                          std::format("RAD paged load requires the metadata "
+                                                      "sidecar: {}",
+                                                      built.error().message),
+                                          path);
+                    }
+                    view = open_rad_meta_sidecar(path);
+                }
+                if (!view) {
+                    return make_error(ErrorCode::CORRUPTED_DATA,
+                                      std::format("RAD paged load requires the metadata "
+                                                  "sidecar: {}",
+                                                  view.error()),
+                                      path);
+                }
+                data.lod_tree->meta_view = *view;
+            }
             const char* const page_capacity_env = std::getenv("LFS_LOD_PAGE_CAPACITY");
             LOG_INFO("RAD paged LOD active: deferring full CUDA tensor migration "
                      "(chunks={}, requested_pages={})",

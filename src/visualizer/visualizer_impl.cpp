@@ -627,8 +627,7 @@ namespace lfs::vis {
                 return;
             }
 
-            viewport_.camera.R = *rotation;
-            viewport_.camera.t = eye;
+            viewport_.setViewMatrix(*rotation, eye);
             viewport_.camera.setPivot(target);
 
             if (rendering_manager_)
@@ -652,8 +651,7 @@ namespace lfs::vis {
             }
 
             Viewport& vp = rendering_manager_->resolvePanelViewport(viewport_, panel);
-            vp.camera.R = *rotation;
-            vp.camera.t = eye;
+            vp.setViewMatrix(*rotation, eye);
             vp.camera.setPivot(target);
 
             rendering_manager_->markDirty(DirtyFlag::CAMERA);
@@ -954,6 +952,14 @@ namespace lfs::vis {
         // Asset Manager save event handler
         cmd::SaveAsset::when([this](const auto& cmd) {
             python::invoke_save_asset(cmd.node_name);
+        });
+
+        cmd::SaveAssetById::when([this](const auto& cmd) {
+            if (!scene_manager_)
+                return;
+            const auto* node = scene_manager_->getScene().getNodeById(static_cast<core::NodeId>(cmd.node_id));
+            if (node)
+                python::invoke_save_asset(node->name);
         });
     }
 

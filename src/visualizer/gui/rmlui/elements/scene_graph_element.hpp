@@ -111,6 +111,7 @@ namespace lfs::vis::gui {
         void ensureRowPool(size_t count);
         void clear();
         void markStateDirty();
+        void claimRenameTextInputFocus() const;
         void captureRenameBuffer();
         void rebuildFlatRows(const core::Scene& scene);
         bool syncSelectionFromScene(const core::Scene& scene, lfs::vis::SceneManager* scene_manager);
@@ -140,7 +141,7 @@ namespace lfs::vis::gui {
         void handleSecondaryClick(core::NodeId node_id, float mouse_x, float mouse_y);
         bool activateNode(core::NodeId node_id);
         bool moveSelection(int delta, bool extend);
-        std::vector<std::string> rangeSelectionNames(core::NodeId a, core::NodeId b) const;
+        std::vector<core::NodeId> rangeSelectionIds(core::NodeId a, core::NodeId b) const;
         core::NodeId selectionCursor() const;
         bool isTextInputTarget(Rml::Element* target) const;
         RowSlot* rowSlotFromTarget(Rml::Element* target);
@@ -152,7 +153,7 @@ namespace lfs::vis::gui {
         void showContextMenu(core::NodeId node_id, float mouse_x, float mouse_y);
         void showModelsHeaderContextMenu(float mouse_x, float mouse_y);
         bool isModelsHeaderTarget(Rml::Element* target) const;
-        std::vector<std::string> deletableSelectedNodeNames() const;
+        std::vector<core::NodeId> deletableSelectedNodeIds() const;
         void deleteSelectedNodes();
         void toggleChildrenTraining(core::NodeId group_id, bool enabled);
         void toggleSelectedTraining(bool enabled);

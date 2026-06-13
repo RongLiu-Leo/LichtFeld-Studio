@@ -150,10 +150,14 @@ _vulkan_add_slang_shader(prepare_tile_sort         prepare_tile_sort.slang)
 _vulkan_add_slang_shader(compact_visible_primitives compact_visible_primitives.slang)
 _vulkan_add_slang_shader(lod_map_indices           lod_map_indices.slang)
 _vulkan_add_slang_shader(lod_select_threshold      lod_select_threshold.slang)
+_vulkan_add_slang_shader(lod_compact_touch        lod_compact_touch.slang)
 
 # vertex_shader.slang → projection_forward variants
 _vulkan_add_slang_shader(projection_forward        vertex_shader.slang EXPORT_MODE=0)
 _vulkan_add_slang_shader(projection_forward_3dgut  vertex_shader.slang EXPORT_MODE=0 LFS_3DGUT_PROJECTION=1)
+# Canonical quantized LOD pool variants (lod_pool_quant.hpp)
+_vulkan_add_slang_shader(projection_forward_quant       vertex_shader.slang EXPORT_MODE=0 LFS_QUANT_POOL=1)
+_vulkan_add_slang_shader(projection_forward_quant_3dgut vertex_shader.slang EXPORT_MODE=0 LFS_3DGUT_PROJECTION=1 LFS_QUANT_POOL=1)
 
 # selection_mask.slang → compact 1-byte-per-splat brush/rectangle/polygon masks
 _vulkan_add_slang_shader(selection_mask            selection_mask.slang)
@@ -184,6 +188,7 @@ _vulkan_add_slang_shader(compose_tile_batches_plain      tile_batch_shader.slang
 _vulkan_add_slang_shader(cull_splats                  cull_splats.slang EXPORT_MODE=0 CULL_ENTRY=1)
 _vulkan_add_slang_shader(cull_prepare                 cull_splats.slang EXPORT_MODE=0 CULL_ENTRY=2)
 _vulkan_add_slang_shader(projection_forward_survivors vertex_shader.slang EXPORT_MODE=0 LFS_PROJECTION_SURVIVORS=1)
+_vulkan_add_slang_shader(projection_forward_quant_survivors vertex_shader.slang EXPORT_MODE=0 LFS_PROJECTION_SURVIVORS=1 LFS_QUANT_POOL=1)
 _vulkan_add_slang_shader(prepare_visible_chain        prepare_visible_chain.slang)
 _vulkan_add_slang_shader(copy_visible_indices         copy_visible_indices.slang)
 _vulkan_add_slang_shader(cumsum_block_scan_indirect        cumsum.slang CUMSUM_PHASE=1 CUMSUM_INDIRECT=1)

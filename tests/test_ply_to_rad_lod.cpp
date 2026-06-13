@@ -8,6 +8,8 @@
 
 #include <gtest/gtest.h>
 
+#include <set>
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -144,7 +146,8 @@ namespace {
         }
     }
 
-    void run_roundtrip(const std::size_t splat_count, const std::size_t target_bucket) {
+    void run_roundtrip(const std::size_t splat_count, const std::size_t target_bucket,
+                       const lfs::io::LodBuilder builder = lfs::io::LodBuilder::kBhatt) {
         const auto temp_dir = std::filesystem::temp_directory_path() / "ply_to_rad_lod_test";
         std::filesystem::create_directories(temp_dir);
         const auto ply_path = temp_dir / "synthetic.ply";
@@ -156,6 +159,7 @@ namespace {
         lfs::io::PlyToRadLodOptions options;
         options.target_bucket_splats = target_bucket;
         options.temp_dir = temp_dir / "scratch";
+        options.builder = builder;
         const auto convert_result = lfs::io::convert_ply_to_rad_lod(ply_path, rad_path, options);
         ASSERT_TRUE(convert_result.has_value())
             << convert_result.error().message;
@@ -198,6 +202,67 @@ TEST(PlyToRadLod, MultiBucketRoundtrip) {
 
 TEST(PlyToRadLod, SingleBucketRoundtrip) {
     run_roundtrip(50'000, 4'000'000);
+}
+
+TEST(PlyToRadLod, MultiBucketRoundtripOctree) {
+    run_roundtrip(300'000, 65'536, lfs::io::LodBuilder::kOctree);
+}
+
+TEST(PlyToRadLod, SingleBucketRoundtripOctree) {
+    run_roundtrip(50'000, 4'000'000, lfs::io::LodBuilder::kOctree);
+}
+
+TEST(PlyToRadLod, TileGridDoublesLeaves) {
+    const auto temp_dir = std::filesystem::temp_directory_path() / "ply_to_rad_lod_tiles";
+    std::filesystem::remove_all(temp_dir);
+    std::filesystem::create_directories(temp_dir);
+    const auto ply_path = temp_dir / "synthetic.ply";
+    const auto rad_path = temp_dir / "synthetic.rad";
+
+    constexpr std::size_t kSplats = 20'000;
+    const auto splats = make_synthetic_splats(kSplats);
+    write_synthetic_ply(ply_path, splats);
+
+    lfs::io::PlyToRadLodOptions options;
+    options.target_bucket_splats = 65'536;
+    options.temp_dir = temp_dir / "scratch";
+    options.tiles_x = 2;
+    options.tiles_y = 1;
+    const auto convert_result = lfs::io::convert_ply_to_rad_lod(ply_path, rad_path, options);
+    ASSERT_TRUE(convert_result.has_value()) << convert_result.error().message;
+
+    auto loaded = lfs::io::load_rad(rad_path);
+    ASSERT_TRUE(loaded.has_value()) << loaded.error();
+    ASSERT_TRUE(loaded->lod_tree && loaded->lod_tree->has_tree());
+
+    TreeCheckResult check;
+    check_tree_invariants(*loaded, check);
+    if (::testing::Test::HasFatalFailure()) {
+        return;
+    }
+    EXPECT_EQ(check.leaf_count, 2 * kSplats);
+
+    // Tile 1 replicates every source splat at +X by the exact scene extent
+    // plus the 1% margin, computed the same way the converter does.
+    float min_x = std::numeric_limits<float>::max();
+    float max_x = std::numeric_limits<float>::lowest();
+    for (const auto& s : splats) {
+        min_x = std::min(min_x, s.x);
+        max_x = std::max(max_x, s.x);
+    }
+    const float step_x = (max_x - min_x) * 1.01f;
+    std::vector<std::array<float, 3>> expected_positions;
+    expected_positions.reserve(2 * kSplats);
+    for (const auto& s : splats) {
+        expected_positions.push_back({s.x, s.y, s.z});
+        expected_positions.push_back({s.x + step_x, s.y, s.z});
+    }
+    auto actual_positions = check.leaf_positions;
+    std::sort(expected_positions.begin(), expected_positions.end());
+    std::sort(actual_positions.begin(), actual_positions.end());
+    EXPECT_EQ(expected_positions, actual_positions);
+
+    std::filesystem::remove_all(temp_dir);
 }
 
 TEST(PlyToRadLod, SweepsStaleTempDirsFromCrashedRuns) {
@@ -269,29 +334,59 @@ TEST(PlyToRadLod, OutOfCoreLoadKeepsTreeAndStreamsChunks) {
     ASSERT_TRUE(full.has_value()) << full.error();
     const auto total_nodes = full->lod_tree->total_nodes();
 
-    setenv("LFS_RAD_OOC", "1", 1);
-    setenv("LFS_RAD_PREVIEW_SPLATS", "131072", 1);
-    auto partial = lfs::io::load_rad(rad_path);
-    unsetenv("LFS_RAD_OOC");
-    unsetenv("LFS_RAD_PREVIEW_SPLATS");
+    auto partial = lfs::io::load_rad(
+        rad_path, {.out_of_core = true, .preview_splats = 131072});
     ASSERT_TRUE(partial.has_value()) << partial.error();
 
     // Tree metadata covers all nodes; payload tensors hold the coarse prefix.
+    // Out-of-core loads back the metadata with the mmap'd sidecar instead of
+    // in-RAM vectors; the accessors must agree bit-exactly with the full load.
     ASSERT_TRUE(partial->lod_tree && partial->lod_tree->has_tree());
     EXPECT_EQ(partial->lod_tree->total_nodes(), total_nodes);
     EXPECT_EQ(static_cast<std::size_t>(partial->size()), 131072u);
     EXPECT_LT(static_cast<std::size_t>(partial->size()), total_nodes);
     EXPECT_TRUE(lfs::io::rad_paged_load_recommended(*partial));
+    EXPECT_TRUE(partial->lod_tree->meta_view.valid()) << "sidecar must back OOC tree metadata";
+    EXPECT_FALSE(partial->lod_tree->nodes_in_memory());
+    EXPECT_TRUE(std::filesystem::exists(lfs::io::rad_meta_sidecar_path(rad_path)));
 
-    EXPECT_EQ(partial->lod_tree->centers.size(), total_nodes);
-    EXPECT_EQ(partial->lod_tree->sizes.size(), total_nodes);
+    // Links are bit-exact; bounds carry the sidecar's per-chunk u16
+    // quantization, so they compare within the frame's step size.
     for (std::size_t i = 0; i < total_nodes; ++i) {
-        EXPECT_EQ(partial->lod_tree->centers[i].x, full->lod_tree->centers[i].x);
-        EXPECT_EQ(partial->lod_tree->sizes[i], full->lod_tree->sizes[i]);
-        EXPECT_EQ(partial->lod_tree->child_start[i], full->lod_tree->child_start[i]);
-        EXPECT_EQ(partial->lod_tree->child_count[i], full->lod_tree->child_count[i]);
+        const auto& frame = partial->lod_tree->meta_view.chunkOf(i);
+        const float center_tol = std::max(
+            {2.0f * frame.bbox_extent[0] / 65535.0f,
+             2.0f * frame.bbox_extent[1] / 65535.0f,
+             2.0f * frame.bbox_extent[2] / 65535.0f,
+             1e-6f});
+        EXPECT_NEAR(partial->lod_tree->center_at(i).x, full->lod_tree->center_at(i).x, center_tol);
+        const float size_tol =
+            full->lod_tree->size_at(i) *
+                std::max(2.0f * frame.log_size_range / 65535.0f, 1e-6f) +
+            1e-12f;
+        EXPECT_NEAR(partial->lod_tree->size_at(i), full->lod_tree->size_at(i), size_tol);
+        EXPECT_EQ(partial->lod_tree->child_start_at(i), full->lod_tree->child_start_at(i));
+        EXPECT_EQ(partial->lod_tree->child_count_at(i), full->lod_tree->child_count_at(i));
+        EXPECT_EQ(partial->lod_tree->level_at(i), full->lod_tree->level_at(i));
         if (HasFailure()) {
             FAIL() << "tree mismatch at node " << i;
+        }
+    }
+
+    // Parent links in the sidecar must agree with a reference forward scatter
+    // over the full in-RAM tree.
+    {
+        std::vector<std::uint32_t> reference_parent(total_nodes, 0xFFFFFFFFu);
+        for (std::size_t p = 0; p < total_nodes; ++p) {
+            const std::uint32_t cc = full->lod_tree->child_count_at(p);
+            const std::uint32_t cs = full->lod_tree->child_start_at(p);
+            for (std::uint32_t c = 0; c < cc; ++c) {
+                reference_parent[cs + c] = static_cast<std::uint32_t>(p);
+            }
+        }
+        for (std::size_t i = 0; i < total_nodes; ++i) {
+            ASSERT_EQ(partial->lod_tree->meta_view.links[i].parent, reference_parent[i])
+                << "sidecar parent mismatch at node " << i;
         }
     }
 
@@ -343,8 +438,8 @@ TEST(PlyToRadLod, ValidateExternalRad) {
     std::vector<std::uint8_t> parent_count(n, 0);
     std::size_t leaf_count = 0;
     for (std::size_t i = 0; i < n; ++i) {
-        const std::uint32_t cc = tree.child_count[i];
-        const std::uint32_t cs = tree.child_start[i];
+        const std::uint32_t cc = tree.child_count_at(i);
+        const std::uint32_t cs = tree.child_start_at(i);
         if (cc == 0) {
             ++leaf_count;
             continue;
@@ -376,8 +471,94 @@ TEST(PlyToRadLod, ValidateExternalRad) {
         ASSERT_EQ(chunk->count, range.count);
         for (std::size_t i = 0; i < chunk->count; ++i) {
             const std::size_t node = chunk->base + i;
-            ASSERT_EQ(chunk->means[i * 3 + 0], tree.centers[node].x)
-                << "chunk/tree center mismatch at node " << node;
+            if (tree.meta_view.valid()) {
+                // Out-of-core centers dequantize from the sidecar's u16
+                // boundsQ against the chunk AABB; exactness ends there.
+                const auto& frame =
+                    tree.meta_view.chunks[node / lfs::core::SplatLodTree::kChunkSplats];
+                const float tol = frame.bbox_extent[0] / 65535.0f + 1e-6f;
+                ASSERT_NEAR(chunk->means[i * 3 + 0], tree.center_at(node).x, tol)
+                    << "chunk/tree center mismatch at node " << node;
+            } else {
+                ASSERT_EQ(chunk->means[i * 3 + 0], tree.center_at(node).x)
+                    << "chunk/tree center mismatch at node " << node;
+            }
+        }
+    }
+}
+
+// Layout audit: simulates view-local cuts straight from the sidecar and
+// reports how many distinct chunks each layout needs. Run with
+// LFS_RAD_AUDIT=<file.rad> against two files to compare layouts.
+TEST(PlyToRadLod, TreeletLayoutAudit) {
+    const char* const target = std::getenv("LFS_RAD_AUDIT");
+    if (target == nullptr) {
+        GTEST_SKIP() << "set LFS_RAD_AUDIT to run";
+    }
+    auto view = lfs::io::open_rad_meta_sidecar(target);
+    ASSERT_TRUE(view.has_value()) << view.error();
+    const std::size_t n = view->node_count;
+    const auto level_of = [&](const std::uint32_t i) {
+        return (view->links[i].packed >> 16u) & 0xffu;
+    };
+    const auto count_of = [&](const std::uint32_t i) {
+        return view->links[i].packed & 0xffffu;
+    };
+    constexpr std::size_t kChunk = lfs::core::SplatLodTree::kChunkSplats;
+
+    for (const std::uint32_t seed_level : {6u, 10u, 14u}) {
+        std::vector<std::uint32_t> seeds;
+        for (std::uint32_t i = 0; i < n && seeds.size() < 4096; ++i) {
+            if (level_of(i) == seed_level) {
+                seeds.push_back(i);
+            }
+            if (level_of(i) > seed_level + 1u) {
+                break;
+            }
+        }
+        if (seeds.size() < 64) {
+            continue;
+        }
+        // Spread 64 seeds across the level.
+        std::vector<std::uint32_t> picked;
+        for (std::size_t k = 0; k < 64; ++k) {
+            picked.push_back(seeds[k * seeds.size() / 64]);
+        }
+        for (const std::uint32_t descend : {4u, 8u}) {
+            std::vector<std::uint32_t> cut;
+            std::vector<std::uint32_t> frontier;
+            std::vector<std::uint32_t> next;
+            for (const std::uint32_t seed : picked) {
+                frontier.assign(1, seed);
+                for (std::uint32_t d = 0; d < descend && !frontier.empty(); ++d) {
+                    next.clear();
+                    for (const std::uint32_t node : frontier) {
+                        const std::uint32_t cc = count_of(node);
+                        for (std::uint32_t c = 0; c < cc; ++c) {
+                            next.push_back(view->links[node].child_start + c);
+                        }
+                    }
+                    frontier.swap(next);
+                }
+                cut.insert(cut.end(), frontier.begin(), frontier.end());
+            }
+            if (cut.empty()) {
+                continue;
+            }
+            // Sweep hypothetical page sizes: membership is just node/size, so
+            // the same file predicts utilization at any granularity.
+            for (const std::size_t page : {kChunk, kChunk / 4, kChunk / 8}) {
+                std::set<std::uint64_t> chunks;
+                for (const std::uint32_t node : cut) {
+                    chunks.insert(node / page);
+                }
+                std::printf(
+                    "audit level=%u+%u page=%zu: cut=%zu chunks=%zu nodes/chunk=%.0f util=%.1f%%\n",
+                    seed_level, descend, page, cut.size(), chunks.size(),
+                    static_cast<double>(cut.size()) / static_cast<double>(chunks.size()),
+                    100.0 * static_cast<double>(cut.size()) /
+                        (static_cast<double>(chunks.size()) * static_cast<double>(page)));
+            }
         }
     }
 }

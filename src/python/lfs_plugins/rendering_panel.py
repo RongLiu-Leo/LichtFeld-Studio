@@ -73,7 +73,7 @@ SLIDER_PROPS = [
     "ppisp_gamma_red", "ppisp_gamma_green", "ppisp_gamma_blue",
     "ppisp_crf_toe", "ppisp_crf_shoulder",
     "lod_render_scale", "lod_cone_foveation", "lod_cone_inner_degrees", "lod_cone_outer_degrees",
-    "lod_page_pool_splats",
+    "lod_page_pool_splats", "lod_pool_vram_fraction", "lod_fade_frames",
 ]
 
 SCRUB_FIELD_DEFS = {
@@ -111,6 +111,8 @@ SCRUB_FIELD_DEFS = {
     ),
     "lod_render_scale": ScrubFieldSpec(0.1, 5.0, 0.1, "%.1f"),
     "lod_page_pool_splats": ScrubFieldSpec(0.0, 100_000_000.0, 1_000_000.0, "%d", data_type=int),
+    "lod_pool_vram_fraction": ScrubFieldSpec(0.05, 0.9, 0.05, "%.2f"),
+    "lod_fade_frames": ScrubFieldSpec(0.0, 60.0, 1.0, "%d", data_type=int),
     "lod_cone_foveation": ScrubFieldSpec(0.1, 2.0, 0.1, "%.1f"),
     "lod_cone_inner_degrees": ScrubFieldSpec(0.0, 180.0, 1.0, "%.0f"),
     "lod_cone_outer_degrees": ScrubFieldSpec(0.0, 180.0, 1.0, "%.0f"),
@@ -201,6 +203,8 @@ LOCALE_KEY = {
     "lod_debug_mode": "rendering_panel.lod_debug_mode",
     "lod_max_splats": "rendering_panel.lod_max_splats",
     "lod_page_pool_splats": "rendering_panel.lod_page_pool_splats",
+    "lod_pool_vram_fraction": "rendering_panel.lod_pool_vram_fraction",
+    "lod_fade_frames": "rendering_panel.lod_fade_frames",
     "lod_render_scale": "rendering_panel.lod_render_scale",
     "lod_cone_foveation": "rendering_panel.lod_cone_foveation",
     "lod_cone_inner_degrees": "rendering_panel.lod_cone_inner_degrees",
@@ -510,23 +514,6 @@ class RenderingPanel(Panel):
         model.bind_func("simplify_progress_stage", lambda: self._simplify_progress_stage)
         model.bind_func("simplify_show_error", lambda: bool(self._simplify_error_text))
         model.bind_func("simplify_error_text", lambda: self._simplify_error_text)
-
-        model.bind_func("tooltip_lod_enabled",
-                         lambda: lf.ui.tr("tooltip.lod_enabled") or "")
-        model.bind_func("tooltip_lod_max_splats",
-                         lambda: lf.ui.tr("tooltip.lod_max_splats") or "")
-        model.bind_func("tooltip_lod_page_pool_splats",
-                         lambda: lf.ui.tr("tooltip.lod_page_pool_splats") or "")
-        model.bind_func("tooltip_lod_render_scale",
-                         lambda: lf.ui.tr("tooltip.lod_render_scale") or "")
-        model.bind_func("tooltip_lod_cone_foveation",
-                         lambda: lf.ui.tr("tooltip.lod_cone_foveation") or "")
-        model.bind_func("tooltip_lod_cone_inner_degrees",
-                         lambda: lf.ui.tr("tooltip.lod_cone_inner_degrees") or "")
-        model.bind_func("tooltip_lod_cone_outer_degrees",
-                         lambda: lf.ui.tr("tooltip.lod_cone_outer_degrees") or "")
-        model.bind_func("tooltip_lod_debug_mode",
-                         lambda: lf.ui.tr("tooltip.lod_debug_mode") or "")
 
         model.bind("theme_vignette_enabled",
                    lambda: bool((vignette := _theme_vignette()) and vignette.enabled),

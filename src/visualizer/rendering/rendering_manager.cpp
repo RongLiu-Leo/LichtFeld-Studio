@@ -269,6 +269,9 @@ namespace lfs::vis {
                 stats.gpu_pixel_scale_feedback = gpu.pixel_scale_feedback;
                 stats.pool_pages = gpu.pool_pages;
                 stats.streaming_jobs = gpu.streaming_jobs;
+                stats.miss_chunks = gpu.miss_chunks;
+                stats.deferred_requests = gpu.deferred_requests;
+                stats.admission_frozen = gpu.admission_frozen;
             }
         }
 

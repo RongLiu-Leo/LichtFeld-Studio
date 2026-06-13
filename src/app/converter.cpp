@@ -9,6 +9,7 @@
 #include "core/splat_data.hpp"
 #include "indicators.hpp"
 #include "io/exporter.hpp"
+#include "io/formats/rad.hpp"
 #include "io/loader.hpp"
 #include "io/ply_to_rad_lod.hpp"
 #include "rendering/mesh2splat.hpp"
@@ -244,15 +245,50 @@ namespace lfs::app {
             return ext == ".ply";
         }
 
+        bool isRadExtension(const std::filesystem::path& path) {
+            auto ext = path.extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), [](const unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            return ext == ".rad";
+        }
+
+        // Migration for RAD LOD files written with an older splats-per-chunk:
+        // the loader rejects them, so rad -> rad routes through the re-chunker
+        // instead of the generic load/save pipeline.
+        bool rechunkRadFile(
+            const std::filesystem::path& input,
+            const std::filesystem::path& output) {
+            std::println("Re-chunking RAD LOD: {} -> {}",
+                         path_to_utf8(input), path_to_utf8(output));
+
+            ConvertProgressBar bar;
+            const auto result = lfs::io::rechunk_rad_lod(
+                input, output, [&bar](const float progress) {
+                    return bar.report(progress, "re-chunk");
+                });
+            if (!result) {
+                bar.abort();
+                LOG_ERROR("RAD re-chunk failed: {}", result.error().format());
+                std::println(stderr, "  Error: {}", result.error().message);
+                return false;
+            }
+            if (const auto sidecar = lfs::io::build_rad_meta_sidecar(output); !sidecar) {
+                bar.abort();
+                LOG_ERROR("Sidecar build failed: {}", sidecar.error().format());
+                std::println(stderr, "  Error: {}", sidecar.error().message);
+                return false;
+            }
+            bar.complete();
+            std::println("  Done");
+            return true;
+        }
+
         // Streaming path for PLYs where the monolithic in-memory LOD build is
         // the wrong tool: above one bucket of splats the bucketed converter is
         // much faster (parallel subtrees, small merge neighborhoods), and it
         // is mandatory once the workset would not fit in RAM.
         bool shouldStreamLodConvert(const std::filesystem::path& input) {
-            if (const char* const env = std::getenv("LFS_RAD_STREAM_LOD");
-                env != nullptr && env[0] != '\0') {
-                return env[0] != '0';
-            }
             const auto info = lfs::io::probe_ply_gaussians(input);
             if (!info) {
                 return false;
@@ -283,12 +319,18 @@ namespace lfs::app {
 
         bool streamLodConvertFile(
             const std::filesystem::path& input,
-            const std::filesystem::path& output) {
+            const std::filesystem::path& output,
+            const param::ConvertParameters& params) {
             std::println("Converting (out-of-core LOD): {} -> {}",
                          path_to_utf8(input), path_to_utf8(output));
 
             ConvertProgressBar bar;
             lfs::io::PlyToRadLodOptions options;
+            options.tiles_x = params.tiles_x;
+            options.tiles_y = params.tiles_y;
+            options.builder = params.lod_builder == param::LodBuilder::OCTREE
+                                  ? lfs::io::LodBuilder::kOctree
+                                  : lfs::io::LodBuilder::kBhatt;
             options.progress = [&bar](const float progress, const std::string& stage) {
                 return bar.report(progress, stage);
             };
@@ -310,9 +352,33 @@ namespace lfs::app {
             const std::filesystem::path& output,
             const param::ConvertParameters& params) {
 
+            const bool tiled = params.tiles_x > 1 || params.tiles_y > 1;
+            if (tiled && (params.format != param::OutputFormat::RAD || !isPlyExtension(input))) {
+                LOG_ERROR("--tiles requires a PLY input and RAD output: {}", path_to_utf8(input));
+                std::println(stderr, "  Error: --tiles requires a PLY input and RAD output");
+                return false;
+            }
+
+            if (params.format == param::OutputFormat::RAD && isRadExtension(input)) {
+                const auto needs_rechunk = lfs::io::rad_lod_needs_rechunk(input);
+                if (!needs_rechunk) {
+                    LOG_ERROR("RAD probe failed: {}", needs_rechunk.error());
+                    std::println(stderr, "  Error: {}", needs_rechunk.error());
+                    return false;
+                }
+                // Only stale-chunk LOD files take the migration path; current
+                // LOD and flat RADs round-trip through the generic pipeline.
+                if (*needs_rechunk) {
+                    return rechunkRadFile(input, output);
+                }
+            }
+
+            // An explicit non-default builder always takes the bucketed
+            // converter; the monolithic in-memory path is bhatt-only.
             if (params.format == param::OutputFormat::RAD && isPlyExtension(input) &&
-                shouldStreamLodConvert(input)) {
-                return streamLodConvertFile(input, output);
+                (tiled || params.lod_builder != param::LodBuilder::BHATT ||
+                 shouldStreamLodConvert(input))) {
+                return streamLodConvertFile(input, output, params);
             }
 
             std::println("Converting: {} -> {}", path_to_utf8(input), path_to_utf8(output));

@@ -84,16 +84,22 @@ namespace lfs::io {
         try {
             const auto copy_to_allocator =
                 [&](const lfs::core::Tensor& source, const std::string_view name) -> lfs::core::Tensor {
-                lfs::core::Tensor source_cuda =
-                    source.device() == lfs::core::Device::CUDA ? source : source.cuda();
-                if (!source_cuda.is_contiguous()) {
-                    source_cuda = source_cuda.contiguous();
-                }
-                const auto& shape = source_cuda.shape();
-                const size_t capacity = shape.rank() > 0 ? shape[0] : source_cuda.numel();
-                lfs::core::Tensor dst = allocator(shape, capacity, source_cuda.dtype(), name);
+                lfs::core::Tensor source_contiguous = source.is_contiguous() ? source : source.contiguous();
+                const auto& shape = source_contiguous.shape();
+                const size_t capacity = shape.rank() > 0 ? shape[0] : source_contiguous.numel();
+                lfs::core::Tensor dst = allocator(shape, capacity, source_contiguous.dtype(), name);
                 dst.set_name(std::string{name});
-                dst.copy_from(source_cuda);
+
+                // Viewer splat tensors are read directly by Vulkan. Match the PLY
+                // loader's known-good host-to-external upload path instead of
+                // relying on CUDA device-to-device copies into imported Vk memory.
+                if (dst.is_external_storage() &&
+                    dst.external_storage_kind() == "vulkan_external_buffer" &&
+                    source_contiguous.device() == lfs::core::Device::CUDA) {
+                    dst.copy_from(source_contiguous.cpu());
+                } else {
+                    dst.copy_from(source_contiguous);
+                }
                 return dst;
             };
 

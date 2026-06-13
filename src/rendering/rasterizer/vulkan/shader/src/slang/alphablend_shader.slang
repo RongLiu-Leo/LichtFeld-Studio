@@ -275,6 +275,8 @@ void main(
     #endif
     float4 curr_pixel_state = float4(0, 0, 0, 1);
     float median_depth = FAR_DEPTH;
+    float weighted_depth = 0.0f;
+    float weighted_alpha = 0.0f;
     bool is_inside = (pix_coord.x < W && pix_coord.y < H);
     bool thread_active = is_inside;
 
@@ -477,6 +479,11 @@ void main(
             #endif
 
                 float4 new_pixel_state = update_pixel_state(curr_pixel_state, gauss_rgba);
+                if (uniforms.expected_far > 0.0f && splat_depth <= uniforms.expected_far) {
+                    float depth_weight = gauss_rgba.a * curr_pixel_state.a;
+                    weighted_depth += depth_weight * splat_depth;
+                    weighted_alpha += depth_weight;
+                }
                 if (median_depth >= FAR_DEPTH && curr_pixel_state.a > 0.5f && new_pixel_state.a <= 0.5f) {
                     median_depth = splat_depth;
                 }
@@ -497,7 +504,18 @@ void main(
         int pix_id = pix_coord.y*W+pix_coord.x;
         n_contributors[pix_id] = local_n_contrib;
         final_pixel_state[pix_id] = curr_pixel_state;
-        final_pixel_depth[pix_id] = median_depth;
+        if (uniforms.expected_far > 0.0f) {
+            // Alpha-weighted (expected) depth: Sum(alpha_i*T_i*depth_i) / Sum(alpha_i*T_i),
+            // over contributors within the far bound. Defined wherever any opacity
+            // accumulates, so it has no median holes. The denominator is accumulated
+            // alongside the numerator (not derived from the final transmittance) so the
+            // two stay consistent on the saturating-splat break path, where
+            // curr_pixel_state is not updated before the loop exits.
+            final_pixel_depth[pix_id] =
+                weighted_alpha > 1.0e-4f ? (weighted_depth / weighted_alpha) : FAR_DEPTH;
+        } else {
+            final_pixel_depth[pix_id] = median_depth;
+        }
     }
 }
 

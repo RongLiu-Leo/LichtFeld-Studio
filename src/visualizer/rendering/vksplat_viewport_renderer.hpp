@@ -7,6 +7,8 @@
 #include "core/exportable_storage.hpp"
 #include "core/splat_data.hpp"
 #include "lod_page_cache.hpp"
+#include "lod_pool_quant.hpp"
+#include "lod_upload_engine.hpp"
 #include "rendering/cuda_vulkan_interop.hpp"
 #include "rendering/rasterizer/vulkan/src/gs_renderer.h"
 #include "rendering/rendering.hpp"
@@ -102,6 +104,14 @@ namespace lfs::vis {
             bool synchronize_input_upload = false;
         };
 
+        struct DepthSampleRequest {
+            glm::ivec2 pixel{0, 0};
+            // Coordinate space of `pixel`. When positive, the renderer maps the
+            // sample into the actual output image size for the selected slot.
+            glm::ivec2 source_size{0, 0};
+            OutputSlot output_slot = OutputSlot::Main;
+        };
+
         VksplatViewportRenderer();
         ~VksplatViewportRenderer();
 
@@ -164,6 +174,23 @@ namespace lfs::vis {
         [[nodiscard]] std::expected<std::shared_ptr<lfs::core::Tensor>, std::string> readOutputImageRgba8(
             VulkanContext& context,
             OutputSlot output_slot = OutputSlot::Main) const;
+        // Reads the most recent render's raw per-pixel linear depth (the
+        // final_pixel_depth buffer every chain writes) into an [H,W] CPU float32
+        // tensor. Valid only directly after a render into this slot, before the
+        // next render reuses the pixel_depth scratch.
+        [[nodiscard]] std::expected<std::shared_ptr<lfs::core::Tensor>, std::string> readPreviewDepth(
+            VulkanContext& context,
+            OutputSlot output_slot = OutputSlot::Preview) const;
+        // Forces the non-batched per-pixel rasterizer chain (not the macro-tile
+        // HiGS chain, whose depth is one median per macro-tile, nor the batched
+        // compose, which covers only a subset of pixels) so readPreviewDepth gets
+        // full per-pixel depth. When `expected` is set, that rasterizer writes
+        // alpha-weighted (expected) depth instead of the median — hole-free in
+        // low-opacity regions. Set only around a depth-capture render.
+        void setDepthCaptureMode(bool on, bool expected = false) {
+            depth_capture_mode_ = on;
+            depth_capture_expected_ = on && expected;
+        }
         [[nodiscard]] std::expected<void, std::string> readOutputImageIntoCpuHwc(
             VulkanContext& context,
             OutputSlot output_slot,
@@ -172,9 +199,7 @@ namespace lfs::vis {
             int destination_y) const;
         [[nodiscard]] std::expected<float, std::string> sampleDepthAtPixel(
             VulkanContext& context,
-            int x,
-            int y,
-            OutputSlot output_slot = OutputSlot::Main) const;
+            const DepthSampleRequest& request) const;
         [[nodiscard]] std::expected<lfs::core::Tensor, std::string> buildSelectionMask(
             VulkanContext& context,
             const lfs::core::SplatData& splat_data,
@@ -189,7 +214,17 @@ namespace lfs::vis {
         [[nodiscard]] std::optional<LodPageCache::Snapshot> lodPageCacheSnapshot(
             const lfs::core::SplatData& splat_data) const;
         // VRAM page-pool budget in splats for RAD-backed LoD streaming; 0 = full residency.
-        void setLodPagePoolBudget(std::size_t splats) { lod_page_pool_splats_ = splats; }
+        void setLodPagePoolBudget(std::size_t splats) {
+            lod_pool_sizing_dirty_ = lod_pool_sizing_dirty_ || lod_page_pool_splats_ != splats;
+            lod_page_pool_splats_ = splats;
+        }
+        // Fraction of free VRAM granted to the out-of-core page pool.
+        void setLodPoolVramFraction(float fraction) {
+            lod_pool_sizing_dirty_ = lod_pool_sizing_dirty_ || lod_pool_vram_fraction_ != fraction;
+            lod_pool_vram_fraction_ = fraction;
+        }
+        // Frames a newly streamed page fades in over; 0 disables fading.
+        void setLodFadeFrames(std::uint32_t frames) { lod_fade_frames_ = frames; }
 
         // Snapshot of the GPU LoD selector for stats overlays; counts are from
         // the deferred readback (one frame stale).
@@ -202,6 +237,9 @@ namespace lfs::vis {
             std::size_t resident_chunks = 0;
             std::size_t chunk_count = 0;
             std::size_t touched_chunks = 0;
+            std::size_t miss_chunks = 0;
+            std::size_t deferred_requests = 0;
+            bool admission_frozen = false;
             std::size_t pool_pages = 0;
             std::size_t streaming_jobs = 0;
         };
@@ -211,6 +249,7 @@ namespace lfs::vis {
         struct ComposePipeline;
         struct InputBindingResult {
             bool uses_temporary_upload_slot = false;
+            bool model_snapshot_changed = false;
         };
 
         [[nodiscard]] std::expected<void, std::string> ensureInitialized(VulkanContext& context);
@@ -227,7 +266,6 @@ namespace lfs::vis {
         [[nodiscard]] std::expected<void, std::string> ensureLodPageInputStorage(
             VulkanContext& context,
             const lfs::core::SplatData& splat_data,
-            std::size_t ring_slot,
             int upload_sh_degree);
         [[nodiscard]] std::expected<void, std::string> ensureGpuLodTreeStorage(
             const lfs::core::SplatData& splat_data);
@@ -235,6 +273,10 @@ namespace lfs::vis {
             const lfs::core::SplatData& splat_data,
             std::span<const LodPageCache::PendingUpload> uploads,
             std::size_t ring_slot);
+        void configureLodUploadEngine(const lfs::core::SplatData& splat_data);
+        void discardLodEngineResults(std::vector<LodPageCache::PendingUpload>&& results,
+                                     std::string_view reason);
+        void logLodUploadProgress(std::size_t published_pages);
         struct OverlayBindingViews {
             _VulkanBuffer selection_mask{};
             _VulkanBuffer preview_mask{};
@@ -279,7 +321,7 @@ namespace lfs::vis {
         // Fallback coalesced CUDA-imported VkBuffer per ring slot, holding raw
         // SplatData input regions back-to-back. Training tensors created as
         // Vulkan-external buffers bypass this allocation and are bound directly.
-        static constexpr std::size_t kInputRegionCount = 6;
+        static constexpr std::size_t kInputRegionCount = 7;
         static constexpr std::size_t kOverlayRegionCount = 7;
         static constexpr std::size_t kSelectionQueryRegionCount = 7;
         static constexpr std::size_t kRegionAlignment = 256; // VK minStorageBufferOffsetAlignment upper bound on common HW
@@ -426,12 +468,16 @@ namespace lfs::vis {
         bool lod_levels_upload_pending_ = false;
         bool lod_weights_upload_pending_ = false;
         float gpu_lod_pixel_scale_feedback_ = 1.0f;
+        // Consecutive readback frames with deferred wants but zero
+        // admissions and nothing in flight; gates the threshold descent and
+        // the keep-rendering liveness once it crosses the frozen window.
+        std::uint32_t gpu_lod_frozen_frames_ = 0;
         std::size_t gpu_lod_last_candidate_count_ = 0;
         std::size_t gpu_lod_last_overflow_count_ = 0;
-        // GPU traversal-touched chunks from the deferred selector readback,
-        // ordered for LodPageCache::submitTraversalPriority (protected chunks
-        // first for LRU refresh, then misses by descending priority).
-        std::vector<std::uint32_t> gpu_lod_prefetch_chunks_;
+        std::size_t gpu_lod_last_miss_count_ = 0;
+        // GPU traversal misses from the deferred selector readback, sorted by
+        // descending pixel-scale priority for LodPageCache decode scheduling.
+        std::vector<LodPageCache::ChunkRequest> gpu_lod_prefetch_requests_;
         std::vector<std::uint32_t> gpu_lod_protected_chunks_;
         bool gpu_lod_prefetch_valid_ = false;
         bool gpu_lod_selection_active_ = false;
@@ -439,14 +485,24 @@ namespace lfs::vis {
         const lfs::core::SplatData* lod_page_cache_model_ = nullptr;
         LodPageCache lod_page_cache_;
         std::size_t lod_page_pool_splats_ = 0;
+        float lod_pool_vram_fraction_ = 0.15f;
+        bool lod_pool_sizing_dirty_ = false;
+        std::uint32_t lod_fade_frames_ = 12;
+        std::uint64_t gpu_lod_last_page_generation_ = 0;
+        std::uint64_t gpu_lod_last_publish_frame_ = 0;
         struct GpuLodTreeStorage {
-            // Bounds layout: float4(center.xyz, size) per physical-page LoD node.
+            // Quantized sidecar records per physical-page node: RadMetaBoundsQ
+            // (2 words) and RadMetaLinksQ (3 words); the selector dequantizes
+            // against per-page frames and derives logical from page_to_chunk.
             Buffer<float> node_bounds;
-            // Link layout: uint4(child_start, packed(child_count:16, level:8, flags:8),
-            //                    parent_logical, logical).
             Buffer<std::uint32_t> node_links;
+            // Per-page dequant frames for the non-pool (in-core) path; pool
+            // models bind the page-input InputPageFrames region instead.
+            Buffer<float> page_frames;
             Buffer<std::uint32_t> page_to_chunk;
             Buffer<std::uint32_t> chunk_to_page;
+            // Per-page publish frame stamps driving selector fade-in.
+            Buffer<std::uint32_t> page_age;
             const lfs::core::SplatData* model = nullptr;
             std::size_t node_count = 0;
             std::size_t physical_node_capacity = 0;
@@ -459,6 +515,23 @@ namespace lfs::vis {
             bool valid = false;
         };
         GpuLodTreeStorage gpu_lod_tree_;
+        // CUDA-importable backing for node_bounds/node_links so the upload
+        // engine writes expanded tree metadata with page payloads; the
+        // Buffer shells above hold region views into it.
+        struct LodTreeMetaStorage {
+            VulkanContext::ExternalBuffer buffer{};
+            lfs::rendering::CudaVulkanBufferInterop interop{};
+            std::size_t bounds_offset = 0;
+            std::size_t links_offset = 0;
+            std::size_t capacity_nodes = 0;
+        };
+        LodTreeMetaStorage lod_tree_meta_;
+        // Pages published through the synchronous tensor path this frame
+        // (pinned roots / in-core); for view-backed trees only these need
+        // render-thread metadata writes — engine pages carry their own.
+        std::vector<std::uint32_t> lod_sync_meta_pages_;
+        LodUploadEngine::DeviceLayout lod_engine_layout_{};
+        const lfs::core::SplatData* lod_sink_model_ = nullptr;
         struct LodPageInputStorage {
             VulkanContext::ExternalBuffer buffer{};
             lfs::rendering::CudaVulkanBufferInterop interop{};
@@ -491,11 +564,20 @@ namespace lfs::vis {
         // counter — so the trainer/arena never wait a value a failed frame left
         // unsignaled.
         std::uint64_t last_signaled_render_value_ = 0;
+        // When set, render() takes the legacy per-pixel chain so the depth
+        // readback captures per-pixel depth (see setDepthCaptureMode).
+        bool depth_capture_mode_ = false;
+        // When set, the capture rasterizer writes expected (alpha-weighted) depth.
+        bool depth_capture_expected_ = false;
         std::array<std::uint64_t, kFrameRingSize> ring_completion_values_{};
         std::size_t next_ring_slot_ = 0;
         // Whether the last main render used the macro-tile chain; the
         // selection-overlay re-render reuses its sorted buffers and must match.
         bool last_render_used_macro_chain_ = false;
+        // The first frame after a model/input reset needs the synchronous
+        // render-tile chain so the viewport never presents the macro chain's
+        // zero-count warm-up frame.
+        bool macro_chain_warmup_pending_ = true;
         // Visible-splat capacity high-water mark, fed by the deferred raw emit
         // count (decays /8 per poll, grows after a clamped frame). 0 until the
         // first readback lands; the first frames size at the render domain.
@@ -566,6 +648,13 @@ namespace lfs::vis {
         // topology reallocations.
         std::vector<std::pair<std::uint64_t, std::vector<std::shared_ptr<void>>>>
             retired_input_storages_;
+
+        // Async RAD page streaming: decoded pages are packed and copied on the
+        // engine's own thread/stream; render frames only publish completions.
+        UploadTimeline lod_engine_timeline_{};
+        LodUploadEngine lod_upload_engine_;
+        std::uint64_t lod_upload_log_batches_ = 0;
+        bool lod_upload_log_converged_ = false;
     };
 
 } // namespace lfs::vis

@@ -381,18 +381,26 @@ VulkanGSRenderer::pollDeferredLodSelectionStats() {
         return std::nullopt;
     if (!timelineValueComplete(lod_selection_readback_signal_, lod_selection_readback_value_))
         return std::nullopt;
-    const size_t chunk_count = lod_selection_readback_chunk_count_;
-    if (!invalidateReadbackBuffer(lod_selection_readback_buffer_,
-                                  (2 + chunk_count) * sizeof(uint32_t)))
+    if (!invalidateReadbackBuffer(
+            lod_selection_readback_buffer_,
+            (2 + 4 + kLodCompactProtectedCap + 2 * kLodCompactMissCap) * sizeof(uint32_t)))
         return std::nullopt;
 
     LodSelectionStats stats{};
     stats.candidate_count = lod_selection_readback_mapped_[0];
     stats.rendered_capacity = lod_selection_readback_capacity_;
     stats.overflow_count = lod_selection_readback_mapped_[1];
-    if (chunk_count > 0) {
-        stats.chunk_touch.assign(lod_selection_readback_mapped_ + 2,
-                                 lod_selection_readback_mapped_ + 2 + chunk_count);
+    const uint32_t* const words = lod_selection_readback_mapped_;
+    const size_t protected_count =
+        std::min<size_t>(words[2], kLodCompactProtectedCap);
+    const size_t miss_count = std::min<size_t>(words[3], kLodCompactMissCap);
+    stats.protected_overflow = words[4];
+    stats.miss_overflow = words[5];
+    stats.protected_chunks.assign(words + 6, words + 6 + protected_count);
+    stats.miss_candidates.reserve(miss_count);
+    const uint32_t* const misses = words + 6 + kLodCompactProtectedCap;
+    for (size_t i = 0; i < miss_count; ++i) {
+        stats.miss_candidates.emplace_back(misses[i * 2], misses[i * 2 + 1]);
     }
     lod_selection_readback_pending_ = false;
     lod_selection_readback_signal_ = VK_NULL_HANDLE;
@@ -433,52 +441,42 @@ void VulkanGSRenderer::recordVisibleCountReadback(VulkanGSPipelineBuffers& buffe
 }
 
 void VulkanGSRenderer::recordLodSelectionReadback(VulkanGSPipelineBuffers& buffers,
-                                                  const size_t rendered_capacity,
-                                                  const size_t chunk_count) {
-    ensureLodSelectionReadback(chunk_count);
-    if (buffers.lod_gpu_counts.deviceBuffer.buffer == VK_NULL_HANDLE)
+                                                  const size_t rendered_capacity) {
+    // Fixed payload: 4 compact counts + protected ids + (chunk, priority)
+    // pairs; independent of the logical chunk count.
+    constexpr size_t kPayloadWords =
+        4 + kLodCompactProtectedCap + 2 * kLodCompactMissCap;
+    ensureLodSelectionReadback(kPayloadWords);
+    if (buffers.lod_gpu_counts.deviceBuffer.buffer == VK_NULL_HANDLE ||
+        buffers.lod_compact_counts.deviceBuffer.buffer == VK_NULL_HANDLE)
         return;
 
-    const bool copy_chunk_touch =
-        chunk_count > 0 &&
-        chunk_count <= lod_selection_readback_chunk_capacity_ &&
-        buffers.lod_chunk_touch.deviceBuffer.buffer != VK_NULL_HANDLE &&
-        buffers.lod_chunk_touch.deviceSize() >= chunk_count;
+    bufferMemoryBarrier({{buffers.lod_gpu_counts.deviceBuffer, COMPUTE_SHADER_WRITE},
+                         {buffers.lod_compact_counts.deviceBuffer, COMPUTE_SHADER_WRITE},
+                         {buffers.lod_compact_protected.deviceBuffer, COMPUTE_SHADER_WRITE},
+                         {buffers.lod_compact_misses.deviceBuffer, COMPUTE_SHADER_WRITE}},
+                        TRANSFER_READ);
 
-    std::vector<std::pair<_VulkanBuffer, BarrierMask>> src_barriers = {
-        {buffers.lod_gpu_counts.deviceBuffer, COMPUTE_SHADER_WRITE}};
-    if (copy_chunk_touch) {
-        src_barriers.push_back({buffers.lod_chunk_touch.deviceBuffer, COMPUTE_SHADER_WRITE});
-    }
-    bufferMemoryBarrier(src_barriers, TRANSFER_READ);
-
-    VkBufferCopy copy{};
-    copy.srcOffset = buffers.lod_gpu_counts.deviceBuffer.offset;
-    copy.dstOffset = 0;
-    copy.size = 2 * sizeof(uint32_t);
-    vkCmdCopyBuffer(command_buffer,
-                    buffers.lod_gpu_counts.deviceBuffer.buffer,
-                    lod_selection_readback_buffer_.buffer,
-                    1,
-                    &copy);
-    if (copy_chunk_touch) {
-        VkBufferCopy touch_copy{};
-        touch_copy.srcOffset = buffers.lod_chunk_touch.deviceBuffer.offset;
-        touch_copy.dstOffset = 2 * sizeof(uint32_t);
-        touch_copy.size = chunk_count * sizeof(uint32_t);
-        vkCmdCopyBuffer(command_buffer,
-                        buffers.lod_chunk_touch.deviceBuffer.buffer,
-                        lod_selection_readback_buffer_.buffer,
-                        1,
-                        &touch_copy);
-    }
+    const auto copy_region = [&](const _VulkanBuffer& src, const size_t dst_word,
+                                 const size_t words) {
+        VkBufferCopy copy{};
+        copy.srcOffset = src.offset;
+        copy.dstOffset = dst_word * sizeof(uint32_t);
+        copy.size = words * sizeof(uint32_t);
+        vkCmdCopyBuffer(command_buffer, src.buffer,
+                        lod_selection_readback_buffer_.buffer, 1, &copy);
+    };
+    copy_region(buffers.lod_gpu_counts.deviceBuffer, 0, 2);
+    copy_region(buffers.lod_compact_counts.deviceBuffer, 2, 4);
+    copy_region(buffers.lod_compact_protected.deviceBuffer, 6, kLodCompactProtectedCap);
+    copy_region(buffers.lod_compact_misses.deviceBuffer, 6 + kLodCompactProtectedCap,
+                2 * kLodCompactMissCap);
     bufferMemoryBarrier({{lod_selection_readback_buffer_, TRANSFER_WRITE}},
                         HOST_READ);
     lod_selection_readback_pending_ = true;
     lod_selection_readback_signal_ = VK_NULL_HANDLE;
     lod_selection_readback_value_ = 0;
     lod_selection_readback_capacity_ = rendered_capacity;
-    lod_selection_readback_chunk_count_ = copy_chunk_touch ? chunk_count : 0;
 }
 
 bool VulkanGSRenderer::invalidateReadbackBuffer(_VulkanBuffer& buffer, VkDeviceSize size) {
@@ -555,6 +553,9 @@ void VulkanGSRenderer::initializeExternal(const std::map<std::string, std::strin
     createComputePipeline(pipeline_compact_visible_primitives, spirv_paths.at("compact_visible_primitives"));
     createComputePipeline(pipeline_lod_map_indices, spirv_paths.at("lod_map_indices"));
     createComputePipeline(pipeline_lod_select_threshold, spirv_paths.at("lod_select_threshold"));
+    if (spirv_paths.count("lod_compact_touch")) {
+        createComputePipeline(pipeline_lod_compact_touch, spirv_paths.at("lod_compact_touch"));
+    }
 
     // HiGS viewer chain pipelines are optional so trainer-side users of this
     // renderer (which pass only the legacy shader set) keep working.
@@ -567,6 +568,11 @@ void VulkanGSRenderer::initializeExternal(const std::map<std::string, std::strin
     create_optional(pipeline_cull_splats, "cull_splats");
     create_optional(pipeline_cull_prepare, "cull_prepare");
     create_optional(pipeline_projection_forward_survivors, "projection_forward_survivors");
+    // Quant-pool projection variants exist only where the viewer registers
+    // them; a quant pool with a missing pipeline is a hard dispatch error.
+    create_optional(pipeline_projection_forward_quant, "projection_forward_quant");
+    create_optional(pipeline_projection_forward_quant_3dgut, "projection_forward_quant_3dgut");
+    create_optional(pipeline_projection_forward_quant_survivors, "projection_forward_quant_survivors");
     create_optional(pipeline_prepare_visible_chain, "prepare_visible_chain");
     create_optional(pipeline_copy_visible_indices, "copy_visible_indices");
     create_optional(pipeline_cumsum_indirect.block_scan, "cumsum_block_scan_indirect");
@@ -650,13 +656,19 @@ void VulkanGSRenderer::executeSelectLodThreshold(const VulkanGSLodSelectUniforms
                                                  VulkanGSPipelineBuffers& buffers,
                                                  const _VulkanBuffer& node_bounds,
                                                  const _VulkanBuffer& node_links,
-                                                 const _VulkanBuffer& chunk_to_page) {
+                                                 const _VulkanBuffer& chunk_to_page,
+                                                 const _VulkanBuffer& page_age,
+                                                 const _VulkanBuffer& page_frames,
+                                                 const _VulkanBuffer& page_to_chunk) {
     if (uniforms.node_count == 0 ||
         uniforms.physical_node_count == 0 ||
         uniforms.output_capacity == 0 ||
         node_bounds.buffer == VK_NULL_HANDLE ||
         node_links.buffer == VK_NULL_HANDLE ||
-        chunk_to_page.buffer == VK_NULL_HANDLE) {
+        chunk_to_page.buffer == VK_NULL_HANDLE ||
+        page_age.buffer == VK_NULL_HANDLE ||
+        page_frames.buffer == VK_NULL_HANDLE ||
+        page_to_chunk.buffer == VK_NULL_HANDLE) {
         return;
     }
 
@@ -683,6 +695,9 @@ void VulkanGSRenderer::executeSelectLodThreshold(const VulkanGSLodSelectUniforms
                             {out_weights, TRANSFER_COMPUTE_SHADER_WRITE},
                             {chunk_touch, TRANSFER_WRITE},
                             {out_levels, TRANSFER_COMPUTE_SHADER_WRITE},
+                            {page_age, TRANSFER_COMPUTE_SHADER_WRITE},
+                            {page_frames, TRANSFER_COMPUTE_SHADER_WRITE},
+                            {page_to_chunk, TRANSFER_COMPUTE_SHADER_WRITE},
                         },
                         COMPUTE_SHADER_READ_WRITE);
 
@@ -700,6 +715,9 @@ void VulkanGSRenderer::executeSelectLodThreshold(const VulkanGSLodSelectUniforms
             out_weights,
             chunk_touch,
             out_levels,
+            page_age,
+            page_frames,
+            page_to_chunk,
         });
 
     bufferMemoryBarrier({
@@ -710,7 +728,34 @@ void VulkanGSRenderer::executeSelectLodThreshold(const VulkanGSLodSelectUniforms
                             {out_levels, COMPUTE_SHADER_WRITE},
                         },
                         COMPUTE_SHADER_READ);
-    recordLodSelectionReadback(buffers, uniforms.output_capacity, uniforms.logical_chunk_count);
+
+    // Phase D: compact chunk_touch on the GPU so the readback and the CPU
+    // request pass scale with the working set, not the logical chunk count.
+    auto& compact_counts = clearDeviceBuffer(buffers.lod_compact_counts, 4);
+    auto& compact_protected =
+        resizeDeviceBuffer(buffers.lod_compact_protected, kLodCompactProtectedCap, true);
+    auto& compact_misses =
+        resizeDeviceBuffer(buffers.lod_compact_misses, 2 * kLodCompactMissCap, true);
+    const VulkanGSLodCompactUniforms compact_uniforms{
+        .chunk_count = uniforms.logical_chunk_count,
+        .protected_capacity = kLodCompactProtectedCap,
+        .miss_capacity = kLodCompactMissCap,
+        .pad0 = 0,
+    };
+    bufferMemoryBarrier({{chunk_touch, COMPUTE_SHADER_WRITE},
+                         {compact_counts, TRANSFER_WRITE}},
+                        COMPUTE_SHADER_READ_WRITE);
+    executeCompute(
+        {{uniforms.logical_chunk_count, 256}},
+        &compact_uniforms, sizeof(compact_uniforms),
+        pipeline_lod_compact_touch,
+        {
+            chunk_touch,
+            compact_counts,
+            compact_protected,
+            compact_misses,
+        });
+    recordLodSelectionReadback(buffers, uniforms.output_capacity);
 }
 
 void VulkanGSRenderer::executeProjectionForward(
@@ -823,10 +868,19 @@ void VulkanGSRenderer::executeProjectionForward(
         lod_counts_binding,
     };
 
+    VulkanGSRendererUniforms projection_uniforms = uniforms;
+    if (buffers.quant_pool) {
+        projection_uniforms.lod_page_splats = buffers.pool_page_splats;
+        projection_buffers.push_back(buffers.page_frames.deviceBuffer);
+    }
     executeCompute(
         {{num_splats, SUBGROUP_SIZE}},
-        &uniforms, sizeof(uniforms),
-        use_gut_projection ? pipeline_projection_forward_3dgut : pipeline_projection_forward,
+        &projection_uniforms, sizeof(projection_uniforms),
+        buffers.quant_pool
+            ? (use_gut_projection ? pipeline_projection_forward_quant_3dgut
+                                  : pipeline_projection_forward_quant)
+            : (use_gut_projection ? pipeline_projection_forward_3dgut
+                                  : pipeline_projection_forward),
         projection_buffers);
 }
 
@@ -1095,6 +1149,7 @@ void VulkanGSRenderer::executeRasterizeForward(
     const size_t num_tiles = static_cast<size_t>(uniforms.grid_height) * uniforms.grid_width;
     const bool use_batched_raster =
         !use_gut_rasterization &&
+        !depth_capture_ &&
         num_tiles > 0 &&
         buffers.num_indices >= kMinLoadBalancedRasterInstances &&
         buffers.num_indices / num_tiles >= kMinLoadBalancedAverageTileInstances;
@@ -2083,6 +2138,9 @@ void VulkanGSRenderer::executeProjectionForwardSurvivors(
     survivor_uniforms.sort_capacity = static_cast<uint32_t>(
         std::min<size_t>(visible_capacity,
                          static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+    if (buffers.quant_pool) {
+        survivor_uniforms.lod_page_splats = buffers.pool_page_splats;
+    }
 
     auto& unsorted_keys = resizeDeviceBuffer(buffers.unsorted_keys(), visible_capacity);
     auto& unsorted_idx = resizeDeviceBuffer(buffers.unsorted_gauss_idx(), visible_capacity);
@@ -2098,45 +2156,50 @@ void VulkanGSRenderer::executeProjectionForwardSurvivors(
     const _VulkanBuffer lod_counts_binding =
         (lod_counts.buffer != VK_NULL_HANDLE) ? lod_counts : unsorted_keys;
 
+    std::vector<_VulkanBuffer> projection_buffers = {
+        // inputs
+        buffers.xyz_ws.deviceBuffer,
+        buffers.sh0.deviceBuffer,
+        buffers.shN.deviceBuffer,
+        buffers.rotations.deviceBuffer,
+        buffers.scaling_raw.deviceBuffer,
+        buffers.opacity_raw.deviceBuffer,
+        // compact-slot outputs (slots 6 and 8 are absent from the
+        // pipeline layout; the entries are placeholders)
+        unsorted_keys,
+        resizeDeviceBuffer(buffers.rect_tile_space, visible_capacity),
+        unsorted_keys,
+        resizeDeviceBuffer(buffers.xy_vs, 2 * visible_capacity),
+        resizeDeviceBuffer(buffers.depths, visible_capacity),
+        resizeDeviceBuffer(buffers.inv_cov_vs_opacity, 4 * visible_capacity),
+        resizeDeviceBuffer(buffers.rgb, 3 * visible_capacity),
+        resizeDeviceBuffer(buffers.overlay_flags, visible_capacity),
+        transform_indices,
+        node_mask,
+        overlay_params,
+        model_transforms,
+        unsorted_keys,
+        lod_indices_binding,
+        lod_logical_indices_binding,
+        lod_levels_binding,
+        lod_weights_binding,
+        lod_counts_binding,
+        buffers.survivors.deviceBuffer,
+        buffers.survivor_state.deviceBuffer,
+        unsorted_idx,
+        buffers.visible_emit_count.deviceBuffer,
+        resizeDeviceBuffer(buffers.orig_ids, visible_capacity),
+    };
+    if (buffers.quant_pool) {
+        projection_buffers.push_back(buffers.page_frames.deviceBuffer);
+    }
     executeComputeIndirect(
         buffers.survivor_state.deviceBuffer,
         sizeof(uint32_t),
         &survivor_uniforms, sizeof(survivor_uniforms),
-        pipeline_projection_forward_survivors,
-        {
-            // inputs
-            buffers.xyz_ws.deviceBuffer,
-            buffers.sh0.deviceBuffer,
-            buffers.shN.deviceBuffer,
-            buffers.rotations.deviceBuffer,
-            buffers.scaling_raw.deviceBuffer,
-            buffers.opacity_raw.deviceBuffer,
-            // compact-slot outputs (slots 6 and 8 are absent from the
-            // pipeline layout; the entries are placeholders)
-            unsorted_keys,
-            resizeDeviceBuffer(buffers.rect_tile_space, visible_capacity),
-            unsorted_keys,
-            resizeDeviceBuffer(buffers.xy_vs, 2 * visible_capacity),
-            resizeDeviceBuffer(buffers.depths, visible_capacity),
-            resizeDeviceBuffer(buffers.inv_cov_vs_opacity, 4 * visible_capacity),
-            resizeDeviceBuffer(buffers.rgb, 3 * visible_capacity),
-            resizeDeviceBuffer(buffers.overlay_flags, visible_capacity),
-            transform_indices,
-            node_mask,
-            overlay_params,
-            model_transforms,
-            unsorted_keys,
-            lod_indices_binding,
-            lod_logical_indices_binding,
-            lod_levels_binding,
-            lod_weights_binding,
-            lod_counts_binding,
-            buffers.survivors.deviceBuffer,
-            buffers.survivor_state.deviceBuffer,
-            unsorted_idx,
-            buffers.visible_emit_count.deviceBuffer,
-            resizeDeviceBuffer(buffers.orig_ids, visible_capacity),
-        });
+        buffers.quant_pool ? pipeline_projection_forward_quant_survivors
+                           : pipeline_projection_forward_survivors,
+        projection_buffers);
 }
 
 void VulkanGSRenderer::executeSortPrimitivesByDepthVisible(

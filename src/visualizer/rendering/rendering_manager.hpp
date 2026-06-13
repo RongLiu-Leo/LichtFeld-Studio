@@ -143,6 +143,21 @@ namespace lfs::vis {
                                                                   std::optional<glm::vec3> background_color_override = std::nullopt,
                                                                   std::optional<bool> orthographic_override = std::nullopt,
                                                                   std::optional<float> ortho_scale_override = std::nullopt);
+
+        // Image + per-pixel linear depth from the same viewport render. When
+        // expected_depth is true, depth is alpha-weighted expected depth instead
+        // of median depth. image is [H,W,3] and depth is [H,W], both CPU float32.
+        struct PreviewRgbd {
+            std::shared_ptr<lfs::core::Tensor> image;
+            std::shared_ptr<lfs::core::Tensor> depth;
+        };
+        PreviewRgbd renderPreviewImageAndDepth(SceneManager* scene_manager,
+                                               const glm::mat3& camera_rotation,
+                                               const glm::vec3& camera_position,
+                                               float focal_length_mm,
+                                               int width, int height,
+                                               bool expected_depth = false,
+                                               std::optional<glm::vec3> background_color_override = std::nullopt);
         std::shared_ptr<lfs::core::Tensor> renderPreviewImageRgba8(SceneManager* scene_manager,
                                                                    const glm::mat3& camera_rotation,
                                                                    const glm::vec3& camera_position,
@@ -323,8 +338,19 @@ namespace lfs::vis {
         // Camera frustum picking
         int pickCameraFrustum(const glm::vec2& mouse_pos);
 
-        // Depth buffer access for tools (returns camera-space depth at pixel, or -1 if invalid)
+        // Depth access for tools (returns camera-space depth at pixel, or -1 if invalid).
         float getDepthAtPixel(int x, int y, std::optional<SplitViewPanelId> panel = std::nullopt) const;
+        struct ExpectedDepthSampleRequest {
+            SceneManager* scene_manager = nullptr;
+            const Viewport* viewport = nullptr;
+            glm::ivec2 render_size{0, 0};
+            glm::ivec2 pixel{0, 0};
+            float focal_length_mm = lfs::rendering::DEFAULT_FOCAL_LENGTH_MM;
+            bool orthographic = false;
+            float ortho_scale = lfs::rendering::DEFAULT_ORTHO_SCALE;
+        };
+        // Renders a fresh expected-depth preview for precise picking on sparse or low-opacity splats.
+        float renderExpectedDepthAtPixel(const ExpectedDepthSampleRequest& request);
         float renderDepthAtPixelForNodeMask(const SceneManager* scene_manager,
                                             const Viewport& viewport,
                                             const glm::ivec2& render_size,
@@ -542,6 +568,20 @@ namespace lfs::vis {
             std::optional<float> ortho_scale_override,
             std::optional<glm::vec3> background_color_override,
             std::optional<bool> transparent_background_override);
+        [[nodiscard]] std::expected<void, std::string> renderDepthCaptureToPreviewSlotWithState(
+            SceneManager* scene_manager,
+            const lfs::core::SplatData& model,
+            SceneRenderState scene_state,
+            const glm::mat3& camera_rotation,
+            const glm::vec3& camera_position,
+            float focal_length_mm,
+            int width,
+            int height,
+            bool render_lock_held,
+            bool expected_depth,
+            std::optional<glm::vec3> background_color_override,
+            std::optional<bool> orthographic_override,
+            std::optional<float> ortho_scale_override);
         std::shared_ptr<lfs::core::Tensor> renderPreviewImageTiledWithState(
             SceneManager* scene_manager,
             const lfs::core::SplatData& model,

@@ -254,7 +254,7 @@ namespace lfs::python {
     }
 
     TEST_F(SceneValidityTest, TrainingModelActiveCountUsesSyncedTopologyCount) {
-        dummy_scene_.addNode("Model", make_test_splat(2));
+        dummy_scene_.addSplat("Model", make_test_splat(2));
         dummy_scene_.setTrainingModelNode("Model");
 
         const auto model_id = dummy_scene_.getNodeIdByName("Model");
@@ -271,7 +271,7 @@ namespace lfs::python {
 
     TEST_F(SceneValidityTest, TrainingModelAccessDoesNotDependOnSceneVisibility) {
         constexpr size_t count = 4;
-        dummy_scene_.addNode("Model", make_test_splat(count));
+        dummy_scene_.addSplat("Model", make_test_splat(count));
         dummy_scene_.setTrainingModelNode("Model");
 
         dummy_scene_.setNodeVisibility("Model", false);
@@ -304,7 +304,7 @@ namespace lfs::python {
 
     TEST_F(SceneValidityTest, InitializeTrainingModelAdjustsExistingTrainingModelSHDegree) {
         constexpr size_t count = 4;
-        dummy_scene_.addNode("Model", make_test_splat(count, 3));
+        dummy_scene_.addSplat("Model", make_test_splat(count, 3));
         dummy_scene_.setTrainingModelNode("Model");
 
         core::param::TrainingParameters params;
@@ -321,7 +321,7 @@ namespace lfs::python {
     TEST_F(SceneValidityTest, InitializeTrainingModelMigratesExistingModelIntoProvidedAllocator) {
         constexpr size_t count = 4;
         constexpr size_t capacity = 16;
-        dummy_scene_.addNode("Model", make_test_splat(count, 1));
+        dummy_scene_.addSplat("Model", make_test_splat(count, 1));
         dummy_scene_.setTrainingModelNode("Model");
 
         struct AllocCall {
@@ -451,7 +451,7 @@ namespace lfs::python {
             make_external_float_tensor(owners, {count, size_t{1}}, capacity),
             1.0f,
             core::SplatData::ShNLayout::Swizzled);
-        dummy_scene_.addNode("Model", std::move(model));
+        dummy_scene_.addSplat("Model", std::move(model));
         dummy_scene_.setTrainingModelNode("Model");
 
         core::param::TrainingParameters params;
@@ -497,7 +497,7 @@ namespace lfs::python {
             make_external_float_tensor(owners, {count, size_t{1}}, capacity, "vulkan_external_buffer"),
             1.0f,
             core::SplatData::ShNLayout::Swizzled);
-        dummy_scene_.addNode("Model", std::move(model));
+        dummy_scene_.addSplat("Model", std::move(model));
         dummy_scene_.setTrainingModelNode("Model");
 
         core::param::TrainingParameters params;
