@@ -6002,14 +6002,14 @@ namespace lfs::vis::gui {
             if (const auto primary_panel = rendering->resolveViewerPanel(
                     viewer_->getViewport(),
                     viewport_layout_.pos, viewport_layout_.size, std::nullopt, SplitViewPanelId::Left)) {
-                primary_toolbar_x = primary_panel->x - viewport_layout_.pos.x;
+                primary_toolbar_x = primary_panel->x - screen.work_pos.x;
                 primary_toolbar_width = primary_panel->width;
             }
             if (const auto secondary_panel = rendering->resolveViewerPanel(
                     viewer_->getViewport(),
                     viewport_layout_.pos, viewport_layout_.size, std::nullopt, SplitViewPanelId::Right)) {
                 show_secondary_toolbar = secondary_panel->valid();
-                secondary_toolbar_x = secondary_panel->x - viewport_layout_.pos.x;
+                secondary_toolbar_x = secondary_panel->x - screen.work_pos.x;
                 secondary_toolbar_width = secondary_panel->width;
             }
         }
@@ -6041,7 +6041,7 @@ namespace lfs::vis::gui {
                     std::max(kSplitDividerMinWidthPx * current_ui_scale_,
                              std::round(t.viewport.border_size * current_ui_scale_ * 4.0f));
                 split_divider_state.visible = true;
-                split_divider_state.x = std::round((*divider_x - viewport_layout_.pos.x) - divider_width * 0.5f);
+                split_divider_state.x = std::round((*divider_x - screen.work_pos.x) - divider_width * 0.5f);
                 split_divider_state.y = content_bounds.y;
                 split_divider_state.width = divider_width;
                 split_divider_state.height = content_bounds.height;
