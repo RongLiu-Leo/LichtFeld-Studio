@@ -397,15 +397,18 @@ class AssetManagerPanel(Panel):
         self._sidebar_dragging: bool = False
         self._sidebar_drag_start_y: float = 0.0
         self._sidebar_start_height: float = 176.0
+        self._sidebar_resize_handle = None
         self._sidebar_height: float = 176.0
         self._right_panel_dragging: bool = False
         self._right_panel_drag_start_x: float = 0.0
         self._right_panel_start_width: float = 300.0
+        self._right_panel_resize_handle = None
         self._right_panel_width: float = 300.0
 
         self._bottom_panel_dragging: bool = False
         self._bottom_panel_drag_start_y: float = 0.0
         self._bottom_panel_start_height: float = 220.0
+        self._bottom_panel_resize_handle = None
         self._bottom_panel_height: float = 220.0
         self._asset_card_slot_width: float = ASSET_CARD_PREFERRED_WIDTH_DP
 
@@ -456,6 +459,11 @@ class AssetManagerPanel(Panel):
         model.bind_func("sidebar_height", lambda: f"{self._sidebar_height}dp")
         model.bind_func("right_panel_width", lambda: f"{self._right_panel_width}dp")
         model.bind_func("bottom_panel_height", lambda: f"{self._bottom_panel_height}dp")
+        model.bind_func("sidebar_resize_dragging", lambda: self._sidebar_dragging)
+        model.bind_func("right_panel_resize_dragging", lambda: self._right_panel_dragging)
+        model.bind_func(
+            "bottom_panel_resize_dragging", lambda: self._bottom_panel_dragging
+        )
         model.bind_func(
             "asset_card_slot_width",
             lambda: f"{self._asset_card_slot_width:.1f}dp",
@@ -3255,8 +3263,13 @@ class AssetManagerPanel(Panel):
         """Start dragging the sidebar resize handle."""
         self._sidebar_dragging = True
         self._sidebar_drag_start_y = float(event.get_parameter("mouse_y", "0"))
-        # Use the current height from instance variable
         self._sidebar_start_height = self._sidebar_height
+        self._sidebar_resize_handle = _handle
+        if _handle is not None:
+            try:
+                _handle.set_class("dragging", True)
+            except Exception:
+                pass
         event.stop_propagation()
 
     def on_sidebar_resize_delta(self, mouse_y: float) -> None:
@@ -3271,9 +3284,16 @@ class AssetManagerPanel(Panel):
         # The height is bound via data-style-height, so just dirty the model
         self._dirty_model("sidebar_height")
 
-    def on_sidebar_resize_end(self) -> None:
+    def on_sidebar_resize_end(self, handle=None) -> None:
         """End sidebar resize drag."""
         self._sidebar_dragging = False
+        handle = handle or self._sidebar_resize_handle
+        if handle is not None:
+            try:
+                handle.set_class("dragging", False)
+            except Exception:
+                pass
+        self._sidebar_resize_handle = None
 
     def on_right_panel_resize_start(self, _handle, event, _args):
         """Start dragging the right panel resize handle."""
@@ -3281,6 +3301,12 @@ class AssetManagerPanel(Panel):
         self._right_panel_drag_start_x = float(event.get_parameter("mouse_x", "0"))
         # Use the current width from instance variable
         self._right_panel_start_width = self._right_panel_width
+        self._right_panel_resize_handle = _handle
+        if _handle is not None:
+            try:
+                _handle.set_class("dragging", True)
+            except Exception:
+                pass
         event.stop_propagation()
 
     def on_right_panel_resize_delta(self, mouse_x: float) -> None:
@@ -3298,12 +3324,25 @@ class AssetManagerPanel(Panel):
     def on_right_panel_resize_end(self) -> None:
         """End right panel resize drag."""
         self._right_panel_dragging = False
+        handle = self._right_panel_resize_handle
+        if handle is not None:
+            try:
+                handle.set_class("dragging", False)
+            except Exception:
+                pass
+        self._right_panel_resize_handle = None
 
     def on_bottom_panel_resize_start(self, _handle, event, _args):
         """Start dragging the bottom panel resize handle."""
         self._bottom_panel_dragging = True
         self._bottom_panel_drag_start_y = float(event.get_parameter("mouse_y", "0"))
         self._bottom_panel_start_height = self._bottom_panel_height
+        self._bottom_panel_resize_handle = _handle
+        if _handle is not None:
+            try:
+                _handle.set_class("dragging", True)
+            except Exception:
+                pass
         event.stop_propagation()
 
     def on_bottom_panel_resize_delta(self, mouse_y: float) -> None:
@@ -3317,9 +3356,16 @@ class AssetManagerPanel(Panel):
         self._bottom_panel_height = new_height
         self._dirty_model("bottom_panel_height")
 
-    def on_bottom_panel_resize_end(self) -> None:
+    def on_bottom_panel_resize_end(self, handle=None) -> None:
         """End bottom panel resize drag."""
         self._bottom_panel_dragging = False
+        handle = handle or self._bottom_panel_resize_handle
+        if handle is not None:
+            try:
+                handle.set_class("dragging", False)
+            except Exception:
+                pass
+        self._bottom_panel_resize_handle = None
 
     def on_import_splat(self, _handle, _ev, args):
         """Import a splat/point-cloud file (PLY, SOG, SPZ, USD formats)."""
@@ -5284,7 +5330,7 @@ class AssetManagerPanel(Panel):
         except (TypeError, ValueError):
             return
         if self._sidebar_dragging:
-            self.on_sidebar_resize_delta(mouse_x)
+            self.on_sidebar_resize_delta(mouse_y)
             event.stop_propagation()
         elif self._right_panel_dragging:
             self.on_right_panel_resize_delta(mouse_x)

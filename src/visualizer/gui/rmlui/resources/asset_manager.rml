@@ -39,9 +39,11 @@
             <span>{{sort_label}}</span>
           </button>
 
-          <div class="asset-view-toggle">
-            <button class="asset-view-button" data-class-is-active="is_gallery_view" data-event-click="set_view_mode('gallery')">{{gallery_label}}</button>
-            <button class="asset-view-button" data-class-is-active="is_list_view" data-event-click="set_view_mode('list')">{{list_label}}</button>
+          <div class="asset-toolbar-right">
+            <div class="asset-view-toggle">
+              <button class="asset-view-button" data-class-is-active="is_gallery_view" data-event-click="set_view_mode('gallery')"><span class="asset-button-label">{{gallery_label}}</span></button>
+              <button class="asset-view-button" data-class-is-active="is_list_view" data-event-click="set_view_mode('list')"><span class="asset-button-label">{{list_label}}</span></button>
+            </div>
           </div>
         </div>
       </div>
@@ -105,21 +107,25 @@
             </div>
           </div>
 
-          <div class="asset-sidebar-actions">
-            <button class="asset-action-button" data-event-click="refresh_catalog" data-tooltip="asset_manager.tooltip.refresh">{{refresh_label}}</button>
-            <button class="asset-action-button" data-event-click="clean_missing" data-tooltip="asset_manager.tooltip.clean_missing">{{clean_missing_label}}</button>
-
-          </div>
           </div>
         </div>
 
-        <div id="sidebar-resize-handle" data-event-mousedown="on_sidebar_resize_start"></div>
+        <div id="sidebar-resize-handle" data-event-mousedown="on_sidebar_resize_start" data-class-dragging="sidebar_resize_dragging"></div>
 
-        <div id="asset-gallery">
-          <div class="asset-gallery-header">
-            <span class="asset-gallery-title" data-if="is_gallery_view">{{gallery_title}}</span>
-            <span class="asset-gallery-title" data-if="is_list_view">{{list_title}}</span>
-          <span class="asset-gallery-subtitle" data-if="asset_results_summary_visible">{{asset_results_summary}}</span>
+      <div id="asset-gallery">
+        <div class="asset-gallery-header">
+          <div class="asset-gallery-header-row">
+            <div class="asset-gallery-header-copy">
+              <span class="asset-gallery-title" data-if="is_gallery_view">{{gallery_title}}</span>
+              <span class="asset-gallery-title" data-if="is_list_view">{{list_title}}</span>
+              <span class="asset-gallery-subtitle" data-if="asset_results_summary_visible">{{asset_results_summary}}</span>
+            </div>
+
+            <div class="asset-gallery-header-actions" data-if="is_list_view">
+              <button class="asset-view-button asset-header-action" data-event-click="refresh_catalog" data-tooltip="asset_manager.tooltip.refresh"><span class="asset-button-label">{{refresh_label}}</span></button>
+              <button class="asset-view-button asset-header-action" data-event-click="clean_missing" data-tooltip="asset_manager.tooltip.clean_missing"><span class="asset-button-label">{{clean_missing_label}}</span></button>
+            </div>
+          </div>
         </div>
 
           <div id="asset-gallery-scroll" class="asset-gallery-scroll">
@@ -231,7 +237,7 @@
         </div>
       </div>
 
-      <div id="bottom-panel-resize-handle" data-event-mousedown="on_bottom_panel_resize_start"></div>
+      <div id="bottom-panel-resize-handle" data-event-mousedown="on_bottom_panel_resize_start" data-class-dragging="bottom_panel_resize_dragging"></div>
 
       <div id="asset-info-panel" data-style-height="bottom_panel_height">
           <div class="asset-info-tabs">

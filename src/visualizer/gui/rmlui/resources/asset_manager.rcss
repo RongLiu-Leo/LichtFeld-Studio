@@ -54,6 +54,7 @@
     flex-direction: column;
     min-width: 0;
     min-height: 0;
+    width: 100%;
 }
 
 #asset-shell.is-floating {
@@ -68,6 +69,7 @@
     min-height: 240dp;
     background-color: #24221f;
     color: #d8d0c3;
+    border-right-width: 2dp;
 }
 
 #asset-popup-toolbar {
@@ -97,6 +99,14 @@
 
 .toolbar-row-secondary {
     flex-shrink: 0;
+}
+
+.asset-toolbar-right {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    margin-left: auto;
+    min-width: 0;
 }
 
 .asset-search-box {
@@ -166,14 +176,42 @@
 }
 
 .asset-view-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     color: #a9a093;
     font-size: 12dp;
+    flex: 0 0 auto;
+    min-width: 52dp;
+    text-align: center;
 }
 
 .asset-view-button.is-active {
     background-color: #38342f;
     color: #f0ebe2;
     border-color: #7fb9a5;
+}
+
+.asset-button-label {
+    display: block;
+    color: inherit;
+    line-height: 16dp;
+    white-space: nowrap;
+}
+
+.asset-header-action {
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: center;
+    min-width: 72dp;
+    width: auto;
+    padding: 4dp 12dp;
+    white-space: nowrap;
+    text-align: center;
+    color: #f0ebe2;
+    font-weight: 600;
+    line-height: 16dp;
 }
 
 .asset-import-dropdown {
@@ -282,16 +320,24 @@
 }
 
 #sidebar-resize-handle {
-    height: 6dp;
-    min-height: 6dp;
+    height: 10dp;
+    min-height: 10dp;
     cursor: ns-resize;
-    background-color: transparent;
+    background-color: rgba(127, 185, 165, 0.12);
+    border-top-width: 1dp;
+    border-top-color: rgba(127, 185, 165, 0.28);
+    border-bottom-width: 1dp;
+    border-bottom-color: rgba(0, 0, 0, 0.35);
     z-index: 10;
     flex-shrink: 0;
 }
 
 #sidebar-resize-handle:hover {
-    background-color: #7fb9a5;
+    background-color: rgba(127, 185, 165, 0.34);
+}
+
+#sidebar-resize-handle.dragging {
+    background-color: rgba(127, 185, 165, 0.48);
 }
 
 .asset-sidebar-section {
@@ -464,6 +510,31 @@
     padding: 10dp 12dp;
     border-bottom-width: 1dp;
     border-bottom-color: #3c3630;
+}
+
+.asset-gallery-header-row {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 10dp;
+    min-width: 0;
+}
+
+.asset-gallery-header-copy {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    flex: 1;
+}
+
+.asset-gallery-header-actions {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 6dp;
+    flex-shrink: 0;
+    margin-left: auto;
+    min-width: 0;
 }
 
 .asset-gallery-title {
@@ -1085,16 +1156,24 @@
 }
 
 #bottom-panel-resize-handle {
-    height: 6dp;
-    min-height: 6dp;
+    height: 10dp;
+    min-height: 10dp;
     cursor: ns-resize;
-    background-color: transparent;
+    background-color: rgba(127, 185, 165, 0.12);
+    border-top-width: 1dp;
+    border-top-color: rgba(127, 185, 165, 0.28);
+    border-bottom-width: 1dp;
+    border-bottom-color: rgba(0, 0, 0, 0.35);
     z-index: 10;
     flex-shrink: 0;
 }
 
 #bottom-panel-resize-handle:hover {
-    background-color: #7fb9a5;
+    background-color: rgba(127, 185, 165, 0.34);
+}
+
+#bottom-panel-resize-handle.dragging {
+    background-color: rgba(127, 185, 165, 0.48);
 }
 
 .asset-info-tabs {
@@ -1302,6 +1381,7 @@
 }
 
 .asset-action-button {
-    flex: 1;
     text-align: center;
+    flex: 0 0 auto;
+    min-width: 88dp;
 }
