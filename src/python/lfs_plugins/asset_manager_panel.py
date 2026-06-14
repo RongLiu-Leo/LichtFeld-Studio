@@ -610,7 +610,10 @@ class AssetManagerPanel(Panel):
         model.bind_func("add_to_scene_label", lambda: tr("asset_manager.action.add_to_scene"))
         model.bind_func("rename_label", lambda: tr("asset_manager.action.rename"))
         model.bind_func("move_to_folder_label", lambda: tr("asset_manager.action.move_to_folder"))
-        model.bind_func("new_folder_label", lambda: tr("asset_manager.action.new_folder"))
+        model.bind_func(
+            "new_folder_label",
+            lambda: f"{tr('asset_manager.action.new_folder')} and move here",
+        )
         model.bind_func("show_in_folder_label", lambda: tr("asset_manager.action.show_in_folder"))
         model.bind_func("update_thumbnail_label", lambda: tr("asset_manager.action.update_thumbnail"))
         model.bind_func("remove_label", lambda: tr("asset_manager.action.remove"))
@@ -1449,7 +1452,7 @@ class AssetManagerPanel(Panel):
             "modified_label": self._format_timestamp(asset.get("modified_at", "")),
             "thumbnail_path": asset.get("thumbnail_path"),
             "menu_open": asset_id == self._open_menu_asset_id,
-            "load_menu_open": asset_id == self._load_menu_asset_id,
+            "load_menu_open": asset_id == self._open_menu_asset_id,
         }
 
     def get_folder_list(self) -> List[Dict[str, Any]]:
@@ -3941,6 +3944,18 @@ class AssetManagerPanel(Panel):
         # Sort by name
         return sorted(folders, key=lambda f: self._sort_text(f.get("name")))
 
+    def _open_asset_menu(self, asset_id: str) -> None:
+        if not asset_id:
+            return
+        self._load_menu_asset_id = None
+        self._open_menu_folder_id = None
+        self._open_menu_asset_id = asset_id
+        if self._handle:
+            folders = self.get_move_menu_folders()
+            self._log_info("Loading %d folders for move menu", len(folders))
+            self._handle.update_record_list("move_menu_folders", folders)
+        self._dirty_model("assets", "folders")
+
     def on_toggle_asset_menu(self, _handle, _ev, args):
         """Toggle dropdown menu for an asset."""
         asset_id = self._resolve_event_value(args, _ev, "data-asset-id")
@@ -3957,19 +3972,11 @@ class AssetManagerPanel(Panel):
         # Toggle: if already open for this asset, close it; otherwise open for this asset
         if self._open_menu_asset_id == asset_id:
             self._open_menu_asset_id = None
-        else:
-            self._open_menu_asset_id = asset_id
-
-        # Always reload folders when menu opens to ensure fresh data
-        if self._handle:
-            if self._open_menu_asset_id:
-                folders = self.get_move_menu_folders()
-                self._log_info("Loading %d folders for move menu", len(folders))
-                self._handle.update_record_list("move_menu_folders", folders)
-            else:
+            self._dirty_model("assets")
+            if self._handle:
                 self._handle.update_record_list("move_menu_folders", [])
-
-        self._dirty_model("assets")
+        else:
+            self._open_asset_menu(asset_id)
 
     def on_rename_asset(self, _handle, _ev, args):
         """Open rename dialog for an asset."""
@@ -4793,12 +4800,14 @@ class AssetManagerPanel(Panel):
             if action == "load":
                 self.on_load_asset(None, event, [asset_id])
             elif action == "load_new":
+                self._open_menu_asset_id = None
                 self._load_menu_asset_id = None
                 self._dirty_model("assets")
                 self.on_load_asset_new(None, event, [asset_id])
                 self._stop_event(event)
                 return
             elif action == "add_to_scene":
+                self._open_menu_asset_id = None
                 self._load_menu_asset_id = None
                 self._dirty_model("assets")
                 self.on_add_asset_to_scene(None, event, [asset_id])
@@ -4948,8 +4957,6 @@ class AssetManagerPanel(Panel):
             button = int(event.get_parameter("button", "0"))
         except (AttributeError, TypeError, ValueError):
             return
-        if button != 1:
-            return
 
         container = event.current_target()
         target = event.target()
@@ -4970,10 +4977,27 @@ class AssetManagerPanel(Panel):
         if not asset_id:
             return
 
+        if button == 2:
+            self._load_menu_asset_id = None
+            self._select_asset_id(
+                asset_id,
+                toggle=False,
+                multi_select=False,
+                row_element=action_el,
+                container=container,
+            )
+            self._open_asset_menu(asset_id)
+            self._stop_event(event)
+            return
+
+        if button != 1:
+            return
+
         if self._select_asset_id(asset_id):
-            self._load_menu_asset_id = asset_id
+            self._load_menu_asset_id = None
             self._open_menu_asset_id = None
             self._open_menu_folder_id = None
+            self._open_asset_menu(asset_id)
             self._dirty_model("assets", "folders")
         self._stop_event(event)
 

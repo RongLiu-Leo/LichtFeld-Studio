@@ -849,6 +849,12 @@
     display: block;
 }
 
+.asset-load-menu.is-drop-up {
+    top: auto;
+    bottom: 100%;
+    margin-bottom: 4dp;
+}
+
 .asset-dropdown-item {
     padding: 8dp 12dp;
     font-size: 12dp;
@@ -874,6 +880,12 @@
 .asset-dropdown-item.is-danger:hover {
     background-color: #4a2a25;
     color: #ffb5a8;
+}
+
+.asset-dropdown-separator {
+    height: 1dp;
+    margin: 4dp 0;
+    background-color: #3c3630;
 }
 
 .asset-dropdown-item.folder-option {
@@ -931,6 +943,11 @@
      * the scrollbar lane when the panel is docked and space is tight. */
     padding: 12dp 32dp 32dp 12dp;
     box-sizing: border-box;
+}
+
+.asset-list-bottom-spacer {
+    flex: 0 0 480dp;
+    min-height: 480dp;
 }
 
 .asset-card-grid scrollbarvertical,
@@ -999,6 +1016,19 @@
 .asset-list-row .asset-load-menu {
     top: 28dp;
     left: 10dp;
+}
+
+.asset-list-row .asset-load-menu.is-drop-up {
+    top: auto;
+    bottom: 100%;
+    left: 10dp;
+}
+
+.asset-card .asset-load-menu.is-drop-up {
+    top: auto;
+    bottom: 100%;
+    right: 4dp;
+    left: auto;
 }
 
 .asset-list-name,

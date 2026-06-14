@@ -145,17 +145,15 @@
                       <div class="asset-card-tags" data-if="asset.tags_label">
                         <span class="asset-card-tag">{{asset.tags_label}}</span>
                       </div>
-                      <div class="asset-card-actions">
+                    <div class="asset-card-actions">
                         <button class="asset-card-button" data-attr-data-asset-id="asset.id" data-asset-action="load">{{load_button_label}}</button>
                       </div>
                     </div>
                     <button class="asset-card-menu" data-attr-data-asset-id="asset.id" data-asset-action="menu"><img src="../icon/more-vertical.png" /></button>
-                    <div class="asset-load-menu" data-class-is-visible="asset.load_menu_open">
+                    <div class="asset-load-menu" data-class-is-visible="asset.menu_open">
                       <div class="asset-dropdown-item" data-if="asset.can_load" data-attr-data-asset-id="asset.id" data-asset-action="load_new">{{load_new_label}}</div>
                       <div class="asset-dropdown-item" data-if="asset.can_load" data-attr-data-asset-id="asset.id" data-asset-action="add_to_scene">{{add_to_scene_label}}</div>
-                      <div class="asset-dropdown-item is-danger" data-attr-data-asset-id="asset.id" data-asset-action="remove_from_menu">{{remove_from_catalog_label}}</div>
-                    </div>
-                    <div class="asset-card-dropdown" data-class-is-visible="asset.menu_open">
+                      <div class="asset-dropdown-separator"></div>
                       <div data-if="asset.type != 'dataset'">
                         <div class="asset-dropdown-item" data-attr-data-asset-id="asset.id" data-asset-action="update_thumbnail">{{update_thumbnail_label}}</div>
                       </div>
@@ -166,8 +164,8 @@
                         <div class="asset-dropdown-submenu">
                           <div class="asset-dropdown-item" data-attr-data-asset-id="asset.id" data-asset-action="create_folder">{{new_folder_label}}</div>
                           <div class="asset-submenu-divider"></div>
-                          <div data-for="folder : move_menu_folders">
-                            <div class="asset-dropdown-item folder-option" data-attr-data-asset-id="asset.id" data-attr-data-folder-id="folder.id" data-asset-action="move_to_existing_folder">{{folder.name}}</div>
+                          <div data-for="folder : folders">
+                            <div class="asset-dropdown-item folder-option" data-if="folder.id != asset.folder_id" data-attr-data-asset-id="asset.id" data-attr-data-folder-id="folder.id" data-asset-action="move_to_existing_folder">{{folder.name}}</div>
                           </div>
                         </div>
                       </div>
@@ -198,13 +196,31 @@
                     <span class="asset-col asset-col-folder">{{asset.folder_name}}</span>
                     <span class="asset-col asset-col-size">{{asset.size_label}}</span>
                     <span class="asset-col asset-col-modified">{{asset.modified_label}}</span>
-                    <div class="asset-load-menu" data-class-is-visible="asset.load_menu_open">
+                    <div class="asset-load-menu" data-class-is-visible="asset.menu_open">
                       <div class="asset-dropdown-item" data-if="asset.can_load" data-attr-data-asset-id="asset.id" data-asset-action="load_new">{{load_new_label}}</div>
                       <div class="asset-dropdown-item" data-if="asset.can_load" data-attr-data-asset-id="asset.id" data-asset-action="add_to_scene">{{add_to_scene_label}}</div>
-                      <div class="asset-dropdown-item is-danger" data-attr-data-asset-id="asset.id" data-asset-action="remove_from_menu">{{remove_from_catalog_label}}</div>
+                      <div class="asset-dropdown-separator"></div>
+                      <div data-if="asset.type != 'dataset'">
+                        <div class="asset-dropdown-item" data-attr-data-asset-id="asset.id" data-asset-action="update_thumbnail">{{update_thumbnail_label}}</div>
+                      </div>
+                      <div class="asset-dropdown-item" data-attr-data-asset-id="asset.id" data-asset-action="rename">{{rename_label}}</div>
+                      <div class="asset-dropdown-item has-submenu" data-attr-data-asset-id="asset.id">
+                        <span>{{move_to_folder_label}}</span>
+                        <span class="submenu-arrow">&#x203A;</span>
+                        <div class="asset-dropdown-submenu">
+                          <div class="asset-dropdown-item" data-attr-data-asset-id="asset.id" data-asset-action="create_folder">{{new_folder_label}}</div>
+                          <div class="asset-submenu-divider"></div>
+                          <div data-for="folder : folders">
+                            <div class="asset-dropdown-item folder-option" data-if="folder.id != asset.folder_id" data-attr-data-asset-id="asset.id" data-attr-data-folder-id="folder.id" data-asset-action="move_to_existing_folder">{{folder.name}}</div>
+                          </div>
+                        </div>
+                      </div>
+                      <div class="asset-dropdown-item" data-attr-data-asset-id="asset.id" data-asset-action="show_in_folder">{{show_in_folder_label}}</div>
+                      <div class="asset-dropdown-item is-danger" data-attr-data-asset-id="asset.id" data-asset-action="remove_from_menu">{{remove_label}}</div>
                     </div>
                   </div>
                 </div>
+                <div class="asset-list-bottom-spacer"></div>
               </div>
             </div>
           </div>
@@ -410,7 +426,6 @@
                 </div>
               </div>
 
-            </div>
           </div>
         </div>
       </div>
