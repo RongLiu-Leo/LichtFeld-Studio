@@ -35,8 +35,16 @@ _logger = logging.getLogger(__name__)
 
 PRECISE_SCROLL_STEP = 32.0
 RML_PATH_SAFE_CHARS = "/:._-~"
-ASSET_LIST_VISIBLE_LIMIT = 150
-ASSET_GALLERY_VISIBLE_LIMIT = 72
+ASSET_LIST_ROW_HEIGHT_DP = 44.0
+ASSET_LIST_ROW_GAP_DP = 4.0
+ASSET_LIST_WINDOW_FALLBACK_ROWS = 24
+ASSET_LIST_WINDOW_OVERSCAN_ROWS = 6
+ASSET_GALLERY_ROW_HEIGHT_DP = 220.0
+ASSET_GALLERY_ROW_GAP_DP = 10.0
+ASSET_GALLERY_WINDOW_FALLBACK_ROWS = 10
+ASSET_GALLERY_WINDOW_OVERSCAN_ROWS = 2
+ASSET_LIST_BOTTOM_SPACER_EXTRA_ROWS = 3
+ASSET_GALLERY_BOTTOM_SPACER_EXTRA_ROWS = 1
 BACKGROUND_SCAN_THUMBNAIL_LIMIT = 64
 SELECTION_DETAIL_DEFER_SECONDS = 0.035
 ASSET_CARD_PREFERRED_WIDTH_DP = 208.0
@@ -298,12 +306,26 @@ class AssetManagerPanel(Panel):
         self._view_mode: str = "list"  # gallery, list
         self._sort_mode: str = "type"  # name, size, type
         self._search_query: str = ""
-        self._asset_visible_limit = ASSET_LIST_VISIBLE_LIMIT
         self._last_asset_match_count = 0
         self._last_asset_visible_count = 0
         self._last_dirty_model_timing: Dict[str, Any] = {}
         self._last_asset_rows_update_count = 0
         self._last_asset_rows_update_ms = 0.0
+        self._asset_filtered_cache_key: Optional[tuple] = None
+        self._asset_filtered_cache: List[Dict[str, Any]] = []
+        self._asset_window_scroll_top: float = 0.0
+        self._asset_window_client_height: float = 0.0
+        self._asset_window_client_width: float = 0.0
+        self._asset_window_start_index: int = 0
+        self._asset_window_end_index: int = 0
+        self._asset_list_top_spacer_height: float = 0.0
+        self._asset_list_bottom_spacer_height: float = 0.0
+        self._asset_gallery_top_spacer_height: float = 0.0
+        self._asset_gallery_bottom_spacer_height: float = 0.0
+        self._asset_window_refresh_pending: bool = False
+        self._asset_window_update_requested: bool = False
+        self._asset_scroll_event_suppressed: bool = False
+        self._asset_scroll_suppressed_top: float = -1.0
         self._catalog_assets_snapshot: Optional[Dict[str, Dict[str, Any]]] = None
         self._catalog_folders_snapshot: Optional[Dict[str, Dict[str, Any]]] = None
         self._catalog_scenes_snapshot: Optional[Dict[str, Dict[str, Any]]] = None
@@ -437,6 +459,22 @@ class AssetManagerPanel(Panel):
         model.bind_func(
             "asset_card_slot_width",
             lambda: f"{self._asset_card_slot_width:.1f}dp",
+        )
+        model.bind_func(
+            "asset_list_top_spacer_height",
+            lambda: f"{self._asset_list_top_spacer_height:.1f}dp",
+        )
+        model.bind_func(
+            "asset_list_bottom_spacer_height",
+            lambda: f"{self._asset_list_bottom_spacer_height:.1f}dp",
+        )
+        model.bind_func(
+            "asset_gallery_top_spacer_height",
+            lambda: f"{self._asset_gallery_top_spacer_height:.1f}dp",
+        )
+        model.bind_func(
+            "asset_gallery_bottom_spacer_height",
+            lambda: f"{self._asset_gallery_bottom_spacer_height:.1f}dp",
         )
 
         # Active states
@@ -595,11 +633,6 @@ class AssetManagerPanel(Panel):
             "asset_results_summary_visible",
             self.get_asset_results_summary_visible,
         )
-        model.bind_func(
-            "asset_results_more_visible",
-            self.get_asset_results_more_visible,
-        )
-        model.bind_func("show_more_assets_label", self.get_show_more_assets_label)
         model.bind_func("edit_watch_dirs_label", lambda: tr("asset_manager.action.edit_watch_dirs"))
         model.bind_func("rename_folder_label", lambda: tr("asset_manager.action.rename_folder"))
         model.bind_func("delete_folder_label", lambda: tr("asset_manager.action.delete_folder"))
@@ -686,7 +719,6 @@ class AssetManagerPanel(Panel):
         model.bind_event("toggle_filter", self.toggle_filter)
         model.bind_event("set_view_mode", self.set_view_mode)
         model.bind_event("cycle_sort_mode", self.cycle_sort_mode)
-        model.bind_event("show_more_assets", self.show_more_assets)
         model.bind_event("toggle_asset_selection", self.toggle_asset_selection)
         model.bind_event("on_search", self.on_search)
         model.bind_event("on_import_splat", self.on_import_splat)
@@ -733,7 +765,7 @@ class AssetManagerPanel(Panel):
 
     def set_search_query(self, value: str) -> None:
         self._search_query = value
-        self._reset_asset_visible_limit()
+        self._reset_asset_window_to_top()
         # Trigger asset list refresh when search query changes
         self._dirty_model("search_query", *self._asset_result_dirty_fields())
 
@@ -915,6 +947,8 @@ class AssetManagerPanel(Panel):
         self._catalog_folders_snapshot = None
         self._catalog_scenes_snapshot = None
         self._catalog_stats_snapshot = None
+        self._asset_filtered_cache_key = None
+        self._asset_filtered_cache = []
 
     def _asset_index_assets(self) -> Dict[str, Dict[str, Any]]:
         if not self._asset_index:
@@ -1176,46 +1210,260 @@ class AssetManagerPanel(Panel):
             "context_label": context_label,
         }
 
-    def _default_asset_visible_limit(self) -> int:
-        if self._view_mode == "gallery":
-            return ASSET_GALLERY_VISIBLE_LIMIT
-        return ASSET_LIST_VISIBLE_LIMIT
+    def _reset_asset_window_to_top(self) -> None:
+        scroll_el = self._asset_scroll_container()
+        if scroll_el:
+            try:
+                scroll_el.scroll_top = 0.0
+            except Exception:
+                pass
+        self._asset_window_scroll_top = 0.0
+        self._asset_window_start_index = 0
+        self._asset_window_end_index = 0
+        self._asset_list_top_spacer_height = 0.0
+        self._asset_list_bottom_spacer_height = 0.0
+        self._asset_gallery_top_spacer_height = 0.0
+        self._asset_gallery_bottom_spacer_height = 0.0
+        self._asset_window_refresh_pending = False
+        self._asset_window_update_requested = False
 
-    def _reset_asset_visible_limit(self) -> None:
-        self._asset_visible_limit = self._default_asset_visible_limit()
+    def _request_asset_window_refresh(self) -> None:
+        self._asset_window_refresh_pending = True
+        if self._asset_window_update_requested:
+            return
+        self._asset_window_update_requested = True
+        self._request_model_update()
+
+    def _apply_asset_window_refresh(self, *, card_width_changed: bool = False) -> None:
+        """Update the visible asset window without scheduling another panel refresh."""
+        if not self._handle:
+            return
+
+        if card_width_changed:
+            self._handle.dirty("asset_card_slot_width")
+
+        for field in self._asset_window_dirty_fields():
+            self._handle.dirty(field)
+
+        records_start = time.perf_counter()
+        rows = self.get_filtered_assets()
+        self._handle.update_record_list("assets", rows)
+        self._last_asset_rows_update_count = len(rows)
+        self._last_asset_rows_update_ms = self._elapsed_ms(records_start)
 
     def _asset_result_dirty_fields(self) -> tuple[str, ...]:
         return (
             "assets",
             "asset_results_summary",
             "asset_results_summary_visible",
-            "asset_results_more_visible",
-            "show_more_assets_label",
+            "asset_list_top_spacer_height",
+            "asset_list_bottom_spacer_height",
+            "asset_gallery_top_spacer_height",
+            "asset_gallery_bottom_spacer_height",
+        )
+
+    def _asset_window_dirty_fields(self) -> tuple[str, ...]:
+        return (
+            "assets",
+            "asset_list_top_spacer_height",
+            "asset_list_bottom_spacer_height",
+            "asset_gallery_top_spacer_height",
+            "asset_gallery_bottom_spacer_height",
         )
 
     def get_asset_results_summary_visible(self) -> bool:
         return self._last_asset_match_count > 0
 
-    def get_asset_results_more_visible(self) -> bool:
-        return self._last_asset_visible_count < self._last_asset_match_count
-
-    def get_show_more_assets_label(self) -> str:
-        remaining = max(0, self._last_asset_match_count - self._last_asset_visible_count)
-        next_count = min(self._default_asset_visible_limit(), remaining)
-        if next_count <= 0:
-            return "Show more"
-        return f"Show {next_count:,} more"
-
     def get_asset_results_summary(self) -> str:
         total = self._last_asset_match_count
-        visible = self._last_asset_visible_count
         if total <= 0:
             return ""
-        if visible < total:
-            return f"Showing {visible:,} of {total:,} assets"
         if total == 1:
             return "Showing 1 asset"
         return f"Showing {total:,} assets"
+
+    def _asset_scroll_container(self, doc=None):
+        root = doc or self._doc
+        if not root:
+            return None
+        try:
+            return root.get_element_by_id("asset-gallery-scroll")
+        except Exception:
+            return None
+
+    def _sync_asset_window_viewport(self, doc=None) -> bool:
+        scroll_el = self._asset_scroll_container(doc)
+        if not scroll_el:
+            return False
+
+        try:
+            next_scroll_top = max(0.0, float(scroll_el.scroll_top or 0.0))
+            next_client_height = max(0.0, float(scroll_el.client_height or 0.0))
+            next_client_width = max(0.0, float(scroll_el.client_width or 0.0))
+        except Exception:
+            return False
+
+        if (
+            abs(next_scroll_top - self._asset_window_scroll_top) <= 0.5
+            and abs(next_client_height - self._asset_window_client_height) <= 0.5
+            and abs(next_client_width - self._asset_window_client_width) <= 0.5
+        ):
+            return False
+
+        self._asset_window_scroll_top = next_scroll_top
+        self._asset_window_client_height = next_client_height
+        self._asset_window_client_width = next_client_width
+
+        folder_id = self._repair_selected_folder()
+        if not folder_id:
+            changed = (
+                self._asset_window_start_index != 0
+                or self._asset_window_end_index != 0
+                or self._asset_list_top_spacer_height != 0.0
+                or self._asset_list_bottom_spacer_height != 0.0
+                or self._asset_gallery_top_spacer_height != 0.0
+                or self._asset_gallery_bottom_spacer_height != 0.0
+            )
+            self._asset_window_start_index = 0
+            self._asset_window_end_index = 0
+            self._asset_list_top_spacer_height = 0.0
+            self._asset_list_bottom_spacer_height = 0.0
+            self._asset_gallery_top_spacer_height = 0.0
+            self._asset_gallery_bottom_spacer_height = 0.0
+            return changed
+
+        total_count = len(self._get_filtered_assets_cache(folder_id))
+        prev_state = (
+            self._asset_window_start_index,
+            self._asset_window_end_index,
+            self._asset_list_top_spacer_height,
+            self._asset_list_bottom_spacer_height,
+            self._asset_gallery_top_spacer_height,
+            self._asset_gallery_bottom_spacer_height,
+        )
+        self._compute_asset_window(total_count)
+        next_state = (
+            self._asset_window_start_index,
+            self._asset_window_end_index,
+            self._asset_list_top_spacer_height,
+            self._asset_list_bottom_spacer_height,
+            self._asset_gallery_top_spacer_height,
+            self._asset_gallery_bottom_spacer_height,
+        )
+        return prev_state != next_state
+
+    def _asset_filtered_cache_signature(self, folder_id: Optional[str]) -> tuple:
+        return (
+            folder_id,
+            self._selected_scene_id,
+            tuple(sorted(self._active_filters)),
+            self._sort_mode,
+            self._search_query,
+        )
+
+    def _get_filtered_assets_cache(self, folder_id: Optional[str]) -> List[Dict[str, Any]]:
+        signature = self._asset_filtered_cache_signature(folder_id)
+        if signature == self._asset_filtered_cache_key:
+            return self._asset_filtered_cache
+
+        assets_by_folder = self._catalog_stats()["assets_by_folder"]
+        raw_assets = list(assets_by_folder.get(folder_id or "", []))
+        matching_assets: List[Dict[str, Any]] = []
+        search_query = self._search_query
+        selected_scene_id = self._selected_scene_id
+        for asset in raw_assets:
+            if selected_scene_id and asset.get("scene_id") != selected_scene_id:
+                continue
+            if not self._asset_matches_active_filters(asset):
+                continue
+            if search_query and not self._asset_matches_query(asset, search_query):
+                continue
+            matching_assets.append(asset)
+
+        self._asset_filtered_cache_key = signature
+        self._asset_filtered_cache = self._sort_assets(matching_assets)
+        return self._asset_filtered_cache
+
+    def _compute_asset_window(
+        self,
+        total_count: int,
+    ) -> tuple[int, int, float, float]:
+        if total_count <= 0:
+            self._asset_window_start_index = 0
+            self._asset_window_end_index = 0
+            self._asset_list_top_spacer_height = 0.0
+            self._asset_list_bottom_spacer_height = 0.0
+            self._asset_gallery_top_spacer_height = 0.0
+            self._asset_gallery_bottom_spacer_height = 0.0
+            return 0, 0, 0.0, 0.0
+
+        if self._view_mode == "gallery":
+            row_height = ASSET_GALLERY_ROW_HEIGHT_DP
+            row_gap = ASSET_GALLERY_ROW_GAP_DP
+            overscan_rows = ASSET_GALLERY_WINDOW_OVERSCAN_ROWS
+            fallback_rows = ASSET_GALLERY_WINDOW_FALLBACK_ROWS
+            available_width = max(
+                ASSET_CARD_MIN_WIDTH_DP,
+                self._asset_window_client_width - ASSET_CARD_GRID_HORIZONTAL_CHROME_DP,
+            )
+            slot_width = max(ASSET_CARD_MIN_WIDTH_DP, self._asset_card_slot_width)
+            columns = max(
+                1,
+                int((available_width + row_gap) // (slot_width + row_gap)),
+            )
+            total_rows = int(math.ceil(total_count / float(columns)))
+            scroll_row = int(self._asset_window_scroll_top // (row_height + row_gap))
+            visible_rows = max(
+                1,
+                int(math.ceil(self._asset_window_client_height / (row_height + row_gap)))
+                + overscan_rows * 2
+                if self._asset_window_client_height > 0.0
+                else fallback_rows,
+            )
+            start_row = max(0, scroll_row - overscan_rows)
+            end_row = min(total_rows, start_row + visible_rows)
+            start_index = min(total_count, start_row * columns)
+            end_index = min(total_count, end_row * columns)
+            top_spacer = float(start_row * (row_height + row_gap))
+            bottom_spacer = float(
+                max(0, total_rows - end_row + ASSET_GALLERY_BOTTOM_SPACER_EXTRA_ROWS)
+                * (row_height + row_gap)
+            )
+            self._asset_window_start_index = start_index
+            self._asset_window_end_index = end_index
+            self._asset_gallery_top_spacer_height = top_spacer
+            self._asset_gallery_bottom_spacer_height = bottom_spacer
+            self._asset_list_top_spacer_height = 0.0
+            self._asset_list_bottom_spacer_height = 0.0
+            return start_index, end_index, top_spacer, bottom_spacer
+
+        row_height = ASSET_LIST_ROW_HEIGHT_DP
+        row_gap = ASSET_LIST_ROW_GAP_DP
+        overscan_rows = ASSET_LIST_WINDOW_OVERSCAN_ROWS
+        fallback_rows = ASSET_LIST_WINDOW_FALLBACK_ROWS
+        row_pitch = row_height + row_gap
+        scroll_row = int(self._asset_window_scroll_top // row_pitch)
+        visible_rows = max(
+            1,
+            int(math.ceil(self._asset_window_client_height / row_pitch))
+            + overscan_rows * 2
+            if self._asset_window_client_height > 0.0
+            else fallback_rows,
+        )
+        start_row = max(0, scroll_row - overscan_rows)
+        end_row = min(total_count, start_row + visible_rows)
+        top_spacer = float(start_row * row_pitch)
+        bottom_spacer = float(
+            max(0, total_count - end_row + ASSET_LIST_BOTTOM_SPACER_EXTRA_ROWS)
+            * row_pitch
+        )
+        self._asset_window_start_index = start_row
+        self._asset_window_end_index = end_row
+        self._asset_list_top_spacer_height = top_spacer
+        self._asset_list_bottom_spacer_height = bottom_spacer
+        self._asset_gallery_top_spacer_height = 0.0
+        self._asset_gallery_bottom_spacer_height = 0.0
+        return start_row, end_row, top_spacer, bottom_spacer
 
     def _asset_matches_active_filters(self, asset: Dict[str, Any]) -> bool:
         if not self._active_filters:
@@ -1238,32 +1486,32 @@ class AssetManagerPanel(Panel):
         if not assets_by_folder:
             self._last_asset_match_count = 0
             self._last_asset_visible_count = 0
+            self._asset_window_start_index = 0
+            self._asset_window_end_index = 0
+            self._asset_list_top_spacer_height = 0.0
+            self._asset_list_bottom_spacer_height = 0.0
+            self._asset_gallery_top_spacer_height = 0.0
+            self._asset_gallery_bottom_spacer_height = 0.0
             return []
 
         folder_id = self._repair_selected_folder()
         if not folder_id:
             self._last_asset_match_count = 0
             self._last_asset_visible_count = 0
+            self._asset_window_start_index = 0
+            self._asset_window_end_index = 0
+            self._asset_list_top_spacer_height = 0.0
+            self._asset_list_bottom_spacer_height = 0.0
+            self._asset_gallery_top_spacer_height = 0.0
+            self._asset_gallery_bottom_spacer_height = 0.0
             return []
 
-        matching_assets = []
-        search_query = self._search_query
-        selected_scene_id = self._selected_scene_id
-        for asset in assets_by_folder.get(folder_id, []):
-            if selected_scene_id and asset.get("scene_id") != selected_scene_id:
-                continue
-            if not self._asset_matches_active_filters(asset):
-                continue
-            if search_query and not self._asset_matches_query(asset, search_query):
-                continue
-
-            matching_assets.append(asset)
-
-        sorted_assets = self._sort_assets(matching_assets)
+        sorted_assets = self._get_filtered_assets_cache(folder_id)
         total_count = len(sorted_assets)
-        visible_limit = max(1, int(self._asset_visible_limit))
-        visible_assets = sorted_assets[:visible_limit]
-
+        start_index, end_index, top_spacer, bottom_spacer = self._compute_asset_window(
+            total_count
+        )
+        visible_assets = sorted_assets[start_index:end_index]
         self._last_asset_match_count = total_count
         self._last_asset_visible_count = len(visible_assets)
         include_thumbnail = self._view_mode == "gallery"
@@ -2575,7 +2823,7 @@ class AssetManagerPanel(Panel):
         else:
             self._active_filters.add(filter_id)
 
-        self._reset_asset_visible_limit()
+        self._reset_asset_window_to_top()
         self._dirty_model(
             "active_filters",
             "filters",
@@ -2590,7 +2838,7 @@ class AssetManagerPanel(Panel):
         if mode not in ("gallery", "list"):
             return
         self._view_mode = mode
-        self._reset_asset_visible_limit()
+        self._reset_asset_window_to_top()
         self._dirty_model(
             "view_mode",
             "is_gallery_view",
@@ -2605,19 +2853,12 @@ class AssetManagerPanel(Panel):
         except ValueError:
             current_index = 0
         self._sort_mode = self.SORT_MODES[(current_index + 1) % len(self.SORT_MODES)]
-        self._reset_asset_visible_limit()
+        self._reset_asset_window_to_top()
         self._dirty_model(
             "sort_mode",
             "sort_label",
             *self._asset_result_dirty_fields(),
         )
-
-    def show_more_assets(self, _handle=None, _ev=None, _args=None):
-        """Expand the bounded asset row/card window."""
-        if not self.get_asset_results_more_visible():
-            return
-        self._asset_visible_limit += self._default_asset_visible_limit()
-        self._dirty_model(*self._asset_result_dirty_fields())
 
     def toggle_asset_selection(self, _handle, _ev, args):
         """Toggle selection state of an asset."""
@@ -2982,7 +3223,7 @@ class AssetManagerPanel(Panel):
         """Handle search input changes (real-time)."""
         if args and len(args) > 0:
             self._search_query = str(args[0])
-        self._reset_asset_visible_limit()
+        self._reset_asset_window_to_top()
         self._dirty_model("search_query", *self._asset_result_dirty_fields())
 
     # ── New Folder Handlers ──────────────────────────────────
@@ -3335,7 +3576,7 @@ class AssetManagerPanel(Panel):
         self._selected_scene_id = None  # Clear scene selection when folder changes
         self._selected_asset_ids.clear()
         self._selection_type = next_selection_type
-        self._reset_asset_visible_limit()
+        self._reset_asset_window_to_top()
 
         self._dirty_model(
             "folders",
@@ -3396,7 +3637,7 @@ class AssetManagerPanel(Panel):
         self._selected_scene_id = next_scene_id
         self._selected_asset_ids.clear()
         self._selection_type = next_selection_type
-        self._reset_asset_visible_limit()
+        self._reset_asset_window_to_top()
 
         self._dirty_model(
             "scenes",
@@ -4516,6 +4757,7 @@ class AssetManagerPanel(Panel):
 
         # Initial refresh must dirty scalar bindings after catalog load.
         self.refresh_catalog()
+        self._last_auto_save_time = time.time()
         self._last_scene_generation = RuntimeState.scene_generation.value
         self._last_language_generation = RuntimeState.language_generation.value
         self._subscribe_reactive_state()
@@ -4529,7 +4771,20 @@ class AssetManagerPanel(Panel):
 
     def on_update(self, doc):
         """Dirty-policy update for catalog and deferred scene work."""
-        changed = self._sync_gallery_card_width(doc)
+        self._asset_window_update_requested = False
+        pending_window_refresh = self._asset_window_refresh_pending
+        window_changed = self._sync_asset_window_viewport(doc)
+        card_width_changed = self._sync_gallery_card_width(doc)
+        should_apply_window_refresh = (
+            pending_window_refresh or window_changed or card_width_changed
+        )
+        if should_apply_window_refresh:
+            self._apply_asset_window_refresh(
+                card_width_changed=card_width_changed and self._view_mode == "gallery",
+            )
+        self._asset_window_refresh_pending = False
+
+        changed = should_apply_window_refresh
 
         space_changed = self._sync_panel_space_state()
         if space_changed and self._handle:
@@ -4550,16 +4805,14 @@ class AssetManagerPanel(Panel):
         if self._pending_transform_applications:
             self._request_model_update()
 
-        scene_generation = RuntimeState.scene_generation.value
-        if scene_generation != self._last_scene_generation:
-            self._last_scene_generation = scene_generation
-            self._sync_runtime_scene_catalog(select_current=True)
-            self.refresh_catalog(request_update=False)
-            changed = True
-
         try:
+            scan_active = False
+            scan_refresh_pending = False
+            with self._scan_thread_lock:
+                scan_active = self._scan_thread is not None and self._scan_thread.is_alive()
+                scan_refresh_pending = self._scan_ui_refresh_needed
             library_path = self._asset_index.library_path
-            if library_path.exists():
+            if library_path.exists() and not scan_active and not scan_refresh_pending:
                 current_mtime = library_path.stat().st_mtime
                 if current_mtime > self._library_mtime:
                     self._asset_index.load()
@@ -4662,7 +4915,6 @@ class AssetManagerPanel(Panel):
             return
 
         native_signals = (
-            RuntimeState.scene_generation,
             RuntimeState.language_generation,
         )
         self._reactive_unsubscribers = [
@@ -4696,17 +4948,33 @@ class AssetManagerPanel(Panel):
             content.add_event_listener(
                 "dblclick", self._on_asset_manager_double_click
             )
-        for scroll_id in ("asset-card-grid", "asset-list-view"):
-            scroll_el = doc.get_element_by_id(scroll_id)
-            if scroll_el:
-                scroll_el.add_event_listener(
-                    "mousescroll", self._on_gallery_precise_scroll
-                )
+        scroll_el = doc.get_element_by_id("asset-gallery-scroll")
+        if scroll_el:
+            scroll_el.add_event_listener("scroll", self._on_asset_scroll)
+            scroll_el.add_event_listener(
+                "mousescroll", self._on_gallery_precise_scroll
+            )
 
         # Resize-start is bound declaratively in RML via data-event-mousedown.
         # Only keep document-level listeners here for active drag tracking.
         doc.add_event_listener("mousemove", self._on_resize_mousemove)
         doc.add_event_listener("mouseup", self._on_resize_mouseup)
+
+    def _on_asset_scroll(self, event) -> None:
+        scroll_el = event.current_target()
+        if not scroll_el:
+            return
+        if self._asset_scroll_event_suppressed:
+            try:
+                current_scroll_top = max(0.0, float(scroll_el.scroll_top or 0.0))
+            except Exception:
+                current_scroll_top = -1.0
+            self._asset_scroll_event_suppressed = False
+            if abs(current_scroll_top - self._asset_scroll_suppressed_top) <= 0.01:
+                self._asset_scroll_suppressed_top = -1.0
+                return
+            self._asset_scroll_suppressed_top = -1.0
+        self._request_asset_window_refresh()
 
     def _on_gallery_precise_scroll(self, event) -> None:
         scroll_el = event.current_target()
@@ -4729,6 +4997,10 @@ class AssetManagerPanel(Panel):
         )
         if abs(new_scroll - scroll_el.scroll_top) > 0.01:
             scroll_el.scroll_top = new_scroll
+            self._asset_scroll_event_suppressed = True
+            self._asset_scroll_suppressed_top = new_scroll
+
+        self._request_asset_window_refresh()
 
         event.stop_propagation()
 
@@ -5166,6 +5438,7 @@ class AssetManagerPanel(Panel):
 
     def _dirty_catalog_view(self) -> None:
         """Refresh catalog-facing records without dirtying unrelated model fields."""
+        self._invalidate_catalog_cache()
         self._reconcile_selection()
         fields: List[str] = [
             "folders",
@@ -5407,7 +5680,10 @@ class AssetManagerPanel(Panel):
             return
 
         fields_set = set(fields)
-        if fields_set.intersection({"assets", "folders", "scenes"}):
+        # "assets" is also used for viewport/menu refreshes, so invalidating the
+        # catalog cache here defeats virtualization by forcing a full regroup/filter
+        # rebuild on scroll. Real catalog mutations already invalidate explicitly.
+        if fields_set.intersection({"folders", "scenes"}):
             self._invalidate_catalog_cache()
 
         # Check if any selection-related fields are being dirtied.

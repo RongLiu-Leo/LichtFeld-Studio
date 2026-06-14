@@ -480,63 +480,53 @@
     margin-top: 2dp;
 }
 
-.asset-results-footer {
-    display: flex;
-    justify-content: center;
-    padding: 10dp 0 4dp;
-}
-
-.asset-show-more-button {
-    min-width: 140dp;
-    font-size: 12dp;
-    padding: 6dp 12dp;
-}
-
 .asset-gallery-scroll {
     flex: 1;
-    position: relative;
-    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    overflow: auto;
     min-height: 140dp;
 }
 
 .asset-scroll-shell {
-    position: absolute;
     display: flex;
+    flex-direction: column;
+    width: 100%;
     min-width: 0;
     min-height: 0;
 }
 
 .asset-scroll-shell-gallery {
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
+    gap: 0;
 }
 
 .asset-scroll-shell-list {
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
+    gap: 4dp;
 }
 
 .asset-card-grid,
 .asset-list-view {
-    flex: 1;
+    flex: none;
     min-width: 0;
     min-height: 0;
 }
 
 .asset-card-grid {
     display: flex;
+    flex-direction: column;
+    gap: 0;
+    overflow: visible;
+    padding: 12dp 24dp 12dp 12dp;
+    box-sizing: border-box;
+}
+
+.asset-card-grid-window {
+    display: flex;
     flex-direction: row;
     flex-wrap: wrap;
     gap: 10dp;
     align-content: flex-start;
-    overflow-y: auto;
-    overflow-x: hidden;
-    padding: 12dp 24dp 12dp 12dp;
-    box-sizing: border-box;
+    min-width: 0;
 }
 
 .asset-card-slot {
@@ -916,45 +906,48 @@
 .asset-list-view {
     display: flex;
     flex-direction: column;
-    gap: 4dp;
-    overflow: auto;
+    gap: 0;
+    overflow: visible;
     /* Reserve a real gutter for the native scrollbars so rows never paint into
      * the scrollbar lane when the panel is docked and space is tight. */
     padding: 12dp 32dp 32dp 12dp;
     box-sizing: border-box;
 }
 
-.asset-list-bottom-spacer {
-    flex: 0 0 480dp;
-    min-height: 480dp;
+.asset-list-window {
+    display: flex;
+    flex-direction: column;
+    gap: 4dp;
+    min-width: 0;
 }
 
-.asset-card-grid scrollbarvertical,
-.asset-card-grid scrollbarhorizontal,
-.asset-list-view scrollbarvertical,
-.asset-list-view scrollbarhorizontal {
+.asset-virtual-spacer {
+    flex: 0 0 auto;
+    width: 100%;
+    min-width: 100%;
+    pointer-events: none;
+}
+
+.asset-gallery-scroll scrollbarvertical,
+.asset-gallery-scroll scrollbarhorizontal {
     z-index: 20;
 }
 
-.asset-card-grid::-webkit-scrollbar,
-.asset-list-view::-webkit-scrollbar {
+.asset-gallery-scroll::-webkit-scrollbar {
     height: 8dp;
     width: 8dp;
 }
 
-.asset-card-grid::-webkit-scrollbar-track,
-.asset-list-view::-webkit-scrollbar-track {
+.asset-gallery-scroll::-webkit-scrollbar-track {
     background: #2b2825;
 }
 
-.asset-card-grid::-webkit-scrollbar-thumb,
-.asset-list-view::-webkit-scrollbar-thumb {
+.asset-gallery-scroll::-webkit-scrollbar-thumb {
     background: #514a42;
     border-radius: 4dp;
 }
 
-.asset-card-grid::-webkit-scrollbar-thumb:hover,
-.asset-list-view::-webkit-scrollbar-thumb:hover {
+.asset-gallery-scroll::-webkit-scrollbar-thumb:hover {
     background: #6a5f55;
 }
 
@@ -981,6 +974,8 @@
 }
 
 .asset-list-row {
+    min-height: 44dp;
+    height: 44dp;
     padding: 8dp 10dp;
     border-width: 1dp;
     border-color: #514a42;
@@ -1008,6 +1003,17 @@
     bottom: 100%;
     right: 4dp;
     left: auto;
+}
+
+.asset-card {
+    height: 220dp;
+    overflow: hidden;
+}
+
+.asset-card-body {
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
 }
 
 .asset-list-name,
