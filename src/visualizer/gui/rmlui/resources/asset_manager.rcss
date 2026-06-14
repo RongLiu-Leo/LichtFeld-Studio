@@ -994,7 +994,7 @@
     flex-direction: row;
     align-items: center;
     gap: 6dp;
-    min-width: 480dp;
+    min-width: 440dp;
     width: 100%;
     box-sizing: border-box;
 }
@@ -1047,13 +1047,13 @@
 }
 
 .asset-col-name {
-    width: 140dp;
-    min-width: 100dp;
+    width: 118dp;
+    min-width: 88dp;
     flex-shrink: 1;
 }
 
 .asset-col-type {
-    width: 50dp;
+    width: 42dp;
     flex-shrink: 0;
 }
 
@@ -1063,18 +1063,19 @@
 }
 
 .asset-col-folder {
-    width: 80dp;
+    width: 66dp;
     flex-shrink: 0;
 }
 
 .asset-col-size {
-    width: 60dp;
+    width: 52dp;
     flex-shrink: 0;
 }
 
 .asset-col-modified {
-    width: 80dp;
-    flex-shrink: 0;
+    width: 150dp;
+    min-width: 150dp;
+    flex: 1 0 150dp;
 }
 
 .asset-col-status {
