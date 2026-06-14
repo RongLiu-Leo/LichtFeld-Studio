@@ -1027,7 +1027,7 @@
 }
 
 .asset-col-type {
-    width: 42dp;
+    width: 58dp;
     flex-shrink: 0;
 }
 
@@ -1037,12 +1037,12 @@
 }
 
 .asset-col-folder {
-    width: 66dp;
+    width: 58dp;
     flex-shrink: 0;
 }
 
 .asset-col-size {
-    width: 52dp;
+    width: 78dp;
     flex-shrink: 0;
 }
 

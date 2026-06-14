@@ -62,7 +62,7 @@
                 </div>
               </div>
             </div>
-            <div class="section-content" data-visible="folders_expanded">
+            <div class="section-content collapsed" data-class-collapsed="!folders_expanded">
               <div data-for="folder : folders">
                 <div class="asset-filter-row" data-class-is-active="folder.id == selected_folder_id" data-attr-data-folder-id="folder.id">
                   <span class="asset-row-label">{{folder.name}}</span>
@@ -95,7 +95,7 @@
               <span class="section-arrow" data-class-is-expanded="!filters_collapsed">&#x25B6;</span>
               <span>{{filters_title}}</span>
             </div>
-            <div class="section-content" data-visible="filters_expanded">
+            <div class="section-content collapsed" data-class-collapsed="!filters_expanded">
               <div data-for="filter : filters">
                 <div class="asset-filter-checkbox-row" data-event-click="toggle_filter(filter.id)">
                   <input type="checkbox" data-checked="filter.is_selected" />
