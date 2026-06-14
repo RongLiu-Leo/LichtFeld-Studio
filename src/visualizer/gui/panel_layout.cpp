@@ -556,9 +556,7 @@ namespace lfs::vis::gui {
         const float icon_bar_w = ICON_BAR_WIDTH * dpi;
         const float status_bar_h = STATUS_BAR_HEIGHT * dpi;
         const float panel_h = screen.work_size.y - status_bar_h;
-        const float max_panel_w = std::min(
-            screen.work_size.x * LEFT_DOCK_MAX_RATIO,
-            screen.work_size.x - MIN_VIEWPORT_WIDTH * dpi - icon_bar_w);
+        const float max_panel_w = std::max(0.0f, screen.work_size.x - icon_bar_w);
 
         if (max_panel_w <= 0.0f) {
             left_dock_hovering_edge_ = false;
@@ -670,9 +668,7 @@ namespace lfs::vis::gui {
         const float icon_bar_w = ICON_BAR_WIDTH * dpi;
         const float status_bar_h = STATUS_BAR_HEIGHT * dpi;
         const float panel_h = screen.work_size.y - status_bar_h;
-        const float max_panel_w = std::min(
-            screen.work_size.x * LEFT_DOCK_MAX_RATIO,
-            screen.work_size.x - MIN_VIEWPORT_WIDTH * dpi - icon_bar_w);
+        const float max_panel_w = std::max(0.0f, screen.work_size.x - icon_bar_w);
 
         if (max_panel_w <= 0.0f) {
             left_dock_hovering_edge_ = false;
@@ -778,9 +774,7 @@ namespace lfs::vis::gui {
         if (!left_dock_visible_)
             return icon_bar_w;
 
-        const float max_panel_w = std::min(
-            screen.work_size.x * LEFT_DOCK_MAX_RATIO,
-            screen.work_size.x - MIN_VIEWPORT_WIDTH * dpi - icon_bar_w);
+        const float max_panel_w = std::max(0.0f, screen.work_size.x - icon_bar_w);
         if (max_panel_w <= 0.0f)
             return icon_bar_w;
 

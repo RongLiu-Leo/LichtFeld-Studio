@@ -139,7 +139,6 @@
 .asset-view-button,
 .asset-card-button,
 .asset-info-button,
-.asset-tag-remove,
 .asset-action-button {
     background-color: #302d29;
     border-width: 1dp;
@@ -155,7 +154,6 @@
 .asset-view-button:hover,
 .asset-card-button:hover,
 .asset-info-button:hover,
-.asset-tag-remove:hover,
 .asset-action-button:hover {
     background-color: #454038;
     border-color: #7fb9a5;
@@ -542,7 +540,6 @@
 }
 
 .asset-card-slot {
-    max-width: 100%;
     min-width: 0;
     display: flex;
 }
@@ -747,25 +744,7 @@
     color: #a9a093;
 }
 
-.asset-card-tags,
-.asset-info-tags {
-    display: flex;
-    flex-direction: column;
-    gap: 4dp;
-    margin-top: 8dp;
-}
-
-.asset-card-tag {
-    font-size: 12dp;
-    color: #a9a093;
-    background-color: #38342f;
-    padding: 2dp 6dp;
-    border-radius: 3dp;
-}
-
-.asset-card-actions,
-.asset-tag-editor,
-.asset-info-tag-row {
+.asset-card-actions {
     display: flex;
     flex-direction: row;
     gap: 6dp;
@@ -1245,15 +1224,6 @@
     display: flex;
     flex-direction: row;
     gap: 8dp;
-}
-
-.asset-tag-editor input[type="text"] {
-    flex: 1;
-}
-
-.asset-tag-remove {
-    font-size: 12dp;
-    padding: 2dp 6dp;
 }
 
 .scene-asset-row {

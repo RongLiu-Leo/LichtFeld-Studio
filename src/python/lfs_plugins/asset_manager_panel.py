@@ -298,7 +298,6 @@ class AssetManagerPanel(Panel):
         self._view_mode: str = "list"  # gallery, list
         self._sort_mode: str = "type"  # name, size, type
         self._search_query: str = ""
-        self._pending_tag_name: str = ""
         self._asset_visible_limit = ASSET_LIST_VISIBLE_LIMIT
         self._last_asset_match_count = 0
         self._last_asset_visible_count = 0
@@ -309,7 +308,6 @@ class AssetManagerPanel(Panel):
         self._catalog_folders_snapshot: Optional[Dict[str, Dict[str, Any]]] = None
         self._catalog_scenes_snapshot: Optional[Dict[str, Dict[str, Any]]] = None
         self._catalog_stats_snapshot: Optional[Dict[str, Any]] = None
-        self._selected_asset_tags_key: Optional[tuple[str, ...]] = None
         self._selected_scene_assets_key: Optional[str] = None
         self._selection_detail_timer: Optional[threading.Timer] = None
         self._selection_detail_generation = 0
@@ -650,10 +648,6 @@ class AssetManagerPanel(Panel):
         model.bind_func("prop_sparse_model_label", lambda: tr("asset_manager.property.sparse_model"))
         model.bind_func("prop_cameras_label", lambda: tr("asset_manager.property.cameras"))
         model.bind_func("prop_initial_points_label", lambda: tr("asset_manager.property.initial_points"))
-        model.bind_func("tags_title", lambda: tr("asset_manager.sidebar.tags"))
-        model.bind_func("remove_tag_label", lambda: tr("asset_manager.action.remove"))
-        model.bind_func("add_tag_placeholder", lambda: tr("asset_manager.action.add_tag"))
-        model.bind_func("add_tag_button_label", lambda: tr("asset_manager.action.add_tag"))
         model.bind_func("geometry_metadata_title", lambda: tr("asset_manager.info_panel.geometry_metadata"))
         model.bind_func("prop_bounding_box_label", lambda: tr("asset_manager.geometry.bounding_box"))
         model.bind_func("prop_center_label", lambda: tr("asset_manager.geometry.center"))
@@ -679,7 +673,6 @@ class AssetManagerPanel(Panel):
         model.bind_record_list("scenes")
         model.bind_record_list("filters")
         model.bind_record_list("assets")
-        model.bind_record_list("selected_asset_tags")
 
         # Record lists for nested struct lists
         model.bind_record_list("selected_scene_assets")
@@ -710,9 +703,6 @@ class AssetManagerPanel(Panel):
         model.bind_event("on_load_asset", self.on_load_asset)
         model.bind_event("on_remove_asset", self.on_remove_asset)
         model.bind_event("on_update_thumbnail", self.on_update_thumbnail)
-        model.bind_event("on_pending_tag_change", self.on_pending_tag_change)
-        model.bind_event("on_add_tag", self.on_add_tag)
-        model.bind_event("on_remove_tag", self.on_remove_tag)
 
         # Panel resize event handlers
         model.bind_event("on_sidebar_resize_start", self.on_sidebar_resize_start)
@@ -1412,11 +1402,6 @@ class AssetManagerPanel(Panel):
             "usd": tr("asset_manager.type.usd"),
         }
         type_label = type_labels.get(asset_type, asset_type.upper() if asset_type else "")
-        tags = asset.get("tags") or []
-        if isinstance(tags, (list, tuple, set)):
-            tags_label = ", ".join(str(tag) for tag in tags if tag is not None)
-        else:
-            tags_label = str(tags)
 
         return {
             "id": asset_id,
@@ -1432,8 +1417,6 @@ class AssetManagerPanel(Panel):
             "file_size_bytes": file_size_bytes,
             "points_label": points_str,
             "gaussian_count": gaussian_count,
-            # Record-list rows only support scalar fields in the current RML bridge.
-            "tags_label": tags_label,
             "thumb_class": thumb_class,
             "thumb_label": asset_type.upper() if asset_type else tr("asset_manager.type.asset"),
             "thumbnail_decorator": self._thumbnail_decorator(asset)
@@ -2746,7 +2729,6 @@ class AssetManagerPanel(Panel):
     ) -> tuple[str, ...]:
         fields = [
             "selected_asset_id",
-            "selected_asset_tags",
             *self._selection_count_fields(),
             *self._selection_visibility_fields(),
             *self._selected_asset_detail_fields(),
@@ -3002,35 +2984,6 @@ class AssetManagerPanel(Panel):
             self._search_query = str(args[0])
         self._reset_asset_visible_limit()
         self._dirty_model("search_query", *self._asset_result_dirty_fields())
-
-    def on_pending_tag_change(self, _handle, _ev, args):
-        """Update the pending tag input buffer."""
-        self._pending_tag_name = str(args[0]) if args else ""
-
-    def on_add_tag(self, _handle, _ev, args):
-        """Add the pending tag to the currently selected asset."""
-        asset = self._get_selected_asset()
-        if not asset or not self._asset_index:
-            return
-        tag = self._pending_tag_name.strip()
-        if not tag:
-            return
-        self._asset_index.add_tag_to_asset(asset["id"], tag)
-        self._pending_tag_name = ""
-        self.refresh_catalog()
-        self._dirty_model("assets", "selected_asset_tags")
-
-    def on_remove_tag(self, _handle, _ev, args):
-        """Remove a tag from the currently selected asset."""
-        asset = self._get_selected_asset()
-        if not asset or not self._asset_index or not args:
-            return
-        tag = str(args[0]).strip()
-        if not tag:
-            return
-        self._asset_index.remove_tag_from_asset(asset["id"], tag)
-        self.refresh_catalog()
-        self._dirty_model("assets", "selected_asset_tags")
 
     # ── New Folder Handlers ──────────────────────────────────
 
@@ -3391,7 +3344,6 @@ class AssetManagerPanel(Panel):
             "selected_folder_id",
             "selected_scene_id",
             "selected_asset_id",
-            "selected_asset_tags",
             *self._selection_count_fields(),
             *self._selection_visibility_fields(),
             *self._selected_asset_detail_fields(),
@@ -3451,7 +3403,6 @@ class AssetManagerPanel(Panel):
             *self._asset_result_dirty_fields(),
             "selected_scene_id",
             "selected_asset_id",
-            "selected_asset_tags",
             *self._selection_count_fields(),
             *self._selection_visibility_fields(),
             *self._selected_asset_detail_fields(),
@@ -5362,7 +5313,6 @@ class AssetManagerPanel(Panel):
         self,
         *,
         update_scene_assets: bool = True,
-        update_asset_tags: bool = True,
     ) -> Dict[str, Any]:
         """Update record lists for selected scene and folder."""
         if not self._handle or self._updating_selection_details:
@@ -5392,29 +5342,6 @@ class AssetManagerPanel(Panel):
                         "total": build_ms + update_ms,
                     }
                     self._handle.dirty("selected_scene_assets")
-
-            if update_asset_tags:
-                selected_asset = self._get_selected_asset()
-                tags_key = tuple(
-                    str(tag)
-                    for tag in ((selected_asset or {}).get("tags", []) or [])
-                    if tag is not None
-                )
-                if tags_key != self._selected_asset_tags_key:
-                    build_start = time.perf_counter()
-                    rows = [{"value": tag} for tag in tags_key]
-                    build_ms = self._elapsed_ms(build_start)
-                    update_start = time.perf_counter()
-                    self._handle.update_record_list("selected_asset_tags", rows)
-                    update_ms = self._elapsed_ms(update_start)
-                    self._selected_asset_tags_key = tags_key
-                    counts["selected_asset_tags"] = len(rows)
-                    timings_ms["selected_asset_tags"] = {
-                        "build": build_ms,
-                        "update": update_ms,
-                        "total": build_ms + update_ms,
-                    }
-                    self._handle.dirty("selected_asset_tags")
 
             return {"counts": counts, "timings_ms": timings_ms}
         finally:
@@ -5493,7 +5420,6 @@ class AssetManagerPanel(Panel):
             {
                 "selected_asset",
                 "selected_asset_id",
-                "selected_asset_tags",
                 "selected_folder",
                 "selected_folder_id",
                 "selected_scene",
@@ -5507,13 +5433,6 @@ class AssetManagerPanel(Panel):
                 | {"selected_scene", "selected_scene_id", "selected_scene_assets"}
             )
         )
-        update_asset_tags = bool(
-            fields_set.intersection(
-                set(self._selected_asset_detail_fields())
-                | {"selected_asset", "selected_asset_id", "selected_asset_tags"}
-            )
-        )
-
         for field in fields:
             self._handle.dirty(field)
             # Update record lists when they change
@@ -5545,7 +5464,6 @@ class AssetManagerPanel(Panel):
             records_start = time.perf_counter()
             selection_summary = self._update_selection_details(
                 update_scene_assets=update_scene_assets,
-                update_asset_tags=update_asset_tags,
             )
             record_update_ms += self._elapsed_ms(records_start)
             record_updates.update(selection_summary.get("counts", {}))

@@ -190,8 +190,6 @@ namespace lfs::vis::gui {
         static constexpr float MIN_VIEWPORT_HEIGHT = 140.0f;
         static constexpr float LEFT_DOCK_MIN_WIDTH = 180.0f;
         static constexpr float LEFT_DOCK_DEFAULT_WIDTH = 320.0f;
-        static constexpr float LEFT_DOCK_MAX_RATIO = 0.35f;
-        static constexpr float MIN_VIEWPORT_WIDTH = 200.0f;
         static constexpr float ICON_BAR_WIDTH = 40.0f;
     };
 

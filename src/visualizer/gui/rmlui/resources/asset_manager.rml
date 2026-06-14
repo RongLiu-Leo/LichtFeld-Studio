@@ -142,9 +142,6 @@
                         <span data-if="asset.points_label">{{asset.points_label}}</span>
                         <span>{{asset.size_label}}</span>
                       </div>
-                      <div class="asset-card-tags" data-if="asset.tags_label">
-                        <span class="asset-card-tag">{{asset.tags_label}}</span>
-                      </div>
                     <div class="asset-card-actions">
                         <button class="asset-card-button" data-attr-data-asset-id="asset.id" data-asset-action="load">{{load_button_label}}</button>
                       </div>
@@ -354,21 +351,6 @@
                 <button class="asset-info-button" data-event-click="on_locate_file">{{locate_file_button_label}}</button>
               </div>
 
-              <div class="asset-info-section">
-                <div class="asset-info-section-title">{{tags_title}}</div>
-                <div class="asset-info-tags">
-                  <div data-for="tag : selected_asset_tags">
-                    <div class="asset-info-tag-row">
-                      <span class="asset-card-tag">{{tag.value}}</span>
-                      <button class="asset-tag-remove" data-event-click="on_remove_tag(tag.value)">{{remove_tag_label}}</button>
-                    </div>
-                  </div>
-                </div>
-                <div class="asset-tag-editor">
-                  <input type="text" placeholder="{{add_tag_placeholder}}" data-event-change="on_pending_tag_change" />
-                  <button class="asset-info-button" data-event-click="on_add_tag">{{add_tag_button_label}}</button>
-                </div>
-              </div>
             </div>
 
             <div data-if="show_selection_scene">
