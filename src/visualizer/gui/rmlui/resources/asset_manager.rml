@@ -5,14 +5,9 @@
 </head>
 
 <body template="docked-panel" data-model="asset_manager">
-  <div class="dock-drag-handle" data-class-hidden="is_floating">
-    <div class="dock-drag-handle-bar"></div>
-  </div>
-
   <div id="asset-floating-header" class="hidden" data-class-hidden="!is_floating">
     <span id="asset-floating-title">{{panel_label}}</span>
     <div class="asset-panel-actions">
-      <button class="btn btn--secondary asset-panel-action" data-event-click="toggle_dock_mode">{{dock_toggle_label}}</button>
       <button class="btn btn--secondary asset-panel-action" data-event-click="close_panel">{{close_label}}</button>
     </div>
   </div>

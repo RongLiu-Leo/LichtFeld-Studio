@@ -459,7 +459,6 @@ class AssetManagerPanel(Panel):
 
         # Dock state (mirror histogram_panel pattern)
         model.bind_func("is_floating", lambda: self._is_floating)
-        model.bind_func("dock_toggle_label", self._dock_toggle_label)
         model.bind_func("close_label", lambda: tr("common.close"))
 
         # Import menu state
@@ -731,8 +730,7 @@ class AssetManagerPanel(Panel):
         model.bind_event("toggle_folders_collapsed", self.toggle_folders_collapsed)
         model.bind_event("toggle_filters_collapsed", self.toggle_filters_collapsed)
 
-        # Dock toggle / close events
-        model.bind_event("toggle_dock_mode", self._on_toggle_dock_mode)
+        # Close event
         model.bind_event("close_panel", self._on_close_panel)
 
     # ── Data Retrieval Methods ─────────────────────────────────
@@ -5589,11 +5587,6 @@ class AssetManagerPanel(Panel):
         self._with_import_folder(lambda _folder_id: open_url_import_panel())
 
 
-    # ── Dock helpers ──────────────────────────────────────────
-
-    def _dock_toggle_label(self) -> str:
-        return "Dock" if self._is_floating else "Undock"
-
     def _sync_panel_space_state(self) -> bool:
         info = None
         try:
@@ -5606,18 +5599,6 @@ class AssetManagerPanel(Panel):
         self._panel_space = panel_space
         self._is_floating = is_floating
         return changed
-
-    def _on_toggle_dock_mode(self, _handle, _event, _args):
-        target_space = lf.ui.PanelSpace.LEFT_DOCK if self._is_floating else lf.ui.PanelSpace.FLOATING
-        try:
-            changed = bool(lf.ui.set_panel_space(self.id, target_space))
-        except Exception:
-            changed = False
-        if not changed:
-            return
-        self._sync_panel_space_state()
-        if self._handle:
-            self._handle.dirty_all()
 
     def _on_close_panel(self, _handle, _event, _args):
         lf.ui.set_panel_enabled(self.id, False)
