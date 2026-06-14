@@ -1040,6 +1040,8 @@ namespace {
         ::args::ValueFlag<int> sh_degree(parser, "degree", "SH degree [0-3], -1 to keep original (default: -1)", {"sh-degree"});
         ::args::ValueFlag<std::string> format(parser, "format", "Output format: ply, sog, spz, html, usd, usda, usdc, rad", {'f', "format"});
         ::args::ValueFlag<int> sog_iter(parser, "iterations", "K-means iterations for SOG (default: 10)", {"sog-iterations"});
+        ::args::ValueFlag<std::string> tiles(parser, "AxB", "Replicate a PLY source across an AxB ground-plane grid (RAD output only)", {"tiles"});
+        ::args::ValueFlag<std::string> lod_builder(parser, "builder", "PLY->RAD LOD tree builder: bhatt (default) or octree (hybrid: octree fine levels + similarity-ordered bhatt top, much faster)", {"lod-builder"});
         ::args::Flag overwrite(parser, "overwrite", "Overwrite existing files without prompting", {'y', "overwrite"});
 
         std::vector<std::string> args_vec(argv + 1, argv + argc);
@@ -1088,6 +1090,43 @@ namespace {
                 params.format = *fmt;
             } else {
                 return std::unexpected(std::format("Unknown extension '{}'. Use --format", params.output_path.extension().string()));
+            }
+        }
+
+        if (tiles) {
+            const std::string& spec = ::args::get(tiles);
+            const std::size_t sep = spec.find_first_of("xX");
+            std::uint32_t a = 0;
+            std::uint32_t b = 0;
+            bool ok = sep != std::string::npos && sep > 0 && sep + 1 < spec.size();
+            if (ok) {
+                const auto [pa, ea] = std::from_chars(spec.data(), spec.data() + sep, a);
+                const auto [pb, eb] = std::from_chars(spec.data() + sep + 1, spec.data() + spec.size(), b);
+                ok = ea == std::errc{} && eb == std::errc{} &&
+                     pa == spec.data() + sep && pb == spec.data() + spec.size() &&
+                     a > 0 && b > 0;
+            }
+            if (!ok) {
+                return std::unexpected(std::format("Invalid --tiles '{}'. Use AxB, e.g. 3x2", spec));
+            }
+            if (params.format != param::OutputFormat::RAD) {
+                return std::unexpected("--tiles requires RAD output (--format rad)");
+            }
+            params.tiles_x = a;
+            params.tiles_y = b;
+        }
+
+        if (lod_builder) {
+            const std::string& name = ::args::get(lod_builder);
+            if (name == "bhatt") {
+                params.lod_builder = param::LodBuilder::BHATT;
+            } else if (name == "octree") {
+                params.lod_builder = param::LodBuilder::OCTREE;
+            } else {
+                return std::unexpected(std::format("Invalid --lod-builder '{}'. Use: bhatt, octree", name));
+            }
+            if (params.format != param::OutputFormat::RAD) {
+                return std::unexpected("--lod-builder requires RAD output (--format rad)");
             }
         }
 

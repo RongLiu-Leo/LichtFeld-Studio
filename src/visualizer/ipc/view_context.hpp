@@ -140,12 +140,14 @@ namespace lfs::vis {
 
         bool lod_enabled = false;
         bool lod_debug_colors = false;
-        float lod_max_splats = 1500000.0f;
-        float lod_pixel_scale_limit = 0.0001f;
-        float lod_render_scale = 1.0f;
-        float lod_cone_foveation = 0.4f;
-        float lod_cone_inner_degrees = 90.0f;
-        float lod_cone_outer_degrees = 120.0f;
+        float lod_max_splats = static_cast<float>(DEFAULT_LOD_MAX_SPLATS);
+        float lod_page_pool_splats = static_cast<float>(DEFAULT_LOD_PAGE_POOL_SPLATS);
+        float lod_pool_vram_fraction = DEFAULT_LOD_POOL_VRAM_FRACTION;
+        float lod_fade_frames = static_cast<float>(DEFAULT_LOD_FADE_FRAMES);
+        float lod_render_scale = DEFAULT_LOD_RENDER_SCALE;
+        float lod_cone_foveation = DEFAULT_LOD_CONE_FOVEATION;
+        float lod_cone_inner_degrees = DEFAULT_LOD_CONE_INNER_DEGREES;
+        float lod_cone_outer_degrees = DEFAULT_LOD_CONE_OUTER_DEGREES;
     };
 
     using GetRenderSettingsCallback = std::function<std::optional<RenderSettingsProxy>()>;

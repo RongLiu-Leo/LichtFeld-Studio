@@ -8,16 +8,26 @@
 #include "core/splat_data.hpp"
 #include "formats/rad.hpp"
 #include "io/error.hpp"
+
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <string>
 
 namespace lfs::io {
 
     using lfs::core::Device;
     using lfs::core::SplatData;
     using lfs::core::Tensor;
+
+    namespace {
+        bool radPagedGpuUploadRequested(const SplatData& data) {
+            return rad_paged_load_recommended(data);
+        }
+    } // namespace
 
     Result<LoadResult> RadLoader::load(
         const std::filesystem::path& path,
@@ -80,18 +90,51 @@ namespace lfs::io {
                               std::format("Failed to load RAD: {}", splat_result.error()), path);
         }
 
-        // Move tensors to CUDA for Vulkan renderer compatibility
         SplatData& data = *splat_result;
-        data.means_raw() = data.means_raw().to(Device::CUDA);
-        data.sh0_raw() = data.sh0_raw().to(Device::CUDA);
-        if (data.shN_raw().is_valid() && data.shN_raw().numel() > 0) {
-            data.shN_raw() = data.shN_raw().to(Device::CUDA);
-        }
-        data.scaling_raw() = data.scaling_raw().to(Device::CUDA);
-        data.rotation_raw() = data.rotation_raw().to(Device::CUDA);
-        data.opacity_raw() = data.opacity_raw().to(Device::CUDA);
-        if (data.has_deleted_mask()) {
-            data.deleted() = data.deleted().to(Device::CUDA);
+        if (radPagedGpuUploadRequested(data)) {
+            // Paged residency streams chunk payloads from disk, and that path
+            // is sidecar-backed end to end (upload engine, page sink, and
+            // selector metadata all gate on the meta view). Out-of-core loads
+            // attach it inside load_rad; in-core paged loads ensure it here.
+            if (!data.lod_tree->meta_view.valid()) {
+                auto view = open_rad_meta_sidecar(path);
+                if (!view) {
+                    if (auto built = build_rad_meta_sidecar(path); !built) {
+                        return make_error(ErrorCode::CORRUPTED_DATA,
+                                          std::format("RAD paged load requires the metadata "
+                                                      "sidecar: {}",
+                                                      built.error().message),
+                                          path);
+                    }
+                    view = open_rad_meta_sidecar(path);
+                }
+                if (!view) {
+                    return make_error(ErrorCode::CORRUPTED_DATA,
+                                      std::format("RAD paged load requires the metadata "
+                                                  "sidecar: {}",
+                                                  view.error()),
+                                      path);
+                }
+                data.lod_tree->meta_view = *view;
+            }
+            const char* const page_capacity_env = std::getenv("LFS_LOD_PAGE_CAPACITY");
+            LOG_INFO("RAD paged LOD active: deferring full CUDA tensor migration "
+                     "(chunks={}, requested_pages={})",
+                     data.lod_tree->chunk_count(),
+                     page_capacity_env != nullptr ? page_capacity_env : "auto");
+        } else {
+            // Move tensors to CUDA for Vulkan renderer compatibility.
+            data.means_raw() = data.means_raw().to(Device::CUDA);
+            data.sh0_raw() = data.sh0_raw().to(Device::CUDA);
+            if (data.shN_raw().is_valid() && data.shN_raw().numel() > 0) {
+                data.shN_raw() = data.shN_raw().to(Device::CUDA);
+            }
+            data.scaling_raw() = data.scaling_raw().to(Device::CUDA);
+            data.rotation_raw() = data.rotation_raw().to(Device::CUDA);
+            data.opacity_raw() = data.opacity_raw().to(Device::CUDA);
+            if (data.has_deleted_mask()) {
+                data.deleted() = data.deleted().to(Device::CUDA);
+            }
         }
 
         if (options.progress) {

@@ -387,13 +387,11 @@ namespace lfs::io {
     private:
         static std::vector<fs::path> build_lookup_keys(const std::string& image_name) {
             const fs::path img_path = lfs::core::utf8_to_path(image_name);
-            const fs::path parent_path = img_path.parent_path();
-            const fs::path stem_path = parent_path / img_path.stem();
-            const std::string stem = lfs::core::path_to_utf8(img_path.stem());
+            const fs::path stem_path = img_path.parent_path() / img_path.stem();
 
             std::vector<fs::path> keys;
             std::unordered_set<std::string> seen_keys;
-            keys.reserve(1 + 3 * DEPTH_SEARCH_EXTENSIONS.size());
+            keys.reserve(1 + 2 * DEPTH_SEARCH_EXTENSIONS.size());
 
             auto append_key = [&](const fs::path& key) {
                 const std::string normalized_key = detail::normalize_lookup_key(key);
@@ -408,16 +406,6 @@ namespace lfs::io {
                 fs::path target = stem_path;
                 target += ext;
                 append_key(target);
-            }
-
-            if (stem.rfind("RENDER_", 0) == 0) {
-                const fs::path depth_stem_path =
-                    parent_path / lfs::core::utf8_to_path("DEPTH_" + stem.substr(7));
-                for (const auto* ext : DEPTH_SEARCH_EXTENSIONS) {
-                    fs::path target = depth_stem_path;
-                    target += ext;
-                    append_key(target);
-                }
             }
 
             for (const auto* ext : DEPTH_SEARCH_EXTENSIONS) {

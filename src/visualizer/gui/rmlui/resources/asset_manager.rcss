@@ -953,8 +953,17 @@
     flex-direction: column;
     gap: 4dp;
     overflow: auto;
-    padding: 12dp 24dp 24dp 12dp;
+    /* Reserve a real gutter for the native scrollbars so rows never paint into
+     * the scrollbar lane when the panel is docked and space is tight. */
+    padding: 12dp 32dp 32dp 12dp;
     box-sizing: border-box;
+}
+
+.asset-card-grid scrollbarvertical,
+.asset-card-grid scrollbarhorizontal,
+.asset-list-view scrollbarvertical,
+.asset-list-view scrollbarhorizontal {
+    z-index: 20;
 }
 
 .asset-card-grid::-webkit-scrollbar,

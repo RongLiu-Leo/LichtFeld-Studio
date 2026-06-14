@@ -1005,6 +1005,12 @@ NB_MODULE(lichtfeld, m) {
     // Scene manipulation
     m.def(
         "set_node_visibility", [](const std::string& name, bool visible) {
+            if (auto* scene = get_scene_internal()) {
+                if (const auto* node = scene->getNode(name)) {
+                    lfs::core::events::cmd::SetNodeVisibilityById{.node_id = node->id, .visible = visible}.emit();
+                    return;
+                }
+            }
             lfs::core::events::cmd::SetPLYVisibility{.name = name, .visible = visible}.emit();
         },
         nb::arg("name"), nb::arg("visible"), "Set visibility of a scene node by name");
@@ -1040,6 +1046,12 @@ NB_MODULE(lichtfeld, m) {
 
     m.def(
         "remove_node", [](const std::string& name, bool keep_children) {
+            if (auto* scene = get_scene_internal()) {
+                if (const auto* node = scene->getNode(name)) {
+                    lfs::core::events::cmd::RemoveNodeById{.node_id = node->id, .keep_children = keep_children}.emit();
+                    return;
+                }
+            }
             lfs::core::events::cmd::RemovePLY{.name = name, .keep_children = keep_children}.emit();
         },
         nb::arg("name"), nb::arg("keep_children") = false, "Remove a scene node by name");
@@ -1076,18 +1088,49 @@ NB_MODULE(lichtfeld, m) {
 
     m.def(
         "reparent_node", [](const std::string& name, const std::string& new_parent) {
+            if (auto* scene = get_scene_internal()) {
+                const auto* node = scene->getNode(name);
+                if (!node)
+                    return;
+                lfs::core::NodeId parent_id = lfs::core::NULL_NODE;
+                if (!new_parent.empty()) {
+                    const auto* parent = scene->getNode(new_parent);
+                    if (!parent)
+                        return;
+                    parent_id = parent->id;
+                }
+                lfs::core::events::cmd::ReparentNodeById{.node_id = node->id, .new_parent_id = parent_id}.emit();
+                return;
+            }
             lfs::core::events::cmd::ReparentNode{.node_name = name, .new_parent_name = new_parent}.emit();
         },
         nb::arg("name"), nb::arg("new_parent"), "Move a node under a new parent node");
 
     m.def(
         "rename_node", [](const std::string& old_name, const std::string& new_name) {
+            if (auto* scene = get_scene_internal()) {
+                if (const auto* node = scene->getNode(old_name)) {
+                    lfs::core::events::cmd::RenameNodeById{.node_id = node->id, .new_name = new_name}.emit();
+                    return;
+                }
+            }
             lfs::core::events::cmd::RenamePLY{.old_name = old_name, .new_name = new_name}.emit();
         },
         nb::arg("old_name"), nb::arg("new_name"), "Rename a scene node");
 
     m.def(
         "add_group", [](const std::string& name, const std::string& parent) {
+            if (auto* scene = get_scene_internal()) {
+                lfs::core::NodeId parent_id = lfs::core::NULL_NODE;
+                if (!parent.empty()) {
+                    const auto* parent_node = scene->getNode(parent);
+                    if (!parent_node)
+                        return;
+                    parent_id = parent_node->id;
+                }
+                lfs::core::events::cmd::AddGroupByParentId{.name = name, .parent_id = parent_id}.emit();
+                return;
+            }
             lfs::core::events::cmd::AddGroup{.name = name, .parent_name = parent}.emit();
         },
         nb::arg("name"), nb::arg("parent") = "", "Add a group node to the scene");
@@ -1316,6 +1359,25 @@ NB_MODULE(lichtfeld, m) {
             }
         },
         nb::arg("name"), nb::arg("matrix"), "Set node visualizer-world transform matrix (16 floats, column-major)");
+
+    m.def(
+        "bake_selected_node_transforms", []() -> size_t {
+            auto* sm = lfs::python::get_scene_manager();
+            if (!sm)
+                return 0;
+
+            const auto names = sm->getSelectedNodeNames();
+            if (names.empty())
+                return 0;
+
+            auto result = lfs::vis::cap::bakeNodeTransforms(*sm, names, "transform.bake");
+            if (!result) {
+                LOG_WARN("bake_selected_node_transforms failed: {}", result.error());
+                return 0;
+            }
+            return *result;
+        },
+        "Bake selected SPLAT, POINTCLOUD, and MESH node transforms into their payloads");
 
     m.def(
         "capture_selection_transforms", []() -> nb::dict {

@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -102,6 +103,7 @@ namespace lfs::vis {
 
         RenderingManager();
         ~RenderingManager();
+        void setWakeCallback(std::function<void()> callback);
 
         // Initialize rendering resources
         void initialize();
@@ -141,6 +143,21 @@ namespace lfs::vis {
                                                                   std::optional<glm::vec3> background_color_override = std::nullopt,
                                                                   std::optional<bool> orthographic_override = std::nullopt,
                                                                   std::optional<float> ortho_scale_override = std::nullopt);
+
+        // Image + per-pixel linear depth from the same viewport render. When
+        // expected_depth is true, depth is alpha-weighted expected depth instead
+        // of median depth. image is [H,W,3] and depth is [H,W], both CPU float32.
+        struct PreviewRgbd {
+            std::shared_ptr<lfs::core::Tensor> image;
+            std::shared_ptr<lfs::core::Tensor> depth;
+        };
+        PreviewRgbd renderPreviewImageAndDepth(SceneManager* scene_manager,
+                                               const glm::mat3& camera_rotation,
+                                               const glm::vec3& camera_position,
+                                               float focal_length_mm,
+                                               int width, int height,
+                                               bool expected_depth = false,
+                                               std::optional<glm::vec3> background_color_override = std::nullopt);
         std::shared_ptr<lfs::core::Tensor> renderPreviewImageRgba8(SceneManager* scene_manager,
                                                                    const glm::mat3& camera_rotation,
                                                                    const glm::vec3& camera_position,
@@ -181,13 +198,7 @@ namespace lfs::vis {
         void markDirty();
         void markDirty(DirtyMask flags);
 
-        [[nodiscard]] bool pollDirtyState() {
-            if (const DirtyMask animation_dirty = animation_state_.pollDirtyState(); animation_dirty) {
-                dirty_mask_.fetch_or(animation_dirty, std::memory_order_relaxed);
-                return true;
-            }
-            return dirty_mask_.load(std::memory_order_relaxed) != 0;
-        }
+        [[nodiscard]] bool pollDirtyState();
 
         void setPivotAnimationEndTime(const std::chrono::steady_clock::time_point end_time) {
             animation_state_.setPivotAnimationEndTime(end_time);
@@ -327,8 +338,19 @@ namespace lfs::vis {
         // Camera frustum picking
         int pickCameraFrustum(const glm::vec2& mouse_pos);
 
-        // Depth buffer access for tools (returns camera-space depth at pixel, or -1 if invalid)
+        // Depth access for tools (returns camera-space depth at pixel, or -1 if invalid).
         float getDepthAtPixel(int x, int y, std::optional<SplitViewPanelId> panel = std::nullopt) const;
+        struct ExpectedDepthSampleRequest {
+            SceneManager* scene_manager = nullptr;
+            const Viewport* viewport = nullptr;
+            glm::ivec2 render_size{0, 0};
+            glm::ivec2 pixel{0, 0};
+            float focal_length_mm = lfs::rendering::DEFAULT_FOCAL_LENGTH_MM;
+            bool orthographic = false;
+            float ortho_scale = lfs::rendering::DEFAULT_ORTHO_SCALE;
+        };
+        // Renders a fresh expected-depth preview for precise picking on sparse or low-opacity splats.
+        float renderExpectedDepthAtPixel(const ExpectedDepthSampleRequest& request);
         float renderDepthAtPixelForNodeMask(const SceneManager* scene_manager,
                                             const Viewport& viewport,
                                             const glm::ivec2& render_size,
@@ -495,8 +517,7 @@ namespace lfs::vis {
         void setLodAvailable(bool available);
         void setLodEnabled(bool enabled);
         [[nodiscard]] bool isLodEnabled() const;
-        // Returns {selected_count, budget, level_histogram} for the current LOD controller
-        [[nodiscard]] std::tuple<size_t, size_t, std::vector<std::pair<uint8_t, size_t>>> getLodStats() const;
+        [[nodiscard]] SparkLodController::Stats getLodStats() const;
 
     private:
         enum class PreviewImageReadback {
@@ -547,6 +568,20 @@ namespace lfs::vis {
             std::optional<float> ortho_scale_override,
             std::optional<glm::vec3> background_color_override,
             std::optional<bool> transparent_background_override);
+        [[nodiscard]] std::expected<void, std::string> renderDepthCaptureToPreviewSlotWithState(
+            SceneManager* scene_manager,
+            const lfs::core::SplatData& model,
+            SceneRenderState scene_state,
+            const glm::mat3& camera_rotation,
+            const glm::vec3& camera_position,
+            float focal_length_mm,
+            int width,
+            int height,
+            bool render_lock_held,
+            bool expected_depth,
+            std::optional<glm::vec3> background_color_override,
+            std::optional<bool> orthographic_override,
+            std::optional<float> ortho_scale_override);
         std::shared_ptr<lfs::core::Tensor> renderPreviewImageTiledWithState(
             SceneManager* scene_manager,
             const lfs::core::SplatData& model,
@@ -575,6 +610,7 @@ namespace lfs::vis {
         void applySplitModeChange(const SplitViewService::ModeChangeResult& result);
         void queueCameraMetricsRefreshIfStale(SceneManager* scene_manager);
         void invalidateCameraMetricsRequests(bool clear_latest = false);
+        void notifyAsyncLodResultsReady();
         void cameraMetricsWorkerLoop(std::stop_token stop_token);
         void releaseSceneModelResources();
         void releaseSceneRenderResources();
@@ -613,8 +649,8 @@ namespace lfs::vis {
         std::unique_ptr<PointCloudVulkanRenderer> point_cloud_vulkan_renderer_;
         std::unique_ptr<SparkLodController> lod_controller_;
         const lfs::core::SplatData* lod_controller_model_ = nullptr;
-        bool lod_was_active_last_frame_ = false;
-        bool lod_need_sync_fallback_ = false;
+        bool lod_controller_needs_sync_traversal_ = false;
+        std::uint64_t lod_controller_page_map_generation_ = 0;
         // Cached SH0→RGB derivation for the point-cloud Vulkan path. Refreshed
         // only when the source sh0_raw() pointer/size changes so the Vulkan
         // renderer's per-tensor upload cache stays warm across frames.
@@ -629,6 +665,8 @@ namespace lfs::vis {
         VkImageLayout vulkan_external_viewport_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
         std::uint64_t vulkan_external_viewport_image_generation_ = 0;
         std::uint64_t split_view_image_generation_ = 0;
+        std::mutex wake_callback_mutex_;
+        std::function<void()> wake_callback_;
         glm::ivec2 vulkan_viewport_image_size_{0, 0};
         bool vulkan_viewport_image_flip_y_ = false;
         glm::ivec2 vulkan_gt_comparison_content_size_{0, 0};

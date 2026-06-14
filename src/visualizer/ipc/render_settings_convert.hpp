@@ -88,7 +88,9 @@ namespace lfs::vis {
         p.lod_enabled = s.lod_enabled;
         p.lod_debug_colors = s.lod_debug_colors;
         p.lod_max_splats = static_cast<float>(s.lod_max_splats);
-        p.lod_pixel_scale_limit = s.lod_pixel_scale_limit;
+        p.lod_page_pool_splats = static_cast<float>(s.lod_page_pool_splats);
+        p.lod_pool_vram_fraction = s.lod_pool_vram_fraction;
+        p.lod_fade_frames = static_cast<float>(s.lod_fade_frames);
         p.lod_render_scale = s.lod_render_scale;
         p.lod_cone_foveation = s.lod_cone_foveation;
         p.lod_cone_inner_degrees = s.lod_cone_inner_degrees;
@@ -178,7 +180,9 @@ namespace lfs::vis {
         s.lod_enabled = p.lod_enabled;
         s.lod_debug_colors = p.lod_debug_colors;
         s.lod_max_splats = static_cast<size_t>(p.lod_max_splats);
-        s.lod_pixel_scale_limit = p.lod_pixel_scale_limit;
+        s.lod_page_pool_splats = static_cast<size_t>(p.lod_page_pool_splats);
+        s.lod_pool_vram_fraction = std::clamp(p.lod_pool_vram_fraction, 0.05f, 0.9f);
+        s.lod_fade_frames = std::clamp(static_cast<int>(p.lod_fade_frames), 0, 240);
         s.lod_render_scale = p.lod_render_scale;
         s.lod_cone_foveation = p.lod_cone_foveation;
         s.lod_cone_inner_degrees = p.lod_cone_inner_degrees;
