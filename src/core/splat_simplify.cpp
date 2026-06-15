@@ -477,9 +477,15 @@ namespace lfs::core {
         [[nodiscard]] Eigen3x3 eigen_symmetric_3x3_jacobi(const std::array<float, 9>& Ain) {
             std::array<float, 9> A = Ain;
             std::array<float, 9> V = {
-                1.0f, 0.0f, 0.0f,
-                0.0f, 1.0f, 0.0f,
-                0.0f, 0.0f, 1.0f,
+                1.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                1.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                1.0f,
             };
 
             for (int iter = 0; iter < kJacobiIterations; ++iter) {

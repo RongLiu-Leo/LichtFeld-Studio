@@ -5915,10 +5915,10 @@ namespace lfs::vis::gui {
             left_dock_input_activity;
         if (block_underlay_input || !left_dock_requires_live_layout) {
             panel_layout_.renderLeftDockCached(draw_ctx, show_main_panel_, ui_hidden_,
-                                                panel_input, screen);
+                                               panel_input, screen);
         } else {
             panel_layout_.renderLeftDock(draw_ctx, show_main_panel_, ui_hidden_,
-                                          panel_input, screen);
+                                         panel_input, screen);
         }
         if (!hasMouseButtonDown(sdl_input))
             left_dock_pointer_live_capture_ = false;

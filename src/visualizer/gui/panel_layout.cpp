@@ -536,10 +536,10 @@ namespace lfs::vis::gui {
     }
 
     void PanelLayoutManager::renderLeftDock(const PanelDrawContext& draw_ctx,
-                                             const bool show_main_panel,
-                                             const bool ui_hidden,
-                                             const PanelInputState& input,
-                                             const ScreenState& screen) {
+                                            const bool show_main_panel,
+                                            const bool ui_hidden,
+                                            const PanelInputState& input,
+                                            const ScreenState& screen) {
         LOG_TIMER("gui_render.panel_layout.renderLeftDock");
         auto& reg = PanelRegistry::instance();
         if (!show_main_panel || ui_hidden || screen.work_size.x <= 0 || screen.work_size.y <= 0 ||
@@ -648,10 +648,10 @@ namespace lfs::vis::gui {
     }
 
     void PanelLayoutManager::renderLeftDockCached(const PanelDrawContext& draw_ctx,
-                                                   const bool show_main_panel,
-                                                   const bool ui_hidden,
-                                                   const PanelInputState& input,
-                                                   const ScreenState& screen) {
+                                                  const bool show_main_panel,
+                                                  const bool ui_hidden,
+                                                  const PanelInputState& input,
+                                                  const ScreenState& screen) {
         LOG_TIMER("gui_render.panel_layout.renderLeftDock.cached");
         auto& reg = PanelRegistry::instance();
         if (!show_main_panel || ui_hidden || screen.work_size.x <= 0 || screen.work_size.y <= 0 ||
@@ -763,8 +763,8 @@ namespace lfs::vis::gui {
     }
 
     float PanelLayoutManager::computeLeftDockReservedWidth(const bool show_main_panel,
-                                                            const bool ui_hidden,
-                                                            const ScreenState& screen) const {
+                                                           const bool ui_hidden,
+                                                           const ScreenState& screen) const {
         const float dpi = lfs::python::get_shared_dpi_scale();
         const float icon_bar_w = ICON_BAR_WIDTH * dpi;
 
@@ -784,8 +784,8 @@ namespace lfs::vis::gui {
     }
 
     ViewportLayout PanelLayoutManager::computeViewportLayout(bool show_main_panel, bool ui_hidden,
-                                                              bool python_console_visible,
-                                                              const ScreenState& screen) const {
+                                                             bool python_console_visible,
+                                                             const ScreenState& screen) const {
         const float w = computeViewportWidth(show_main_panel, ui_hidden,
                                              python_console_visible, screen);
         const float h = ui_hidden
