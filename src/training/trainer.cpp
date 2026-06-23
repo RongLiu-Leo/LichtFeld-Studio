@@ -4277,11 +4277,17 @@ namespace lfs::training {
             }
 
             // Final save if not already saved by stop request
+            std::filesystem::path final_ply_path;
             if (!stop_requested_.load() && !stop_token.stop_requested()) {
                 auto final_path = params_.dataset.output_path;
                 const bool rotate_checkpoint = get_active_sparsify_steps() == 0;
-                save_ply(final_path, params_.dataset.output_name, get_total_iterations(), /*join=*/true,
+                const int final_iter = get_total_iterations();
+                save_ply(final_path, params_.dataset.output_name, final_iter, /*join=*/true,
                          /*save_checkpoint=*/rotate_checkpoint);
+                // Mirror the filename logic in save_ply() so we point at the file that was actually written.
+                final_ply_path = params_.dataset.output_name.empty()
+                                     ? final_path / ("splat_" + std::to_string(final_iter) + ".ply")
+                                     : final_path / (params_.dataset.output_name + ".ply");
             }
 
             maybe_publish_camera_loss_heatmap(current_iteration_.load(), true);
@@ -4289,9 +4295,10 @@ namespace lfs::training {
             if (progress_) {
                 progress_->complete();
             }
-            evaluator_->save_report();
+            evaluator_->save_report(final_ply_path);
             if (progress_) {
-                progress_->print_final_summary(static_cast<int>(strategy_->get_model().size()));
+                progress_->print_final_summary(static_cast<int>(strategy_->get_model().size()),
+                                               /*actual_iterations=*/-1, final_ply_path);
             }
 
             is_running_ = false;

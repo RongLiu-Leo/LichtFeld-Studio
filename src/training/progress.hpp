@@ -6,6 +6,7 @@
 
 #include "indicators.hpp"
 #include <chrono>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -120,7 +121,22 @@ namespace lfs::training {
             }
         }
 
-        void print_final_summary(int final_splats, int actual_iterations = -1) {
+        // Format a byte count into a human-readable string (e.g. "1.23 GB").
+        static std::string format_bytes(std::uintmax_t bytes) {
+            constexpr const char* units[] = {"B", "KB", "MB", "GB", "TB"};
+            double value = static_cast<double>(bytes);
+            int unit = 0;
+            while (value >= 1024.0 && unit < 4) {
+                value /= 1024.0;
+                ++unit;
+            }
+            std::ostringstream ss;
+            ss << std::fixed << std::setprecision(unit == 0 ? 0 : 2) << value << " " << units[unit];
+            return ss.str();
+        }
+
+        void print_final_summary(int final_splats, int actual_iterations = -1,
+                                 const std::filesystem::path& final_ply_path = {}) {
             complete(); // Ensure progress bar is completed first
 
             auto end_time = std::chrono::steady_clock::now();
@@ -144,6 +160,21 @@ namespace lfs::training {
                       << "✓ Final splats: " << final_splats
 #endif
                       << std::endl;
+
+            // Report on-disk memory footprint of the final PLY file, if available.
+            if (!final_ply_path.empty()) {
+                std::error_code ec;
+                const auto file_size = std::filesystem::file_size(final_ply_path, ec);
+                if (!ec) {
+                    std::cout
+#ifdef _WIN32
+                        << "* Final PLY size: "
+#else
+                        << "✓ Final PLY size: "
+#endif
+                        << format_bytes(file_size) << std::endl;
+                }
+            }
         }
 
         // Destructor ensures completion

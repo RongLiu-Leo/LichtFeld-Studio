@@ -202,7 +202,23 @@ namespace lfs::training {
         }
     }
 
-    void MetricsReporter::save_report() const {
+    namespace {
+        // Format a byte count into a human-readable string (e.g. "1.23 GB").
+        std::string format_bytes(std::uintmax_t bytes) {
+            constexpr const char* units[] = {"B", "KB", "MB", "GB", "TB"};
+            double value = static_cast<double>(bytes);
+            int unit = 0;
+            while (value >= 1024.0 && unit < 4) {
+                value /= 1024.0;
+                ++unit;
+            }
+            std::stringstream ss;
+            ss << std::fixed << std::setprecision(unit == 0 ? 0 : 2) << value << " " << units[unit];
+            return ss.str();
+        }
+    } // namespace
+
+    void MetricsReporter::save_report(const std::filesystem::path& final_ply_path) const {
         std::ofstream report_file;
         if (!lfs::core::open_file_for_write(txt_path_, report_file)) {
             std::cerr << "Failed to open report file: " << lfs::core::path_to_utf8(txt_path_) << std::endl;
@@ -246,6 +262,16 @@ namespace lfs::training {
             report_file << "SSIM:  " << final.ssim << "\n";
             report_file << "Time per image: " << final.elapsed_time << " seconds\n";
             report_file << "Number of Gaussians: " << final.num_gaussians << "\n";
+
+            // On-disk memory footprint of the final PLY file, when available.
+            if (!final_ply_path.empty()) {
+                std::error_code ec;
+                const auto ply_size = std::filesystem::file_size(final_ply_path, ec);
+                if (!ec) {
+                    report_file << "Final PLY size: " << format_bytes(ply_size)
+                                << " (" << ply_size << " bytes)\n";
+                }
+            }
         }
 
         // Detailed results

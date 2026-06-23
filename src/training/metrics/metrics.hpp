@@ -89,7 +89,7 @@ namespace lfs::training {
 
         void add_metrics(const EvalMetrics& metrics);
 
-        void save_report() const;
+        void save_report(const std::filesystem::path& final_ply_path = {}) const;
 
     private:
         const std::filesystem::path output_dir_;
@@ -116,9 +116,9 @@ namespace lfs::training {
                              lfs::core::Tensor& background);
 
         // Save final report
-        void save_report() const {
+        void save_report(const std::filesystem::path& final_ply_path = {}) const {
             if (_reporter)
-                _reporter->save_report();
+                _reporter->save_report(final_ply_path);
         }
 
         // Print evaluation header
