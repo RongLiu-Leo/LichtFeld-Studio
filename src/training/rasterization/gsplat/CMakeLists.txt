@@ -31,6 +31,7 @@ set(GSPLAT_SOURCES
         RasterizeToPixelsFromWorld3DGSFwd.cu
         RelocationCUDA.cu
         SphericalHarmonicsCUDA.cu
+        SphericalBetaCUDA.cu
 )
 
 # lfs suffix avoids conflict with legacy gsplat_backend

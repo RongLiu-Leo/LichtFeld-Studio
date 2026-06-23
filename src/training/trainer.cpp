@@ -1903,6 +1903,23 @@ namespace lfs::training {
 
         try {
             params_ = params;
+
+            // Spherical-Beta color is only implemented in the gsplat ("gut") rasterizer
+            // path; force it on so the additive lobe term is evaluated.
+            if (params_.optimization.sb_lobes > 0) {
+                if (!params_.optimization.gut) {
+                    LOG_INFO("Spherical-Beta color requires the gsplat rasterizer; enabling --gut");
+                    params_.optimization.gut = true;
+                }
+                // Densification/relocation of sb_params is wired for the MCMC strategy.
+                if (!lfs::core::param::strategy_names_match(
+                        params_.optimization.strategy, lfs::core::param::kStrategyMCMC)) {
+                    LOG_WARN("Spherical-Beta currently requires the MCMC strategy; switching strategy "
+                             "from '{}' to 'mcmc'", params_.optimization.strategy);
+                    params_.optimization.strategy = std::string(lfs::core::param::kStrategyMCMC);
+                }
+            }
+
             memory_breakdown_enabled_ = env_flag_enabled("LFS_MEM_BREAKDOWN");
             memory_breakdown_logged_init_ = false;
             memory_breakdown_logged_train_setup_ = false;
@@ -2507,6 +2524,9 @@ namespace lfs::training {
 
         // Update params first
         params_ = params;
+        if (params_.optimization.sb_lobes > 0 && !params_.optimization.gut) {
+            params_.optimization.gut = true;
+        }
 
         // Load/reload background image if needed
         if (bg_mode_is_image && bg_image_path_changed &&

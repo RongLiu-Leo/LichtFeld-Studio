@@ -120,6 +120,17 @@ namespace lfs::training {
             const float* sh0_ptr = sh0.ptr<float>();
             const float* shN_ptr = (sh_degree > 0 && shN.is_valid() && shN.numel() > 0) ? shN.ptr<float>() : nullptr;
 
+            // Spherical-beta lobe parameters (additive view-dependent color). Empty unless enabled.
+            const uint32_t sb_lobes = gaussian_model.has_spherical_beta()
+                                          ? static_cast<uint32_t>(gaussian_model.get_sb_lobes())
+                                          : 0u;
+            core::Tensor sb_params_t;
+            const float* sb_params_ptr = nullptr;
+            if (sb_lobes > 0) {
+                sb_params_t = ensure_contiguous(gaussian_model.sb_params());
+                sb_params_ptr = sb_params_t.ptr<float>();
+            }
+
             // Background color and image pointers
             // bg_color and bg_image are mutually exclusive - use one or the other
             const bool use_bg_image = bg_image.is_valid() && !bg_image.is_empty();
@@ -316,6 +327,8 @@ namespace lfs::training {
                 radial_ptr,
                 tangential_ptr,
                 thin_prism_ptr,
+                sb_params_ptr,
+                sb_lobes,
                 result,
                 fwd_stream);
             isect_ids_to_free = result.isect_ids;
@@ -456,6 +469,8 @@ namespace lfs::training {
             ctx.opacities = opacities;
             ctx.sh0 = sh0;
             ctx.shN = shN;
+            ctx.sb_params = sb_params_t;
+            ctx.sb_lobes = sb_lobes;
 
             // Store camera pointers
             ctx.viewmat_ptr = viewmat_ptr;
@@ -541,10 +556,12 @@ namespace lfs::training {
             size_t v_scales_size = align(N * 3 * sizeof(float));
             size_t v_opacities_size = align(N * sizeof(float));
             size_t v_sh_coeffs_size = align(N * K * 3 * sizeof(float));
+            const uint32_t sb_lobes = ctx.sb_lobes;
+            size_t v_sb_params_size = align((sb_lobes > 0 ? N * sb_lobes * 6 : 0) * sizeof(float));
 
             size_t total_bwd_size = v_render_colors_size + v_render_alphas_size +
                                     v_means_size + v_quats_size + v_scales_size +
-                                    v_opacities_size + v_sh_coeffs_size;
+                                    v_opacities_size + v_sh_coeffs_size + v_sb_params_size;
 
             char* bwd_blob = arena_allocator(total_bwd_size);
 
@@ -563,6 +580,8 @@ namespace lfs::training {
             auto* v_opacities_ptr = reinterpret_cast<float*>(bwd_ptr);
             bwd_ptr += v_opacities_size;
             auto* v_sh_coeffs_ptr = reinterpret_cast<float*>(bwd_ptr);
+            bwd_ptr += v_sh_coeffs_size;
+            float* v_sb_params_ptr = (sb_lobes > 0) ? reinterpret_cast<float*>(bwd_ptr) : nullptr;
 
             // Zero the gradient buffers
             cudaMemsetAsync(v_means_ptr, 0, N * 3 * sizeof(float), stream);
@@ -570,6 +589,9 @@ namespace lfs::training {
             cudaMemsetAsync(v_scales_ptr, 0, N * 3 * sizeof(float), stream);
             cudaMemsetAsync(v_opacities_ptr, 0, N * sizeof(float), stream);
             cudaMemsetAsync(v_sh_coeffs_ptr, 0, N * K * 3 * sizeof(float), stream);
+            if (v_sb_params_ptr != nullptr) {
+                cudaMemsetAsync(v_sb_params_ptr, 0, N * sb_lobes * 6 * sizeof(float), stream);
+            }
 
             // Prepare grad_render_colors [1, H, W, channels] - permute from CHW to HWC using custom kernel
             // This avoids memory pool allocation from tensor permute().contiguous()
@@ -673,6 +695,8 @@ namespace lfs::training {
                 ctx.radial_ptr,
                 ctx.tangential_ptr,
                 ctx.thin_prism_ptr,
+                (sb_lobes > 0 && ctx.sb_params.is_valid()) ? ctx.sb_params.ptr<float>() : nullptr,
+                sb_lobes,
                 ctx.render_alphas_ptr,
                 ctx.last_ids_ptr,
                 ctx.tile_offsets_ptr,
@@ -691,6 +715,7 @@ namespace lfs::training {
                 v_scales_ptr,
                 v_opacities_ptr,
                 v_sh_coeffs_ptr,
+                v_sb_params_ptr,
                 densification_info_ptr,
                 pixel_error_map_ptr,
                 stream);
@@ -778,6 +803,19 @@ namespace lfs::training {
                 K,
                 static_cast<std::uint32_t>(gaussian_model.max_sh_coeffs_rest()),
                 stream);
+
+            // Spherical-beta lobe params: dense [N, sb_lobes*6] -> optimizer grad.
+            if (v_sb_params_ptr != nullptr && gaussian_model.has_spherical_beta()) {
+                auto& sb_grad = optimizer.get_grad(ParamType::SbParams);
+                if (sb_grad.is_valid() && sb_grad.numel() > 0) {
+                    sb_grad.set_stream(stream);
+                    kernels::launch_grad_accumulate(
+                        sb_grad.ptr<float>(),
+                        v_sb_params_ptr,
+                        N * sb_lobes * 6,
+                        stream);
+                }
+            }
 
             // Accumulate gradient norms when pixel-error map is not provided
             if (update_densification_info && pixel_error_map_ptr == nullptr) {

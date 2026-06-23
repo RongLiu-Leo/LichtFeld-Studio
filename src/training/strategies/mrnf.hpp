@@ -97,7 +97,8 @@ namespace lfs::training {
             const lfs::core::Tensor& sh0,
             const lfs::core::Tensor& shN,
             const lfs::core::Tensor& opacities,
-            int64_t count);
+            int64_t count,
+            const lfs::core::Tensor& sb_params = {});
         [[nodiscard]] lfs::core::Tensor compute_edge_scores(int iter);
         [[nodiscard]] lfs::core::Tensor edge_guidance_factor() const;
 

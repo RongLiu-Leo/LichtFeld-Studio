@@ -12,6 +12,7 @@
 #include <cctype>
 #include <expected>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -101,6 +102,13 @@ namespace lfs::core {
             size_t stop_refine = 25'000;
             float grad_threshold = 0.0002f;
             int sh_degree = 3;
+
+            // Spherical-beta view-dependent color (orthogonal to sh_degree). The SH base
+            // color is always present (controlled by sh_degree); spherical-beta adds extra
+            // anisotropic lobes on top. sb_lobes == 0 disables it. See Beta-Splatting (Liu et al.).
+            int sb_lobes = 0;             // Number of spherical-beta lobes per primitive (0 = off)
+            float sb_params_lr = 0.0025f; // Learning rate for spherical-beta parameters
+
             float opacity_reg = 0.01f;
             float scale_reg = 0.01f;
             float init_opacity = 0.5f;

@@ -693,6 +693,8 @@ namespace lfs::training {
             reset_optimizer_state_at_indices(*_optimizer, ParamType::Scaling, prune_indices);
             reset_optimizer_state_at_indices(*_optimizer, ParamType::Rotation, prune_indices);
             reset_optimizer_state_at_indices(*_optimizer, ParamType::Opacity, prune_indices);
+            if (_splat_data->has_spherical_beta())
+                reset_optimizer_state_at_indices(*_optimizer, ParamType::SbParams, prune_indices);
 
             LOG_DEBUG("MRNF: soft-pruned {} splats at iter {} (active: {}, total slots: {})",
                       pruned_count, iter, active_count(), _splat_data->size());
@@ -877,6 +879,12 @@ namespace lfs::training {
         reset_optimizer_state_at_indices(*_optimizer, ParamType::Rotation, split_indices);
         reset_optimizer_state_at_indices(*_optimizer, ParamType::Opacity, split_indices);
 
+        // Spherical-beta lobes (dense [N, K*6]): children inherit the parent's lobes.
+        Tensor child_sb;
+        if (_splat_data->has_spherical_beta()) {
+            child_sb = _splat_data->sb_params().index_select(0, split_indices).contiguous();
+        }
+
         size_t append_start = 0;
         if (free_count() > 0) {
             auto [filled_indices, remaining_after_fill] = fill_free_slots_with_data(
@@ -886,7 +894,8 @@ namespace lfs::training {
                 child_sh0,
                 child_shN,
                 child_raw_opacities,
-                static_cast<int64_t>(K));
+                static_cast<int64_t>(K),
+                child_sb);
             append_start = K - static_cast<size_t>(remaining_after_fill);
         }
 
@@ -938,6 +947,9 @@ namespace lfs::training {
             _optimizer->add_new_params(ParamType::Scaling, append_scaling, true);
             _optimizer->add_new_params(ParamType::Rotation, append_rotation, true);
             _optimizer->add_new_params(ParamType::Opacity, append_opacity, true);
+            if (_splat_data->has_spherical_beta() && child_sb.is_valid()) {
+                _optimizer->add_new_params(ParamType::SbParams, child_sb.slice(0, append_start, K), true);
+            }
         }
 
         LOG_DEBUG("MRNF: split {} splats at iter {} (reused: {}, appended: {}, active: {}, total slots: {})",
@@ -1241,7 +1253,8 @@ namespace lfs::training {
         const lfs::core::Tensor& sh0,
         const lfs::core::Tensor& shN,
         const lfs::core::Tensor& opacities,
-        int64_t count) {
+        int64_t count,
+        const lfs::core::Tensor& sb_params) {
 
         using namespace lfs::core;
 
@@ -1293,12 +1306,19 @@ namespace lfs::training {
                 layout_rest);
         }
 
+        if (_splat_data->has_spherical_beta() && sb_params.is_valid() && sb_params.numel() > 0) {
+            _splat_data->sb_params().index_put_(target_indices, sb_params.slice(0, 0, slots_to_fill));
+        }
+
         reset_optimizer_state_at_indices(*_optimizer, ParamType::Means, target_indices);
         reset_optimizer_state_at_indices(*_optimizer, ParamType::Sh0, target_indices);
         reset_optimizer_state_at_indices(*_optimizer, ParamType::ShN, target_indices, layout_rest);
         reset_optimizer_state_at_indices(*_optimizer, ParamType::Scaling, target_indices);
         reset_optimizer_state_at_indices(*_optimizer, ParamType::Rotation, target_indices);
         reset_optimizer_state_at_indices(*_optimizer, ParamType::Opacity, target_indices);
+        if (_splat_data->has_spherical_beta()) {
+            reset_optimizer_state_at_indices(*_optimizer, ParamType::SbParams, target_indices);
+        }
 
         auto false_vals = Tensor::zeros_bool({static_cast<size_t>(slots_to_fill)}, target_indices.device());
         _free_mask.index_put_(target_indices, false_vals);

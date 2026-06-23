@@ -279,6 +279,24 @@ namespace lfs::core {
         // swizzled buffer is allocated/resized to fit N with optional `capacity`.
         void shN_set_from_canonical(const Tensor& canonical, size_t capacity = 0);
 
+        // ========== Spherical Beta color encoding (orthogonal to SH) ==========
+        // When enabled, an additive set of anisotropic "beta lobes" augments the SH base
+        // color. _sb_params is a dense [N, sb_lobes * 6] tensor; each lobe packs
+        // (r, g, b, theta, phi, beta). Stored raw (pre-activation), like other params.
+        inline Tensor& sb_params() { return _sb_params; }
+        inline const Tensor& sb_params() const { return _sb_params; }
+        inline Tensor& sb_params_raw() { return _sb_params; }
+        inline const Tensor& sb_params_raw() const { return _sb_params; }
+        [[nodiscard]] int get_sb_lobes() const { return _sb_lobes; }
+        [[nodiscard]] bool has_spherical_beta() const {
+            return _sb_lobes > 0 && _sb_params.is_valid() && _sb_params.numel() > 0;
+        }
+        // Allocate / reset spherical-beta parameters for the current primitive count.
+        // theta/phi are initialised over the sphere; rgb/beta initialise to zero.
+        void init_spherical_beta(int sb_lobes);
+        // Adopt an existing sb_params tensor (e.g. from PLY/checkpoint load).
+        void set_sb_params(Tensor sb_params, int sb_lobes);
+
         // Number of "rest" SH coefficients implied by the current active SH degree
         // (0 / 3 / 8 / 15 for degree 0 / 1 / 2 / 3).
         size_t active_sh_coeffs_rest() const;
@@ -359,6 +377,11 @@ namespace lfs::core {
         Tensor _scaling;
         Tensor _rotation;
         Tensor _opacity;
+
+        // Spherical-beta lobe parameters: dense [N, _sb_lobes * 6], raw (pre-activation).
+        // Empty when color encoding is plain spherical harmonics.
+        Tensor _sb_params;
+        int _sb_lobes = 0;
 
         // Soft deletion mask: bool tensor [N], true = hidden from rendering
         Tensor _deleted;

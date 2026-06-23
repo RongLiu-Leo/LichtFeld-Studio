@@ -221,6 +221,7 @@ namespace {
             ::args::ValueFlag<std::string> strategy(training_group, "strategy", "Optimization strategy: mcmc, mrnf, igs+ (legacy aliases: mnrf, lfs)", {"strategy"});
             ::args::ValueFlag<int> sh_degree(training_group, "sh_degree", "Max SH degree [0-3]", {"sh-degree"});
             ::args::ValueFlag<int> sh_degree_interval(training_group, "sh_degree_interval", "SH degree interval", {"sh-degree-interval"});
+            ::args::ValueFlag<int> sb_lobes(training_group, "sb_lobes", "Spherical-beta lobes per primitive; 0 disables (default: 0). Orthogonal to --sh-degree.", {"sb-lobes"});
             ::args::ValueFlag<int> max_cap(training_group, "max_cap", "Maximum number of Gaussians", {"max-cap"});
             ::args::ValueFlag<float> min_opacity(training_group, "min_opacity", "Minimum opacity threshold", {"min-opacity"});
             ::args::ValueFlag<float> steps_scaler(training_group, "steps_scaler", "Scale training steps by factor", {"steps-scaler"});
@@ -613,6 +614,14 @@ namespace {
                 }
             }
 
+            // Validate sb_lobes (0 disables; 1-8 enables spherical-beta)
+            if (sb_lobes) {
+                int lobes = ::args::get(sb_lobes);
+                if (lobes < 0 || lobes > 8) {
+                    return std::unexpected("ERROR: --sb-lobes must be between 0 and 8 (0 disables spherical-beta)");
+                }
+            }
+
             // Validate min_opacity (0.0-1.0)
             if (min_opacity) {
                 float opacity = ::args::get(min_opacity);
@@ -694,6 +703,7 @@ namespace {
                                         steps_scaler_val = cli_option_present({"--steps-scaler"}) ? std::optional<float>(::args::get(steps_scaler)) : std::optional<float>(),
                                         sh_degree_interval_val = cli_option_present({"--sh-degree-interval"}) ? std::optional<int>(::args::get(sh_degree_interval)) : std::optional<int>(),
                                         sh_degree_val = cli_option_present({"--sh-degree"}) ? std::optional<int>(::args::get(sh_degree)) : std::optional<int>(),
+                                        sb_lobes_val = cli_option_present({"--sb-lobes"}) ? std::optional<int>(::args::get(sb_lobes)) : std::optional<int>(),
                                         min_opacity_val = cli_option_present({"--min-opacity"}) ? std::optional<float>(::args::get(min_opacity)) : std::optional<float>(),
                                         init_num_pts_val = cli_option_present({"--init-num-pts"}) ? std::optional<int>(::args::get(init_num_pts)) : std::optional<int>(),
                                         init_extent_val = cli_option_present({"--init-extent"}) ? std::optional<float>(::args::get(init_extent)) : std::optional<float>(),
@@ -774,6 +784,7 @@ namespace {
                 setVal(steps_scaler_val, opt.steps_scaler);
                 setVal(sh_degree_interval_val, opt.sh_degree_interval);
                 setVal(sh_degree_val, opt.sh_degree);
+                setVal(sb_lobes_val, opt.sb_lobes);
                 setVal(min_opacity_val, opt.min_opacity);
                 setVal(init_num_pts_val, opt.init_num_pts);
                 setVal(init_extent_val, opt.init_extent);

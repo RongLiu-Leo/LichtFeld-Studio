@@ -5,6 +5,7 @@
 #include "Rasterization.h"
 #include "Common.h"
 #include "Ops.h"
+#include "SphericalBeta.h"
 
 #include <cassert>
 #include <cstdio>
@@ -235,6 +236,8 @@ namespace gsplat_lfs {
         const float* radial_coeffs,
         const float* tangential_coeffs,
         const float* thin_prism_coeffs,
+        const float* sb_params,
+        uint32_t num_lobes,
         RasterizeWithSHResult& result,
         cudaStream_t stream) {
         GSPLAT_CHECK_CUDA_PTR(means, "means");
@@ -295,6 +298,14 @@ namespace gsplat_lfs {
                 sh_degree, result.dirs, sh0, shN, nullptr,
                 static_cast<int64_t>(C) * N,
                 result.colors, stream);
+
+            // Spherical-beta lobes are additive on top of the SH base color.
+            if (num_lobes > 0 && sb_params != nullptr) {
+                launch_spherical_beta_fwd_kernel(
+                    num_lobes, result.dirs, sb_params, nullptr,
+                    static_cast<int64_t>(C) * N,
+                    result.colors, stream);
+            }
         }
 
         // Step 4: Rasterize to pixels
@@ -348,6 +359,8 @@ namespace gsplat_lfs {
         const float* radial_coeffs,
         const float* tangential_coeffs,
         const float* thin_prism_coeffs,
+        const float* sb_params,
+        uint32_t num_lobes,
         const float* render_alphas,
         const int32_t* last_ids,
         const int32_t* tile_offsets,
@@ -366,6 +379,7 @@ namespace gsplat_lfs {
         float* v_scales,
         float* v_opacities,
         float* v_sh_coeffs,
+        float* v_sb_params,
         float* densification_info,
         const float* densification_error_map,
         cudaStream_t stream) {
@@ -400,6 +414,14 @@ namespace gsplat_lfs {
 
         // Backward through SH
         if (render_mode == 0 || render_mode == 3 || render_mode == 4) {
+            // Spherical-beta backward first: it consumes v_colors to produce v_sb_params.
+            // dC/dC_base is the identity, so v_colors passes through unchanged to SH.
+            if (num_lobes > 0 && sb_params != nullptr && v_sb_params != nullptr) {
+                launch_spherical_beta_bwd_kernel(
+                    num_lobes, dirs, sb_params, nullptr, v_colors,
+                    static_cast<int64_t>(C) * N,
+                    v_sb_params, stream);
+            }
             spherical_harmonics_swizzled_bwd(
                 K, sh_degree,
                 dirs,

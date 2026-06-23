@@ -108,6 +108,8 @@ namespace lfs::core {
             opt_json["stop_refine"] = stop_refine;
             opt_json["grad_threshold"] = grad_threshold;
             opt_json["sh_degree"] = sh_degree;
+            opt_json["sb_lobes"] = sb_lobes;
+            opt_json["sb_params_lr"] = sb_params_lr;
             opt_json["opacity_reg"] = opacity_reg;
             opt_json["scale_reg"] = scale_reg;
             opt_json["init_opacity"] = init_opacity;
@@ -306,6 +308,13 @@ namespace lfs::core {
             params.stop_refine = json["stop_refine"];
             params.grad_threshold = json["grad_threshold"];
             params.sh_degree = json["sh_degree"];
+
+            if (json.contains("sb_lobes")) {
+                params.sb_lobes = json["sb_lobes"];
+            }
+            if (json.contains("sb_params_lr")) {
+                params.sb_params_lr = json["sb_params_lr"];
+            }
 
             if (json.contains("opacity_reg")) {
                 params.opacity_reg = json["opacity_reg"];

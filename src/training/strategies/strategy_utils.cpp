@@ -72,6 +72,9 @@ namespace lfs::training {
         config.param_lrs["scaling"] = params.scaling_lr;
         config.param_lrs["rotation"] = params.rotation_lr;
         config.param_lrs["opacity"] = params.opacity_lr;
+        if (splat_data.has_spherical_beta()) {
+            config.param_lrs["sb_params"] = params.sb_params_lr;
+        }
 
         // Pre-allocate optimizer state capacity to avoid reallocations during training
         // This dramatically reduces peak memory usage by avoiding double-buffering during growth

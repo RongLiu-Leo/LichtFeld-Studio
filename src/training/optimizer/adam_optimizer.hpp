@@ -58,7 +58,8 @@ namespace lfs::training {
         ShN,
         Scaling,
         Rotation,
-        Opacity
+        Opacity,
+        SbParams // Spherical-beta lobe params (dense [N, sb_lobes*6]); empty unless enabled
     };
 
     struct FastGSFusedAdamParam {
@@ -125,9 +126,10 @@ namespace lfs::training {
             return (it != config_.param_lrs.end()) ? it->second : static_cast<double>(config_.lr);
         }
 
-        static constexpr std::array<ParamType, 6> all_param_types() {
+        static constexpr std::array<ParamType, 7> all_param_types() {
             return {ParamType::Means, ParamType::Sh0, ParamType::ShN,
-                    ParamType::Scaling, ParamType::Rotation, ParamType::Opacity};
+                    ParamType::Scaling, ParamType::Rotation, ParamType::Opacity,
+                    ParamType::SbParams};
         }
 
         // MCMC operations (atomically update params + optimizer state)

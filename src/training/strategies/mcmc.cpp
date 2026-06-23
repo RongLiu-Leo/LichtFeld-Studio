@@ -351,6 +351,13 @@ namespace lfs::training {
                     _splat_data->shN().ptr<float>(), dead_i32.ptr<int>(),
                     staged.ptr<float>(), n_pairs, layout_rest, layout_rest);
             }
+
+            // Spherical-beta lobes: dense [N, K*6], copy sampled rows into dead slots.
+            if (_splat_data->has_spherical_beta() && dead_indices.numel() > 0) {
+                auto& sb = _splat_data->sb_params();
+                auto src = sb.index_select(0, sampled_idxs).contiguous();
+                sb.index_put_(dead_indices, src);
+            }
         }
 
         // Update optimizer states for all parameters
@@ -362,6 +369,8 @@ namespace lfs::training {
             update_optimizer_for_relocate(sampled_idxs, dead_indices, ParamType::Scaling);
             update_optimizer_for_relocate(sampled_idxs, dead_indices, ParamType::Rotation);
             update_optimizer_for_relocate(sampled_idxs, dead_indices, ParamType::Opacity);
+            if (_splat_data->has_spherical_beta())
+                update_optimizer_for_relocate(sampled_idxs, dead_indices, ParamType::SbParams);
         }
 
         if (_splat_data->has_deleted_mask()) {
@@ -506,6 +515,8 @@ namespace lfs::training {
             _optimizer->add_new_params_gather(ParamType::Rotation, sampled_idxs);
             _optimizer->add_new_params_gather(ParamType::Opacity, sampled_idxs);
             _optimizer->add_new_params_gather(ParamType::Scaling, sampled_idxs);
+            if (_splat_data->has_spherical_beta())
+                _optimizer->add_new_params_gather(ParamType::SbParams, sampled_idxs);
         }
 
         append_live_deleted_rows(*_splat_data, n_new);
@@ -616,6 +627,8 @@ namespace lfs::training {
             _optimizer->add_new_params_gather(ParamType::Rotation, sampled_idxs_i64);
             _optimizer->add_new_params_gather(ParamType::Opacity, sampled_idxs_i64);
             _optimizer->add_new_params_gather(ParamType::Scaling, sampled_idxs_i64);
+            if (_splat_data->has_spherical_beta())
+                _optimizer->add_new_params_gather(ParamType::SbParams, sampled_idxs_i64);
         }
 
         append_live_deleted_rows(*_splat_data, static_cast<size_t>(n_new));
@@ -796,6 +809,8 @@ namespace lfs::training {
         zero_optimizer_state(*_optimizer, ParamType::Scaling, prune_indices);
         zero_optimizer_state(*_optimizer, ParamType::Rotation, prune_indices);
         zero_optimizer_state(*_optimizer, ParamType::Opacity, prune_indices);
+        if (_splat_data->has_spherical_beta())
+            zero_optimizer_state(*_optimizer, ParamType::SbParams, prune_indices);
 
         if (_error_score_max.is_valid() &&
             _error_score_max.ndim() == 1 &&

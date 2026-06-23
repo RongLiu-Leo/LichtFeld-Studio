@@ -215,6 +215,7 @@ namespace lfs::training {
         case ParamType::Scaling: return splat_data_.scaling_raw();
         case ParamType::Rotation: return splat_data_.rotation_raw();
         case ParamType::Opacity: return splat_data_.opacity_raw();
+        case ParamType::SbParams: return splat_data_.sb_params_raw();
         }
         throw std::runtime_error("Invalid ParamType");
     }
@@ -237,6 +238,7 @@ namespace lfs::training {
         case ParamType::Scaling: return "scaling";
         case ParamType::Rotation: return "rotation";
         case ParamType::Opacity: return "opacity";
+        case ParamType::SbParams: return "sb_params";
         }
         return "unknown";
     }
@@ -1235,6 +1237,8 @@ namespace lfs::training {
                     return ParamType::Scaling;
                 if (n == "rotation")
                     return ParamType::Rotation;
+                if (n == "sb_params")
+                    return ParamType::SbParams;
                 return ParamType::Opacity;
             };
             const bool is_shN = (name == "shN");

@@ -52,6 +52,8 @@ namespace lfs::training {
         lfs::core::Tensor opacities; // [N]
         lfs::core::Tensor sh0;       // [N, 1, 3]
         lfs::core::Tensor shN;       // swizzled 1D SH-rest buffer
+        lfs::core::Tensor sb_params; // [N, sb_lobes, 6] spherical-beta (empty if disabled)
+        uint32_t sb_lobes = 0;       // number of spherical-beta lobes (0 = disabled)
         lfs::core::Tensor bg_color;  // [3] or [C, 3]
 
         // Camera pointers (kept alive by K_tensor)
