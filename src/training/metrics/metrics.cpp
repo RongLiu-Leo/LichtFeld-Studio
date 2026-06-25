@@ -309,8 +309,11 @@ namespace lfs::training {
         _psnr_metric = std::make_unique<PSNR>(1.0f);
         _ssim_metric = std::make_unique<SSIM>(true); // apply_valid_padding = true
 
-        // Initialize reporter
-        _reporter = std::make_unique<MetricsReporter>(params.dataset.output_path);
+        // Render-only is a pure visualization pass; it must not create or append to
+        // metrics.csv / metrics_report.txt.
+        if (!params.optimization.render_only) {
+            _reporter = std::make_unique<MetricsReporter>(params.dataset.output_path);
+        }
     }
 
     bool MetricsEvaluator::should_evaluate(const int iteration) const {
@@ -661,8 +664,9 @@ namespace lfs::training {
             .num_gaussians = result.num_gaussians}
             .emit();
 
-        // Add metrics to reporter
-        _reporter->add_metrics(result);
+        // Add metrics to reporter (absent in render-only mode)
+        if (_reporter)
+            _reporter->add_metrics(result);
 
         if (_params.optimization.enable_save_eval_images) {
             std::cout << "Saved " << image_idx << " evaluation images to: " << lfs::core::path_to_utf8(eval_dir) << std::endl;
