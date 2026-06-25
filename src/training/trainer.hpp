@@ -130,6 +130,11 @@ namespace lfs::training {
         // Main training method with stop token support
         std::expected<void, std::string> train(std::stop_token stop_token = {});
 
+        // Pure render pass: render the dataset cameras (Full/Diffuse/Specular) from the
+        // already-loaded model without ever stepping the optimizer or mutating the model.
+        // Requires the trainer to be initialized and evaluation enabled.
+        std::expected<void, std::string> render_only_views();
+
         // Control methods for GUI interaction
         void request_pause() { pause_requested_ = true; }
         void request_resume() { pause_requested_ = false; }

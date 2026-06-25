@@ -226,10 +226,18 @@ namespace lfs::app {
                 core::Scene scene;
 
                 if (params->resume_checkpoint) {
-                    const auto ckpt_params_result = loadCheckpointParams(*params, scene);
+                    auto ckpt_params_result = loadCheckpointParams(*params, scene);
                     if (!ckpt_params_result) {
                         LOG_ERROR("Failed to load checkpoint: {}", ckpt_params_result.error());
                         return 1;
+                    }
+
+                    // Render-only is a CLI-level intent that the checkpoint params don't carry.
+                    // Forward it (and the evaluator it depends on) so the pure render pass works
+                    // when resuming from a checkpoint.
+                    if (params->optimization.render_only) {
+                        ckpt_params_result->optimization.render_only = true;
+                        ckpt_params_result->optimization.enable_eval = true;
                     }
 
                     auto trainer = std::make_unique<training::Trainer>(scene);
@@ -253,7 +261,12 @@ namespace lfs::app {
 
                     core::Tensor::trim_memory_pool();
 
-                    if (const auto result = trainer->train(); !result) {
+                    if (params->optimization.render_only) {
+                        if (const auto result = trainer->render_only_views(); !result) {
+                            LOG_ERROR("Render-only error: {}", result.error());
+                            return 1;
+                        }
+                    } else if (const auto result = trainer->train(); !result) {
                         LOG_ERROR("Training error: {}", result.error());
                         if (!params->python_scripts.empty()) {
                             core::Tensor::shutdown_memory_pool();
@@ -290,7 +303,12 @@ namespace lfs::app {
 
                     core::Tensor::trim_memory_pool();
 
-                    if (const auto result = trainer->train(); !result) {
+                    if (params->optimization.render_only) {
+                        if (const auto result = trainer->render_only_views(); !result) {
+                            LOG_ERROR("Render-only error: {}", result.error());
+                            return 1;
+                        }
+                    } else if (const auto result = trainer->train(); !result) {
                         LOG_ERROR("Training error: {}", result.error());
                         if (!params->python_scripts.empty()) {
                             core::Tensor::shutdown_memory_pool();
@@ -302,7 +320,11 @@ namespace lfs::app {
                     }
                 }
 
-                LOG_INFO("Headless training completed");
+                if (params->optimization.render_only) {
+                    LOG_INFO("Headless render-only completed");
+                } else {
+                    LOG_INFO("Headless training completed");
+                }
             }
 
             core::Tensor::shutdown_memory_pool();

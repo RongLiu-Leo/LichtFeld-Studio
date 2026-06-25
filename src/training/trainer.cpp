@@ -4058,6 +4058,44 @@ namespace lfs::training {
         }
     }
 
+    std::expected<void, std::string> Trainer::render_only_views() {
+        if (!initialized_.load()) {
+            return std::unexpected("Trainer not initialized. Call initialize() before render_only_views()");
+        }
+        if (!strategy_) {
+            return std::unexpected("Render-only: no model/strategy available");
+        }
+        if (!evaluator_ || !evaluator_->is_enabled()) {
+            return std::unexpected("Render-only: evaluation must be enabled (pass --eval)");
+        }
+
+        // Render the dataset cameras. Prefer the eval/test split when present; otherwise
+        // fall back to the training cameras so a model loaded without a test split still
+        // produces renders.
+        std::shared_ptr<CameraDataset> dataset =
+            (val_dataset_ && val_dataset_->size() > 0) ? val_dataset_ : train_dataset_;
+        if (!dataset || dataset->size() == 0) {
+            return std::unexpected("Render-only: no dataset cameras available to render");
+        }
+
+        const int iteration = current_iteration_.load();
+        const auto& model = strategy_->get_model();
+
+        LOG_INFO("Render-only: rendering {} views from loaded model ({} gaussians) at iteration {} - no optimization performed",
+                 dataset->size(), model.size(), iteration);
+
+        // evaluate() performs forward rendering only (Full/Diffuse/Specular) and never
+        // touches the optimizer; it is safe for a pure visualization pass.
+        evaluator_->print_evaluation_header(iteration);
+        const auto metrics = evaluator_->evaluate(iteration, model, dataset, background_);
+        LOG_INFO("{}", metrics.to_string());
+
+        lfs::core::image_io::wait_for_pending_saves();
+        LOG_INFO("Render-only: completed. Images saved under {}",
+                 lfs::core::path_to_utf8(params_.dataset.output_path / ("eval_step_" + std::to_string(iteration))));
+        return {};
+    }
+
     std::expected<void, std::string> Trainer::train(std::stop_token stop_token) {
         // Check if initialized
         if (!initialized_.load()) {

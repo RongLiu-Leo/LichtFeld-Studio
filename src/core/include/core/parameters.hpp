@@ -121,6 +121,7 @@ namespace lfs::core {
             bool enable_eval = false;                          // Only evaluate when explicitly enabled
             bool enable_save_eval_images = true;               // Save during evaluation images
             bool headless = false;                             // Disable visualization during training
+            bool render_only = false;                          // Load model+dataset and render views, no training/optimization
             bool auto_train = false;                           // Start training immediately on startup
             bool no_splash = false;                            // Skip splash screen on startup
             bool debug_python = false;                         // Start debugpy listener for plugin debugging

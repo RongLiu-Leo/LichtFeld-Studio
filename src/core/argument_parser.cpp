@@ -327,6 +327,7 @@ namespace {
             ::args::Group ui_sep(parser, " ");
             ::args::Group ui_group(parser, "UI OPTIONS:");
             ::args::Flag headless(ui_group, "headless", "Disable visualization during training", {"headless"});
+            ::args::Flag render_only(ui_group, "render_only", "Load a model (--init ply / --resume) and dataset, render views (Full/Diffuse/Specular) without any training/optimization", {"render-only"});
             ::args::Flag auto_train(ui_group, "train", "Start training immediately on startup", {"train"});
 #ifndef LFS_BUILD_PORTABLE
             ::args::Flag no_splash(ui_group, "no_splash", "Skip splash screen on startup", {"no-splash"});
@@ -730,6 +731,7 @@ namespace {
                                         ppisp_sidecar_path_val = cli_option_present({"--ppisp-sidecar"}) ? std::optional<std::string>(::args::get(ppisp_sidecar_path)) : std::optional<std::string>(),
                                         enable_eval_flag = bool(enable_eval),
                                         headless_flag = bool(headless),
+                                        render_only_flag = bool(render_only),
                                         auto_train_flag = bool(auto_train),
 #ifdef LFS_BUILD_PORTABLE
                                         no_splash_flag = false,
@@ -812,6 +814,14 @@ namespace {
                     opt.use_ppisp = true;
                 setFlag(enable_eval_flag, opt.enable_eval);
                 setFlag(headless_flag, opt.headless);
+                setFlag(render_only_flag, opt.render_only);
+                // Render-only is a pure load+render pass: it must run headless (no viewer
+                // training loop) and needs the evaluator enabled so it can render and save
+                // the Full/Diffuse/Specular views. It never steps the optimizer.
+                if (opt.render_only) {
+                    opt.headless = true;
+                    opt.enable_eval = true;
+                }
                 setFlag(auto_train_flag, opt.auto_train);
                 setFlag(no_splash_flag, opt.no_splash);
                 setFlag(debug_python_flag, opt.debug_python);
