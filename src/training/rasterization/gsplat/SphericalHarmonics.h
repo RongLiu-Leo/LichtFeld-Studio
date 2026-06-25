@@ -17,6 +17,7 @@ namespace gsplat_lfs {
         const bool* masks,             // [...] optional
         int64_t n_elements,
         float* colors, // [..., 3]
+        float sh_dc_offset = 0.5f,
         cudaStream_t stream = nullptr);
 
     void launch_spherical_harmonics_swizzled_bwd_kernel(

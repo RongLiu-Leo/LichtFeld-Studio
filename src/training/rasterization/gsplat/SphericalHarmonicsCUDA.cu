@@ -400,6 +400,13 @@ namespace gsplat_lfs {
         colors[idx] = result + SH_DC_OFFSET;
     }
 
+    __global__ void add_constant_kernel(float* data, int64_t count, float delta) {
+        const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (idx < count) {
+            data[idx] += delta;
+        }
+    }
+
     void launch_spherical_harmonics_swizzled_fwd_kernel(
         uint32_t degrees_to_use,
         const float* dirs,
@@ -408,6 +415,7 @@ namespace gsplat_lfs {
         const bool* masks,
         int64_t total_elements,
         float* colors,
+        float sh_dc_offset,
         cudaStream_t stream) {
         const uint32_t N = static_cast<uint32_t>(total_elements);
         const int64_t n_elements = static_cast<int64_t>(N) * 3;
@@ -426,6 +434,14 @@ namespace gsplat_lfs {
                 reinterpret_cast<const float4*>(sh_rest_swizzled),
                 masks,
                 colors);
+        if (sh_dc_offset != SH_DC_OFFSET) {
+            // Apply caller-selected SH DC offset in-place (default keeps legacy +0.5).
+            const int64_t n = n_elements;
+            const float delta = sh_dc_offset - SH_DC_OFFSET;
+            const int threads2 = 256;
+            const int blocks2 = static_cast<int>((n + threads2 - 1) / threads2);
+            add_constant_kernel<<<blocks2, threads2, 0, stream>>>(colors, n, delta);
+        }
     }
 
     template <typename scalar_t>

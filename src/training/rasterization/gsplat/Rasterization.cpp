@@ -238,6 +238,7 @@ namespace gsplat_lfs {
         const float* thin_prism_coeffs,
         const float* sb_params,
         uint32_t num_lobes,
+        float sh_dc_offset,
         RasterizeWithSHResult& result,
         cudaStream_t stream) {
         GSPLAT_CHECK_CUDA_PTR(means, "means");
@@ -297,7 +298,7 @@ namespace gsplat_lfs {
             spherical_harmonics_swizzled_fwd(
                 sh_degree, result.dirs, sh0, shN, nullptr,
                 static_cast<int64_t>(C) * N,
-                result.colors, stream);
+                result.colors, sh_dc_offset, stream);
 
             // Spherical-beta lobes are additive on top of the SH base color.
             if (num_lobes > 0 && sb_params != nullptr) {

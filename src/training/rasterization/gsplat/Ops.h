@@ -23,6 +23,7 @@ namespace gsplat_lfs {
         const bool* masks,             // [...] optional (can be nullptr)
         int64_t total_elements,        // total batch size
         float* colors,                 // [..., 3] output (pre-allocated)
+        float sh_dc_offset = 0.5f,
         cudaStream_t stream = nullptr);
 
     void spherical_harmonics_swizzled_bwd(
@@ -313,6 +314,8 @@ namespace gsplat_lfs {
         // spherical-beta color (additive on top of SH); num_lobes == 0 disables
         const float* sb_params, // [N, num_lobes, 6] optional
         uint32_t num_lobes,
+        // SH output offset (beta-splatting parity for Specular uses 0.0).
+        float sh_dc_offset,
         // outputs (result struct with pre-allocated buffers)
         RasterizeWithSHResult& result,
         cudaStream_t stream = nullptr);

@@ -138,6 +138,7 @@ namespace lfs::training {
             // 'zero_sh0' must outlive the kernel launch below, so it is declared here.
             uint32_t effective_sh_degree = sh_degree;
             core::Tensor zero_sh0;
+            float sh_dc_offset = 0.5f;
             switch (color_mode) {
             case RenderColorMode::Diffuse:
                 // DC only: force degree 0 (K=1) and disable SH-rest + spherical-beta.
@@ -146,11 +147,14 @@ namespace lfs::training {
                 sb_params_ptr = nullptr;
                 break;
             case RenderColorMode::Specular:
-                // Zero the DC base so the rendered color is the view-dependent residual.
+                // Match beta-splatting specular decomposition:
+                // - zero SH0 (base)
+                // - no +0.5 SH DC offset in shading
                 zero_sh0 = core::Tensor::zeros(sh0.shape(), core::Device::CUDA, core::DataType::Float32);
                 zero_sh0.set_stream(fwd_stream);
                 zero_sh0.zero_();
                 sh0_ptr = zero_sh0.ptr<float>();
+                sh_dc_offset = 0.0f;
                 break;
             case RenderColorMode::Full:
             default:
@@ -359,6 +363,7 @@ namespace lfs::training {
                 thin_prism_ptr,
                 sb_params_ptr,
                 effective_sb_lobes,
+                sh_dc_offset,
                 result,
                 fwd_stream);
             isect_ids_to_free = result.isect_ids;
@@ -403,23 +408,16 @@ namespace lfs::training {
                 break;
             }
 
-            // SH evaluation applies a built-in +0.5 DC offset. In Specular mode we zero
-            // SH0 to isolate view-dependent color, so this constant appears as a gray veil
-            // (scaled by alpha). Remove that floor in image space:
-            //   spec_clean = spec_raw - 0.5 * alpha
-            // This keeps Specular visually meaningful and aligns decomposition behavior.
-            if (color_mode == RenderColorMode::Specular &&
-                final_image.is_valid() &&
-                final_image.numel() > 0) {
-                final_image = final_image - (render_alphas_tensor * 0.5f);
-            }
-
             // Convert from [1, H, W, C] arena views to reusable CHW buffers.
             thread_local core::Tensor cached_image_chw;
             thread_local core::Tensor cached_alpha_chw;
             thread_local core::Tensor cached_depth_chw;
 
             if (final_image.is_valid() && final_image.numel() > 0) {
+                if (color_mode == RenderColorMode::Specular && effective_sb_lobes > 0) {
+                    // Beta-splatting clamps specular colors non-negative after SB shading.
+                    final_image = final_image.clamp_min(0.0f);
+                }
                 auto image_hwc = final_image.squeeze(0); // [H, W, C]
                 if (!image_hwc.is_contiguous()) {
                     image_hwc = image_hwc.contiguous();

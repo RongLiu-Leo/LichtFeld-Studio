@@ -18,6 +18,7 @@ namespace gsplat_lfs {
         const bool* masks,
         int64_t total_elements,
         float* colors,
+        float sh_dc_offset,
         cudaStream_t stream) {
         if (total_elements == 0) {
             return;
@@ -27,7 +28,7 @@ namespace gsplat_lfs {
             degrees_to_use,
             dirs, sh0, sh_rest_swizzled, masks,
             total_elements,
-            colors, stream);
+            colors, sh_dc_offset, stream);
     }
 
     void spherical_harmonics_swizzled_bwd(

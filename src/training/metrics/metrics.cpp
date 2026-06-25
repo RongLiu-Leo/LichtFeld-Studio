@@ -587,6 +587,16 @@ namespace lfs::training {
                 const RenderColorMode color_modes[3] = {
                     RenderColorMode::Full, RenderColorMode::Diffuse, RenderColorMode::Specular};
                 const char* color_mode_names[3] = {"Full", "Diffuse", "Specular"};
+
+                // Decomposition export is visualization-only. Render with the full stored SH
+                // degree so SH specular does not disappear when training schedule keeps the
+                // active degree at 0 in early iterations.
+                const int original_active_sh = splatData_mutable.get_active_sh_degree();
+                const int max_sh = splatData_mutable.get_max_sh_degree();
+                if (max_sh > original_active_sh) {
+                    splatData_mutable.set_active_sh_degree(max_sh);
+                }
+
                 for (int mi = 0; mi < 3; ++mi) {
                     auto mode_out = gsplat_rasterize(*cam, splatData_mutable, background,
                                                      1.0f, false, GsplatRenderMode::RGB,
@@ -602,6 +612,10 @@ namespace lfs::training {
                     lfs::core::image_io::save_image_async(
                         eval_dir / color_mode_names[mi] / (std::to_string(image_idx) + ".png"),
                         mode_img);
+                }
+
+                if (splatData_mutable.get_active_sh_degree() != original_active_sh) {
+                    splatData_mutable.set_active_sh_degree(original_active_sh);
                 }
             }
 
