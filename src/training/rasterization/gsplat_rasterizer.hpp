@@ -26,6 +26,17 @@ namespace lfs::training {
         RGB_ED = 4 // RGB + expected depth
     };
 
+    // View-dependent color separation, for VISUALIZATION ONLY. This never mutates
+    // the model and is not used by the training/backward path.
+    //   Full     - complete color: sh0 (DC) + higher-order SH + spherical-beta lobes.
+    //   Diffuse  - view-independent base only: render sh0 (DC), drop SH-rest and SB lobes.
+    //   Specular - view-dependent residual: zero sh0 (black base), keep SH-rest and SB lobes.
+    enum class RenderColorMode {
+        Full = 0,
+        Diffuse = 1,
+        Specular = 2
+    };
+
     // Forward pass context - holds raw pointers needed for backward (arena allocated)
     struct GsplatRasterizeContext {
         // Raw pointers to arena-allocated intermediate buffers
@@ -117,7 +128,8 @@ namespace lfs::training {
         bool antialiased = false,
         GsplatRenderMode render_mode = GsplatRenderMode::RGB,
         bool use_gut = false,
-        const lfs::core::Tensor& bg_image = {});
+        const lfs::core::Tensor& bg_image = {},
+        RenderColorMode color_mode = RenderColorMode::Full);
 
     // Explicit backward pass - computes gradients and accumulates into optimizer
     void gsplat_rasterize_backward(
@@ -136,10 +148,11 @@ namespace lfs::training {
         float scaling_modifier = 1.0f,
         bool antialiased = false,
         GsplatRenderMode render_mode = GsplatRenderMode::RGB,
-        bool use_gut = false) {
+        bool use_gut = false,
+        RenderColorMode color_mode = RenderColorMode::Full) {
         auto result = gsplat_rasterize_forward(
             viewpoint_camera, gaussian_model, bg_color, 0, 0, 0, 0,
-            scaling_modifier, antialiased, render_mode, use_gut);
+            scaling_modifier, antialiased, render_mode, use_gut, {}, color_mode);
         if (!result) {
             throw std::runtime_error(result.error());
         }
@@ -165,7 +178,8 @@ namespace lfs::training {
         float scaling_modifier = 1.0f,
         bool antialiased = false,
         GsplatRenderMode render_mode = GsplatRenderMode::RGB,
-        bool use_gut = false) {
+        bool use_gut = false,
+        RenderColorMode color_mode = RenderColorMode::Full) {
         return gsplat_rasterize(
             const_cast<lfs::core::Camera&>(viewpoint_camera),
             gaussian_model,
@@ -173,7 +187,8 @@ namespace lfs::training {
             scaling_modifier,
             antialiased,
             render_mode,
-            use_gut);
+            use_gut,
+            color_mode);
     }
 
 } // namespace lfs::training

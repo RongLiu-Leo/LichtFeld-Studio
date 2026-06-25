@@ -23,6 +23,7 @@
 #include <fstream>
 #include <future>
 #include <mutex>
+#include <optional>
 #include <ranges>
 #include <span>
 #include <string_view>
@@ -63,6 +64,10 @@ namespace lfs::io {
     namespace ply_constants {
         constexpr int MAX_DC_COMPONENTS = 48;
         constexpr int MAX_REST_COMPONENTS = 135;
+        // Spherical-beta lobes: each lobe packs (r, g, b, theta, phi, beta) = 6 channels.
+        // Stored channel-major in PLY (matches the original beta-splatting layout).
+        constexpr int SB_PARAMS_CHANNELS = 6;
+        constexpr int MAX_SB_PARAMS_COMPONENTS = 16 * SB_PARAMS_CHANNELS; // up to 16 lobes
         constexpr int COLOR_CHANNELS = 3;
         constexpr int POSITION_DIMS = 3;
         constexpr int SCALE_DIMS = 3;
@@ -91,6 +96,7 @@ namespace lfs::io {
         constexpr auto REST_PREFIX = "f_rest_"sv;
         constexpr auto SCALE_PREFIX = "scale_"sv;
         constexpr auto ROT_PREFIX = "rot_"sv;
+        constexpr auto SB_PARAMS_PREFIX = "sb_params_"sv;
     } // namespace ply_constants
 
     namespace {
@@ -156,17 +162,21 @@ namespace lfs::io {
         size_t rot_offsets[4] = {SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX};
         size_t dc_offsets[ply_constants::MAX_DC_COMPONENTS];
         size_t rest_offsets[ply_constants::MAX_REST_COMPONENTS];
-        int dc_count = 0, rest_count = 0;
+        // Spherical-beta lobe params, stored channel-major in the PLY file.
+        size_t sb_params_offsets[ply_constants::MAX_SB_PARAMS_COMPONENTS];
+        int dc_count = 0, rest_count = 0, sb_params_count = 0;
 
         FastPropertyLayout() {
             std::fill(std::begin(dc_offsets), std::end(dc_offsets), SIZE_MAX);
             std::fill(std::begin(rest_offsets), std::end(rest_offsets), SIZE_MAX);
+            std::fill(std::begin(sb_params_offsets), std::end(sb_params_offsets), SIZE_MAX);
         }
 
         [[nodiscard]] bool has_positions() const { return pos_x_offset != SIZE_MAX; }
         [[nodiscard]] bool has_opacity() const { return opacity_offset != SIZE_MAX; }
         [[nodiscard]] bool has_scaling() const { return scale_offsets[0] != SIZE_MAX; }
         [[nodiscard]] bool has_rotation() const { return rot_offsets[0] != SIZE_MAX; }
+        [[nodiscard]] bool has_sb_params() const { return sb_params_count > 0; }
     };
 
     struct MMappedFile {
@@ -396,6 +406,14 @@ namespace lfs::io {
                     int idx = prop_name[4] - '0';
                     if (idx >= 0 && idx < 4)
                         layout.rot_offsets[idx] = layout.vertex_stride;
+                } else if (name_len >= 11 && std::strncmp(prop_name, "sb_params_", 10) == 0) {
+                    // Spherical-beta lobe params (channel-major), orthogonal color extension.
+                    int idx = std::atoi(prop_name + 10);
+                    if (idx >= 0 && idx < ply_constants::MAX_SB_PARAMS_COMPONENTS) {
+                        layout.sb_params_offsets[idx] = layout.vertex_stride;
+                        if (idx >= layout.sb_params_count)
+                            layout.sb_params_count = idx + 1;
+                    }
                 }
 
                 layout.vertex_stride += 4; // All properties are float32
@@ -735,6 +753,36 @@ namespace lfs::io {
                           });
     }
 
+    // Reorder spherical-beta lobe params from channel-major PLY storage
+    // (column = channel * lobes + lobe, matching beta-splatting) into LichtFeld's
+    // native lobe-major layout [N, lobes*6] (each lobe packs r,g,b,theta,phi,beta).
+    void extract_sb_params_to_host(const char* __restrict__ vertex_data,
+                                   const FastPropertyLayout& layout,
+                                   const int lobes,
+                                   float* __restrict__ output) {
+        const size_t count = layout.vertex_count;
+        const size_t stride = layout.vertex_stride;
+        const int channels = ply_constants::SB_PARAMS_CHANNELS;
+        const size_t per_vertex = static_cast<size_t>(lobes) * static_cast<size_t>(channels);
+
+        tbb::parallel_for(tbb::blocked_range<size_t>(0, count, ply_constants::BLOCK_SIZE_LARGE),
+                          [&](const tbb::blocked_range<size_t>& range) {
+                              for (size_t i = range.begin(); i < range.end(); ++i) {
+                                  const char* p = vertex_data + i * stride;
+                                  for (int l = 0; l < lobes; ++l) {
+                                      for (int c = 0; c < channels; ++c) {
+                                          const size_t col = static_cast<size_t>(c) * lobes + l;
+                                          const size_t off = layout.sb_params_offsets[col];
+                                          const float v = (off != SIZE_MAX)
+                                                              ? *reinterpret_cast<const float*>(p + off)
+                                                              : 0.0f;
+                                          output[i * per_vertex + static_cast<size_t>(l) * channels + c] = v;
+                                      }
+                                  }
+                              }
+                          });
+    }
+
     // Pageable, not value-initialized. Pinning ~1.5 GB via cudaHostAlloc cost
     // ~700 ms on this path — far more than async H->D overlap could recoup.
     struct HostBuffer {
@@ -964,6 +1012,25 @@ namespace lfs::io {
             // Retain the allocator so later edits (apply_deleted) keep tensors in
             // the same backing storage (e.g. Vulkan-external interop).
             splat_data.set_tensor_allocator(options.splat_tensor_allocator);
+
+            // Spherical-beta lobes (orthogonal, view-dependent color extension).
+            // Only present when the PLY was written with sb_params_* columns.
+            if (layout.has_sb_params() &&
+                layout.sb_params_count % ply_constants::SB_PARAMS_CHANNELS == 0) {
+                const int sb_lobes = layout.sb_params_count / ply_constants::SB_PARAMS_CHANNELS;
+                HostBuffer host_sb_params(N * static_cast<size_t>(layout.sb_params_count));
+                if (host_sb_params.ptr) {
+                    extract_sb_params_to_host(vertex_data, layout, sb_lobes, host_sb_params.ptr);
+                    Tensor sb_params = tensor_from_host_floats(
+                        host_span(host_sb_params),
+                        {N, static_cast<size_t>(layout.sb_params_count)},
+                        options,
+                        "SplatData.sb_params");
+                    splat_data.set_sb_params(std::move(sb_params), sb_lobes);
+                    LOG_INFO("PLY: loaded spherical-beta color ({} lobes, {} params/vertex)",
+                             sb_lobes, layout.sb_params_count);
+                }
+            }
 
             auto end_time = std::chrono::high_resolution_clock::now();
             auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
@@ -1632,12 +1699,47 @@ namespace lfs::io {
         return attrs;
     }
 
+    // Build the spherical-beta lobe attribute block (channel-major, beta-splatting
+    // compatible) from a SplatData that has spherical beta enabled. Standard 3DGS
+    // params (f_dc, opacity, scale, rot) are kept as-is by the base exporter; this
+    // just appends the orthogonal sb_params_* columns.
+    static std::optional<PlyAttributeBlock> make_spherical_beta_attribute_block(const SplatData& splat_data) {
+        if (!splat_data.has_spherical_beta())
+            return std::nullopt;
+
+        const int lobes = splat_data.get_sb_lobes();
+        const auto& sb_raw = splat_data.sb_params();
+        if (lobes <= 0 || !sb_raw.is_valid() || sb_raw.numel() == 0)
+            return std::nullopt;
+
+        const int channels = ply_constants::SB_PARAMS_CHANNELS;
+        const auto N = static_cast<int>(sb_raw.size(0));
+
+        PlyAttributeBlock block;
+        // LichtFeld stores lobe-major [N, L*6]; PLY wants channel-major [N, 6*L].
+        block.values = sb_raw.reshape({N, lobes, channels}) // [N, L, C]
+                           .transpose(1, 2)                 // [N, C, L]
+                           .contiguous()
+                           .reshape({N, channels * lobes}); // [N, C*L]
+        block.names = make_ply_extra_attribute_names(
+            "sb_params", static_cast<size_t>(channels * lobes));
+        return block;
+    }
+
     Result<void> save_ply(const SplatData& splat_data, const PlySaveOptions& options) {
         if (!report_export_progress(options.progress_callback, 0.0f, "Preparing PLY"))
             return make_error(ErrorCode::CANCELLED, "Export cancelled by user", options.output_path);
 
+        // Keep the standard 3DGS schema; append spherical-beta lobes when present.
+        std::vector<PlyAttributeBlock> effective_extra = options.extra_attributes;
+        if (auto sb_block = make_spherical_beta_attribute_block(splat_data)) {
+            LOG_DEBUG("[PLY] Appending spherical-beta lobes: {} columns ({} lobes)",
+                      sb_block->names.size(), splat_data.get_sb_lobes());
+            effective_extra.push_back(std::move(*sb_block));
+        }
+
         auto filtered_extra_attributes = filter_extra_attributes_for_splat_export(
-            splat_data, options.extra_attributes, options.output_path);
+            splat_data, effective_extra, options.output_path);
         if (!filtered_extra_attributes) {
             return std::unexpected(filtered_extra_attributes.error());
         }

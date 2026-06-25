@@ -485,6 +485,11 @@ namespace lfs::training {
                                                ("eval_step_" + std::to_string(iteration));
         if (_params.optimization.enable_save_eval_images) {
             std::filesystem::create_directories(eval_dir);
+            // View-dependent color separation (visualization only). Each eval step gets
+            // Full / Diffuse / Specular subfolders with the corresponding per-view renders.
+            std::filesystem::create_directories(eval_dir / "Full");
+            std::filesystem::create_directories(eval_dir / "Diffuse");
+            std::filesystem::create_directories(eval_dir / "Specular");
         }
 
         int image_idx = 0;
@@ -575,6 +580,29 @@ namespace lfs::training {
                     rgb_images,
                     true, // horizontal
                     4);   // separator width
+
+                // View-dependent color separation. Always render through the gut/gsplat
+                // path so spherical-beta lobes are evaluated (the only SB-capable path);
+                // these modes never affect training or the reported metrics.
+                const RenderColorMode color_modes[3] = {
+                    RenderColorMode::Full, RenderColorMode::Diffuse, RenderColorMode::Specular};
+                const char* color_mode_names[3] = {"Full", "Diffuse", "Specular"};
+                for (int mi = 0; mi < 3; ++mi) {
+                    auto mode_out = gsplat_rasterize(*cam, splatData_mutable, background,
+                                                     1.0f, false, GsplatRenderMode::RGB,
+                                                     /*use_gut=*/true, color_modes[mi]);
+                    auto mode_img = mode_out.image.clamp(0.0f, 1.0f);
+                    if (mask.is_valid()) {
+                        auto mask_f = mask_as_float01(mask);
+                        const int C = static_cast<int>(mode_img.shape()[0]);
+                        const int H = static_cast<int>(mask_f.shape()[0]);
+                        const int W = static_cast<int>(mask_f.shape()[1]);
+                        mode_img = mode_img * mask_f.unsqueeze(0).expand({C, H, W});
+                    }
+                    lfs::core::image_io::save_image_async(
+                        eval_dir / color_mode_names[mi] / (std::to_string(image_idx) + ".png"),
+                        mode_img);
+                }
             }
 
             image_idx++;

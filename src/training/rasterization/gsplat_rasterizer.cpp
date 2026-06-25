@@ -26,7 +26,8 @@ namespace lfs::training {
         bool antialiased,
         GsplatRenderMode render_mode,
         bool use_gut,
-        const core::Tensor& bg_image) {
+        const core::Tensor& bg_image,
+        RenderColorMode color_mode) {
 
         // Begin arena frame for memory allocation
         auto& arena = core::GlobalArenaManager::instance().get_arena();
@@ -131,6 +132,35 @@ namespace lfs::training {
                 sb_params_ptr = sb_params_t.ptr<float>();
             }
 
+            // View-dependent color separation (visualization only). We never touch the
+            // model tensors: Diffuse drops the view-dependent terms, Specular renders
+            // against a zeroed DC base so only the view-dependent residual remains.
+            // 'zero_sh0' must outlive the kernel launch below, so it is declared here.
+            uint32_t effective_sh_degree = sh_degree;
+            core::Tensor zero_sh0;
+            switch (color_mode) {
+            case RenderColorMode::Diffuse:
+                // DC only: force degree 0 (K=1) and disable SH-rest + spherical-beta.
+                effective_sh_degree = 0u;
+                shN_ptr = nullptr;
+                sb_params_ptr = nullptr;
+                break;
+            case RenderColorMode::Specular:
+                // Zero the DC base so the rendered color is the view-dependent residual.
+                zero_sh0 = core::Tensor::zeros(sh0.shape(), core::Device::CUDA, core::DataType::Float32);
+                zero_sh0.set_stream(fwd_stream);
+                zero_sh0.zero_();
+                sh0_ptr = zero_sh0.ptr<float>();
+                break;
+            case RenderColorMode::Full:
+            default:
+                break;
+            }
+            // From here on, color is computed from sh0_ptr/shN_ptr (+ sb) using
+            // 'effective_sh_degree'; everything else is unchanged.
+            const uint32_t effective_sb_lobes =
+                (sb_params_ptr != nullptr) ? sb_lobes : 0u;
+
             // Background color and image pointers
             // bg_color and bg_image are mutually exclusive - use one or the other
             const bool use_bg_image = bg_image.is_valid() && !bg_image.is_empty();
@@ -205,7 +235,7 @@ namespace lfs::training {
             // Calculate buffer dimensions
             const uint32_t N = static_cast<uint32_t>(means.shape()[0]);
             const uint32_t C = 1;                                   // Single camera
-            const uint32_t K = (sh_degree + 1u) * (sh_degree + 1u); // active SH coefficients including sh0
+            const uint32_t K = (effective_sh_degree + 1u) * (effective_sh_degree + 1u); // active SH coefficients including sh0
             const uint32_t H = image_height;
             const uint32_t W = image_width;
             const uint32_t num_tiles_y = (H + tile_size - 1) / tile_size;
@@ -301,7 +331,7 @@ namespace lfs::training {
                 opacities_ptr,
                 sh0_ptr,
                 shN_ptr,
-                sh_degree,
+                effective_sh_degree,
                 bg_color_ptr,
                 bg_image_ptr, // per-pixel background image
                 nullptr,      // masks
@@ -328,7 +358,7 @@ namespace lfs::training {
                 tangential_ptr,
                 thin_prism_ptr,
                 sb_params_ptr,
-                sb_lobes,
+                effective_sb_lobes,
                 result,
                 fwd_stream);
             isect_ids_to_free = result.isect_ids;
@@ -371,6 +401,17 @@ namespace lfs::training {
                 auto accum_depth = render_colors_tensor.slice(-1, 3, 4);
                 final_depth = accum_depth.div(render_alphas_tensor.clamp_min(1e-10f));
                 break;
+            }
+
+            // SH evaluation applies a built-in +0.5 DC offset. In Specular mode we zero
+            // SH0 to isolate view-dependent color, so this constant appears as a gray veil
+            // (scaled by alpha). Remove that floor in image space:
+            //   spec_clean = spec_raw - 0.5 * alpha
+            // This keeps Specular visually meaningful and aligns decomposition behavior.
+            if (color_mode == RenderColorMode::Specular &&
+                final_image.is_valid() &&
+                final_image.numel() > 0) {
+                final_image = final_image - (render_alphas_tensor * 0.5f);
             }
 
             // Convert from [1, H, W, C] arena views to reusable CHW buffers.
