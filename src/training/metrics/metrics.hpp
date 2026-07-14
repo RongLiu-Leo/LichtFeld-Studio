@@ -103,8 +103,10 @@ namespace lfs::training {
     public:
         explicit MetricsEvaluator(const lfs::core::param::TrainingParameters& params);
 
-        // Check if evaluation is enabled
-        bool is_enabled() const { return _params.optimization.enable_eval; }
+        // Evaluation always runs at eval_steps. With --eval it targets the held-out
+        // split; without --eval it targets all training views. Kept as a method so
+        // callers reading intent stay readable.
+        bool is_enabled() const { return true; }
 
         // Check if we should evaluate at this iteration
         bool should_evaluate(const int iteration) const;

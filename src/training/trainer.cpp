@@ -2007,12 +2007,15 @@ namespace lfs::training {
                     return std::unexpected("Evaluation is enabled but the validation split is empty. Decrease Test Every or disable evaluation.");
                 }
             } else {
-                // Use all images for training
+                // Use all images for training. Without a held-out split we still run
+                // evaluation at eval_steps, measuring quality against the training views
+                // themselves, so val_dataset_ mirrors the full training set.
                 train_dataset_ = std::make_shared<CameraDataset>(
                     source_cameras, dataset_config, CameraDataset::Split::ALL);
-                val_dataset_ = nullptr;
+                val_dataset_ = std::make_shared<CameraDataset>(
+                    source_cameras, dataset_config, CameraDataset::Split::ALL);
 
-                LOG_INFO("Using all {} images for training (no evaluation)",
+                LOG_INFO("Using all {} images for training; evaluation at eval_steps will run on the full training set",
                          train_dataset_->size());
             }
 

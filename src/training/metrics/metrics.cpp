@@ -301,9 +301,9 @@ namespace lfs::training {
     // MetricsEvaluator Implementation
     MetricsEvaluator::MetricsEvaluator(const lfs::core::param::TrainingParameters& params)
         : _params(params) {
-        if (!params.optimization.enable_eval) {
-            return;
-        }
+        // Evaluation always runs at eval_steps. With --eval it measures the held-out
+        // split; without --eval it measures the training views themselves. Either way
+        // we need the metrics and (non render-only) the reporter.
 
         // Initialize metrics
         _psnr_metric = std::make_unique<PSNR>(1.0f);
@@ -317,9 +317,6 @@ namespace lfs::training {
     }
 
     bool MetricsEvaluator::should_evaluate(const int iteration) const {
-        if (!_params.optimization.enable_eval)
-            return false;
-
         return std::find(_params.optimization.eval_steps.cbegin(), _params.optimization.eval_steps.cend(), iteration) !=
                _params.optimization.eval_steps.cend();
     }
@@ -470,10 +467,6 @@ namespace lfs::training {
                                            const lfs::core::SplatData& splatData,
                                            std::shared_ptr<CameraDataset> val_dataset,
                                            lfs::core::Tensor& background) {
-        if (!_params.optimization.enable_eval) {
-            throw std::runtime_error("Evaluation is not enabled");
-        }
-
         EvalMetrics result;
         result.num_gaussians = static_cast<int>(splatData.size());
         result.iteration = iteration;
@@ -577,7 +570,12 @@ namespace lfs::training {
                     gt_vis = gt_vis * mask_3d;
                     render_vis = r_output.image * mask_3d;
                 }
-                const std::vector<lfs::core::Tensor> rgb_images = {gt_vis, render_vis};
+                // Per-channel absolute error map |gt - render|. Both operands are
+                // float [0,1] (and already masked when a mask is active), so the diff
+                // is itself a valid [0,1] RGB image needing no scaling. Masked regions
+                // are zero in both inputs, so the diff there is zero as well.
+                auto diff_vis = (gt_vis - render_vis).abs();
+                const std::vector<lfs::core::Tensor> rgb_images = {gt_vis, render_vis, diff_vis};
                 lfs::core::image_io::save_images_async(
                     eval_dir / (std::to_string(image_idx) + ".png"),
                     rgb_images,
